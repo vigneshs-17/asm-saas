@@ -33,3 +33,38 @@
 - After each step, update docs/LEARNING_NOTES.md: plain-English explanation
   of new files plus 5 interview questions with answers
 - End every task with: file tree, commands run, test results, open questions
+
+## Architecture constraints (full text: docs/ARCHITECTURE_TARGET.md)
+- Phase order is fixed: verify v2.1 -> v2.2 scan jobs -> v2.3 change
+  detection -> v2.4 scheduling + alerts -> v3 SaaS. Never skip ahead,
+  restart or redesign.
+- Preserve the v1 scanner core and its safety controls (auth gate, SSRF
+  guard, redirect scope, bounded scanning, banner safety, TLS behavior,
+  untrusted-report validation, evidence-based scoring). Change them only
+  with a demonstrated technical reason.
+- Add the minimum architecture each phase needs, designed so later phases
+  fit. No new infrastructure (Redis, Celery, Kafka, graph databases, cloud
+  services) without a measurable limitation that justifies it.
+- Never overwrite historical scan state. Keep the evidence and its source
+  (crt.sh, DNS, redirect, ...) with every derived fact; never reduce
+  evidence to an unexplained boolean.
+- Risk scoring stays explainable: every score lists its contributors, is
+  never called CVSS, and many weak findings never outweigh one strong,
+  evidenced exposure.
+- Long-running work never runs inside an API request; it goes through the
+  job queue. Scheduled scans create ordinary jobs on the same queue.
+- Create normalized tables only when a current feature needs them; JSONB
+  reports are acceptable until then.
+- Every new subsystem gets tests for its failure modes.
+- Log with structured context where it exists: scan_id, job_id, domain_id,
+  stage, duration, status, error.
+
+## Reporting rules (mandatory)
+- Never claim tests passed, lint is clean, Docker or migrations worked,
+  files exist, or CI is green unless you ran the command in this session
+  and show its unedited output.
+- Label every item in a summary IMPLEMENTED, VERIFIED (proven by a command
+  you ran, output shown) or PLANNED.
+- List files from disk (git status), never from memory.
+- Each step ends verified and committed before the next step starts.
+
