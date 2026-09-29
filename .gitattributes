@@ -1,0 +1,12 @@
+# Set default line endings to LF for repository text files
+* text=auto eol=lf
+
+# Explicitly declare common binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
