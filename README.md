@@ -81,6 +81,39 @@ pip install -e ".[dev]"
 
 ---
 
+## Run with Docker
+
+Alternatively, run `asm` inside a containerized environment without installing Python or local dependencies.
+
+### 1. Build the Docker Image
+```bash
+docker build -t asm-saas .
+```
+
+### 2. Run Commands Mounting the Local Output Directory
+To persist generated reports to your host's `output/` directory, bind mount it to `/app/output`:
+
+**Windows (PowerShell):**
+```powershell
+docker run --rm -v "${PWD}/output:/app/output" asm-saas discover example.com
+```
+
+**Linux / macOS:**
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$(pwd)/output:/app/output" asm-saas discover example.com
+```
+> [!NOTE]
+> On Linux and macOS, `--user "$(id -u):$(id -g)"` is required because the container runs as a non-root user (UID 10001) while mounted host directories retain host ownership, ensuring reports written to the host have correct write permissions.
+
+> [!IMPORTANT]
+> Active reconnaissance commands (`probe`, `portscan`, `inspect`) still require the mandatory `--authorized` flag inside the container:
+> ```bash
+> docker run --rm -v "${PWD}/output:/app/output" asm-saas probe output/<report>.json --authorized
+> ```
+
+
+---
+
 ## Usage
 
 ### 1. Discover Subdomains (Passive)

@@ -35,3 +35,25 @@ jobs:
       - name: Run unit test suite (pytest)
         run: |
           pytest
+
+  docker:
+    name: Docker Build & Smoke Test
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t asm-saas .
+
+      - name: Run CLI smoke test
+        run: |
+          docker run --rm asm-saas --help
+
+      - name: Verify non-root user
+        run: |
+          test "$(docker run --rm --entrypoint whoami asm-saas)" = "asm"
+
