@@ -393,3 +393,93 @@ DNS Rebinding is an attack where an attacker controls an authoritative nameserve
 1. **Network Efficiency & Politeness:** Opening new TCP connections and performing cryptographic TLS handshakes consumes network bandwidth and CPU cycles on both the scanner and the target server. By reading the active TLS peer certificate directly from the underlying transport stream of the HTTP response (`network_stream`), the tool collects both HTTP headers and TLS certificates in a single round-trip.
 2. **Graceful Degradation:** Production networks are messy. If a certificate is invalid (expired or self-signed), a strict client like `httpx` will abort the connection immediately during TLS verification. By catching this verification failure and executing a targeted unverified fallback (`verify_mode = ssl.CERT_NONE`), the scanner avoids crashing, records the exact cause of untrust, and still inspects the host's headers and protocol version.
 3. **Audit Trail & Transparency:** Tracking the source of inspection (`from_response` vs. `from_socket`) ensures the resulting ASM report clearly indicates whether the host allowed a standard verified session or required low-level socket fallback.
+
+---
+
+# Part 5: v1 Step 5 — Risk Scoring & Combined Report
+
+## 1. Plain-English Code Walkthrough
+
+### `src/asm/scoring.py`
+- **What it is:** The defensive risk scoring and multi-stage report aggregation engine.
+- **Why it exists:** Previous steps generated isolated reports for subdomains, HTTP probing, open ports, and TLS/header issues. This module combines these disjoint observations into a unified, actionable risk assessment per host and across the entire domain without generating any network packets.
+- **Key Architecture & Design Decisions:**
+  - **Single Central Table (`FINDING_DEFINITIONS`):** All 21 finding types are declared in one table at the top of the module with static IDs, titles, severity tiers, points, and human-readable security impact strings (`why_it_matters`). This makes the scoring rules easily auditable, consistent, and defensible.
+  - **Host Band Derived from Worst Finding Tier (Rule 1):** Rather than arbitrary point bucket math where multiple trivial issues could artificially create a "critical" host, a host's severity band is determined strictly by its **worst finding tier**:
+    - Any `CRITICAL` finding $\rightarrow$ `CRITICAL`
+    - Else any `HIGH` finding $\rightarrow$ `HIGH`
+    - Else any `MEDIUM` finding $\rightarrow$ `MEDIUM`
+    - Else any `LOW` finding $\rightarrow$ `LOW`
+    - Else $\rightarrow$ `INFO` (clean host)
+    The point sum is preserved and used as a secondary tiebreaker for sorting within each band.
+  - **Service Confirmation Distinguishes CRITICAL vs. HIGH (Rule 2):** An exposed database port (3306, 5432, 6379) that returned an active service banner is designated `CRITICAL` (`PORT_CONFIRMED_DB`, 10 pts) because it confirms an active, reachable database engine on the internet. An open DB port without a banner remains `HIGH` (`PORT_EXPOSED_DB`, 7 pts).
+  - **Honest Split on Untrusted Certificates (Rule 3):** An expired or not-yet-valid certificate is classified as `HIGH` (definitive failure of trust and browser availability). In contrast, a self-signed certificate (`issuer_equals_subject`) on an unexpired certificate is classified as `MEDIUM` (`TLS_SELF_SIGNED`, 4 pts), explicitly documenting that it may be intentional for internal or development assets.
+  - **Domain Band Derivation (Rule 4):**
+    - Any `CRITICAL` host $\rightarrow$ Domain `CRITICAL`
+    - Else any `HIGH` host $\rightarrow$ Domain `HIGH` (with an escalation note flagged if $\ge 3$ high hosts exist)
+    - Else any `MEDIUM` host $\rightarrow$ Domain `MEDIUM`
+    - Else any `LOW` host $\rightarrow$ Domain `LOW`
+    - Else $\rightarrow$ Domain `INFO`
+  - **Stage Evaluators:** Dedicated functions (`evaluate_probe_findings`, `evaluate_portscan_findings`, `evaluate_inspect_findings`) convert raw report data into typed `Finding` objects with concrete proof strings.
+
+### `src/asm/models.py` (Scoring Models)
+- Added `SeverityTier` (`StrEnum`: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`).
+- Added `Finding` (`dataclass`): Represents a single security issue with `id`, `title`, `tier`, `points`, `source`, `host`, `port`, `evidence`, and `why_it_matters`.
+- Added `HostScore` (`dataclass`): Aggregated risk score, worst-tier severity band, and itemized findings for a host.
+- Added `ScoreReport` (`dataclass`): Domain-wide aggregation report with timestamp, inputs used, domain band, total score, summary counts, and host list.
+
+### `src/asm/scan_common.py` (`load_and_validate_generic_report`)
+- Added generic report loader treating all input files as untrusted. Verifies JSON structure, validates the `domain` field, asserts all input reports belong to the exact same domain, and ensures the `results` list exists. Raises `ReportValidationError` on any failure.
+
+### `src/asm/cli.py` (`handle_score`)
+- Added `asm score --discover <f> [--probe <f>] [--portscan <f>] [--inspect <f>] [-o DIR] [-v]`.
+- Does not require `--authorized` because it performs zero network activity.
+- Generates `output/<domain>_score_<UTC>.json` and formats a human-readable CLI summary sorted worst-first.
+
+---
+
+## 2. Five Step 5 Cybersecurity Interview Questions & Answers
+
+### Question 1: Why should an Attack Surface Management tool use categorical severity tiers (CRITICAL, HIGH, MEDIUM, LOW) instead of an arbitrary 0–10 score?
+**Answer:**
+- **Actionability Over False Precision:** Arbitrary floating-point numbers (e.g. "Risk Score: 7.42") convey a false sense of mathematical precision. Security teams cannot realistically differentiate the urgency of a 7.2 vs. a 7.4. Categorical tiers map directly to operational triage workflows and Service Level Agreements (SLAs) (e.g. CRITICAL = 24-hour remediation, HIGH = 7-day remediation, MEDIUM = 30 days).
+- **Preventing "Point Inflation":** Point-only scoring algorithms suffer from distortion where dozens of minor informational findings (like missing headers) can sum up to a high number, artificially labeling a low-risk blog as more dangerous than a server exposing an unauthenticated database. Determining the host band by its **worst finding tier** ensures that critical risks are never masked or artificially created.
+
+---
+
+### Question 2: Why must risk scoring be strictly driven by observable evidence, and what is the danger of a finding without evidence?
+**Answer:**
+- **Defensibility & Credibility:** In security operations, developer pushback against vulnerability scanners is common. A finding that states *"Host has insecure database"* without evidence will be contested or ignored. A finding with concrete evidence (*"Port 3306 (mysql) is OPEN with confirmed service banner: '5.7.34-log MySQL Community Server'"*) is irrefutable.
+- **Root Cause & Remediation:** Concrete evidence provides engineers with the exact diagnostic data required to fix the issue (e.g. the specific port, the exact missing header name, or the certificate expiry date).
+- **Audit Compliance:** External compliance frameworks (SOC 2, ISO 27001, PCI-DSS) require evidence-based verification for every identified finding to support formal remediation tracking.
+
+---
+
+### Question 3: How do you justify classifying a confirmed exposed database port with an active banner as CRITICAL, while an open database port without a banner is classified as HIGH?
+**Answer:**
+- **Confirmed Reachability vs. Firewall Artifacts:** An open TCP port without a banner confirms that a three-way TCP handshake succeeded, but does not prove what software is running behind it. It could be a honeypot, an intermediate firewall performing full proxying, or a load balancer. It remains a `HIGH` risk because sensitive ports should never be accessible from the public internet.
+- **Immediate Weaponization Potential (CRITICAL):** When a database port returns an active protocol greeting banner (e.g. MySQL packet handshake or PostgreSQL error response), it conclusively proves that an active database daemon is directly accepting untrusted packets from the public internet. This exposes the organization to immediate remote authentication attacks, zero-day CVE exploitation, and severe data breach risks.
+
+---
+
+### Question 4: In attack surface management, what are false positives vs. false negatives, and how does this heuristic triage model balance them?
+**Answer:**
+- **Definitions:**
+  - **False Positive:** Flagging an issue that does not actually pose risk (e.g. marking a self-signed certificate on an internal staging server as a critical vulnerability). Excessive false positives cause "alert fatigue" and lead engineers to distrust the scanner.
+  - **False Negative:** Failing to detect an actual security flaw (e.g. missing an open database or an expired certificate). False negatives create a false sense of security and leave real vulnerabilities exposed.
+- **How This Model Balances Them:**
+  - Avoids false positives by honestly splitting findings (e.g. self-signed certificates are `MEDIUM`, acknowledging that dev environments intentionally use them; plaintext HTTP is only flagged if port 80 is live while port 443 is unreachable).
+  - Avoids false negatives by performing multi-stage correlation (linking port scan results, probe HTTP statuses, and TLS handshake findings across all discovered host assets).
+
+---
+
+### Question 5: What are the fundamental limitations of static heuristic scoring models, and why is this model explicitly NOT CVSS?
+**Answer:**
+- **What CVSS Is:** The Common Vulnerability Scoring System (CVSS) is an industry standard for rating specific, identified software vulnerabilities (CVEs) based on standardized metrics: Attack Vector (AV), Attack Complexity (AC), Privileges Required (PR), User Interaction (UI), Scope (S), and Impact (Confidentiality, Integrity, Availability).
+- **Why This Model is NOT CVSS:**
+  - Our ASM scanner evaluates external **configuration posture** and **exposure surface** (e.g. missing defensive headers, open ports, certificate lifespan), not confirmed exploitable software vulnerabilities in a CVE database.
+  - Calling heuristic ASM scoring "CVSS" is dishonest and misleading to customers and auditors.
+- **Fundamental Limitations of Heuristic Models:**
+  1. **No Context on Compensating Controls:** The scanner cannot see internal network segmentation, Web Application Firewall (WAF) rate limiting, or VPN authentication layers behind the host.
+  2. **No Business Context:** A missing header on a marketing landing page that serves static brochures carries far less business impact than the same missing header on a banking portal, but static heuristics score them identically.
+

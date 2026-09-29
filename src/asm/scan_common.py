@@ -79,6 +79,61 @@ def load_and_validate_report(
     return data, domain, resolved_hosts, skipped_unresolved_count
 
 
+def load_and_validate_generic_report(
+    report_path_str: str,
+    report_type: str = "report",
+    expected_domain: str | None = None,
+) -> tuple[dict[str, Any], str, list[dict[str, Any]]]:
+    """Load and validate an untrusted scan report JSON file.
+
+    Treats the input report as untrusted data:
+    - Verifies file existence.
+    - Validates JSON format and root dictionary structure.
+    - Requires a non-empty 'domain' string.
+    - Asserts domain matches expected_domain if specified.
+    - Requires a 'results' list of dictionaries.
+
+    Args:
+        report_path_str: Path to the JSON report file.
+        report_type: Descriptive name for errors (e.g. 'probe', 'inspect').
+        expected_domain: Optional expected domain to check for agreement.
+
+    Returns:
+        Tuple of (raw_report_dict, target_domain, results_list).
+
+    Raises:
+        ReportValidationError: On missing, malformed, or mismatched domain report.
+    """
+    report_path = Path(report_path_str)
+    type_name = report_type.capitalize()
+    if not report_path.is_file():
+        raise ReportValidationError(f"{type_name} report file not found: {report_path_str}")
+
+    try:
+        with report_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        raise ReportValidationError(f"Failed to parse {report_type} report JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ReportValidationError(f"{type_name} report JSON root must be an object")
+
+    domain = data.get("domain")
+    if not domain or not isinstance(domain, str):
+        raise ReportValidationError(f"{type_name} report is missing a valid 'domain' field")
+
+    if expected_domain and domain.strip().lower() != expected_domain.strip().lower():
+        msg = f"{type_name} report domain '{domain}' does not match expected '{expected_domain}'"
+        raise ReportValidationError(msg)
+
+    raw_results = data.get("results")
+    if not isinstance(raw_results, list):
+        raise ReportValidationError(f"{type_name} report 'results' field must be a list")
+
+    dict_results = [r for r in raw_results if isinstance(r, dict)]
+    return data, domain, dict_results
+
+
 def is_safe_public_ip(ip_str: str) -> bool:
     """Check if an IP address is a safe, globally routable public address.
 

@@ -469,3 +469,105 @@ class InspectReport:
             "counts": self.counts,
             "results": [r.to_dict() for r in self.results],
         }
+
+
+class SeverityTier(StrEnum):
+    """Categorization of security findings and risk severity."""
+
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+
+
+@dataclass
+class Finding:
+    """An individual security finding discovered on a target host.
+
+    Attributes:
+        id: Unique identifier for the finding type (e.g. 'PORT_EXPOSED_DB').
+        title: Human-readable short title.
+        tier: Severity tier (CRITICAL, HIGH, MEDIUM, LOW, INFO).
+        points: Heuristic numerical risk score assigned to this finding.
+        source: Source report stage ('discover', 'probe', 'portscan', 'inspect').
+        host: Hostname where the finding was detected.
+        port: Relevant TCP port number, or None if host/domain level.
+        evidence: Concrete proof and observation string supporting the finding.
+        why_it_matters: Plain-English explanation of security impact.
+    """
+
+    id: str
+    title: str
+    tier: str
+    points: int
+    source: str
+    host: str
+    port: int | None = None
+    evidence: str = ""
+    why_it_matters: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert Finding to dictionary for JSON export."""
+        return asdict(self)
+
+
+@dataclass
+class HostScore:
+    """Aggregated risk score and findings for a single target host.
+
+    Attributes:
+        subdomain: Hostname evaluated.
+        score: Sum of points from all findings detected on this host.
+        band: Host severity band derived from the worst finding tier.
+        findings: List of individual findings for this host.
+    """
+
+    subdomain: str
+    score: int = 0
+    band: str = SeverityTier.INFO.value
+    findings: list[Finding] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert HostScore to dictionary for JSON export."""
+        return {
+            "subdomain": self.subdomain,
+            "score": self.score,
+            "band": self.band,
+            "findings": [f.to_dict() for f in self.findings],
+        }
+
+
+@dataclass
+class ScoreReport:
+    """Top-level report containing domain-wide risk scores and per-host findings.
+
+    Attributes:
+        domain: Target base domain.
+        generated_utc: ISO 8601 UTC timestamp of score generation.
+        inputs_present: List of report sources present ('discover', 'probe', etc.).
+        domain_score: Sum of all host risk points.
+        domain_band: Domain-wide severity band derived from host bands.
+        counts: Summary statistics of findings by tier and host counts by band.
+        hosts: List of HostScore entries sorted worst-first.
+    """
+
+    domain: str
+    generated_utc: str
+    inputs_present: list[str]
+    domain_score: int
+    domain_band: str
+    counts: dict[str, int] = field(default_factory=dict)
+    hosts: list[HostScore] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert ScoreReport to dictionary for JSON export."""
+        return {
+            "domain": self.domain,
+            "generated_utc": self.generated_utc,
+            "inputs_present": self.inputs_present,
+            "domain_score": self.domain_score,
+            "domain_band": self.domain_band,
+            "counts": self.counts,
+            "hosts": [h.to_dict() for h in self.hosts],
+        }

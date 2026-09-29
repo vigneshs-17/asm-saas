@@ -25,6 +25,7 @@ from asm.portscan import DEFAULT_PORTS, run_port_scan
 from asm.prober import probe_hosts_concurrently
 from asm.resolver import resolve_subdomains_concurrently
 from asm.scan_common import ReportValidationError, load_and_validate_report
+from asm.scoring import score_domain_reports
 from asm.validators import DomainValidationError, validate_domain
 
 logger = logging.getLogger("asm")
@@ -157,6 +158,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to save the JSON inspect report (default: output)",
     )
     inspect_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging",
+    )
+
+    # Subcommand: score
+    score_parser = subparsers.add_parser(
+        "score",
+        help="Compute risk scores and aggregate multi-stage reports for a domain",
+    )
+    score_parser.add_argument(
+        "--discover",
+        required=True,
+        help="Path to Step 1 discovery report JSON file (required)",
+    )
+    score_parser.add_argument(
+        "--probe",
+        default=None,
+        help="Path to Step 2 probe report JSON file (optional)",
+    )
+    score_parser.add_argument(
+        "--portscan",
+        default=None,
+        help="Path to Step 3 portscan report JSON file (optional)",
+    )
+    score_parser.add_argument(
+        "--inspect",
+        default=None,
+        help="Path to Step 4 inspect report JSON file (optional)",
+    )
+    score_parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_dir",
+        default="output",
+        help="Directory to save the JSON score report (default: output)",
+    )
+    score_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -634,6 +674,91 @@ def handle_inspect(report_file_arg: str, authorized: bool, output_dir_arg: str) 
     return 0
 
 
+def handle_score(
+    discover_path: str,
+    probe_path: str | None,
+    portscan_path: str | None,
+    inspect_path: str | None,
+    output_dir_arg: str,
+) -> int:
+    """Execute risk scoring and multi-stage report aggregation.
+
+    Args:
+        discover_path: Path to Step 1 discovery report JSON.
+        probe_path: Optional path to Step 2 probe report JSON.
+        portscan_path: Optional path to Step 3 portscan report JSON.
+        inspect_path: Optional path to Step 4 inspect report JSON.
+        output_dir_arg: Directory to save the final JSON score report.
+
+    Returns:
+        Exit code: 0 on success, 1 on validation or write error.
+    """
+    try:
+        report = score_domain_reports(
+            discover_path=discover_path,
+            probe_path=probe_path,
+            portscan_path=portscan_path,
+            inspect_path=inspect_path,
+        )
+    except ReportValidationError as rve:
+        print(f"Error: {rve}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        logger.debug("Unexpected scoring error: %s", exc, exc_info=True)
+        print(f"Error: Failed to compute score report: {exc}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(output_dir_arg)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    report_path = out_dir / f"{report.domain}_score_{ts}.json"
+
+    try:
+        with report_path.open("w", encoding="utf-8") as f:
+            json.dump(report.to_dict(), f, indent=2)
+    except OSError as err:
+        print(f"Error: Failed to write score report to {report_path}: {err}", file=sys.stderr)
+        return 1
+
+    # CLI Output Summary
+    print()
+    print("=" * 80)
+    print(f"ASM RISK SCORE REPORT: {report.domain}")
+    print("=" * 80)
+    print(f"Domain Severity Band: {report.domain_band}")
+    print(f"Total Domain Risk Score: {report.domain_score} pts")
+    print(f"Inputs Evaluated: {', '.join(report.inputs_present)}")
+    if report.counts.get("high_escalation"):
+        print("(! Escalation note: >= 3 HIGH severity hosts identified across domain)")
+
+    breakdown = (
+        f"Hosts Breakdown: {report.counts['hosts_evaluated']} total "
+        f"({report.counts['hosts_critical']} Critical, "
+        f"{report.counts['hosts_high']} High, "
+        f"{report.counts['hosts_medium']} Medium, "
+        f"{report.counts['hosts_low']} Low, "
+        f"{report.counts['hosts_info']} Info)"
+    )
+    print(breakdown)
+    print(f"Saved score report to {report_path}")
+    print("-" * 80)
+    print("HOSTS (sorted worst-first):")
+
+    for host in report.hosts:
+        print(f"\n  [{host.band}] {host.subdomain} (Score: {host.score} pts)")
+        if not host.findings:
+            print("    - Clean: No security findings identified")
+            continue
+
+        for f in host.findings:
+            port_str = f" [Port {f.port}]" if f.port is not None else ""
+            print(f"    * [{f.tier}] {f.title} ({f.points} pts){port_str}")
+            print(f"      Evidence: {f.evidence}")
+
+    print()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main CLI entrypoint."""
     parser = build_parser()
@@ -649,6 +774,14 @@ def main(argv: list[str] | None = None) -> int:
         return handle_portscan(args.report_file, args.authorized, args.output_dir)
     if args.command == "inspect":
         return handle_inspect(args.report_file, args.authorized, args.output_dir)
+    if args.command == "score":
+        return handle_score(
+            discover_path=args.discover,
+            probe_path=args.probe,
+            portscan_path=args.portscan,
+            inspect_path=args.inspect,
+            output_dir_arg=args.output_dir,
+        )
 
     return 0
 

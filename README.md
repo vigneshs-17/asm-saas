@@ -176,9 +176,51 @@ Report File:         output\example.com_inspect_20260929T060910Z.json
     - Cert: VALID (expires in 87 days, TLSv1.3) [from_socket]
     - Missing Headers: Strict-Transport-Security, Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
     ! Disclosed: Server: cloudflare
+
+### 5. Risk Scoring & Combined Report (Passive / Local Aggregation)
+```bash
+asm score --discover output/example.com_20260929T042333Z.json \
+          --probe output/example.com_probe_20260929T043830Z.json \
+          --portscan output/example.com_portscan_20260929T045524Z.json \
+          --inspect output/example.com_inspect_20260929T060910Z.json
 ```
 
----
+Options:
+- `--discover FILE`: Path to Step 1 discovery report JSON file (**required**).
+- `--probe FILE`: Path to Step 2 probe report JSON file (optional).
+- `--portscan FILE`: Path to Step 3 portscan report JSON file (optional).
+- `--inspect FILE`: Path to Step 4 inspect report JSON file (optional).
+- `-o`, `--output DIR`: Directory to save the final score report (default: `output`).
+- `-v`, `--verbose`: Enable verbose debug logging.
+
+> [!NOTE]
+> **Heuristic Triage Model (Not CVSS):**
+> This scoring model is a heuristic severity model designed for defensive prioritization and attack surface triage. It is **NOT CVSS** and **NOT a guarantee of exploitability**. Scoring evaluates observable internet-facing posture flaws (e.g., exposed databases, expired TLS certificates, missing security headers) to guide remediation, but does not model internal compensating controls, defense-in-depth, or active exploitation.
+
+#### Severity Tiers & Point Values:
+- **CRITICAL** (10 pts): Confirmed reachable database services responding with active banners on the public internet.
+- **HIGH** (7 pts): Exposed sensitive administrative services (RDP, SMB, Telnet), exposed DB ports without banner, expired/invalid certificates, or untrusted public CAs.
+- **MEDIUM** (4 pts): Cleartext protocols (FTP, SMTP, POP3, IMAP), self-signed certificates, certificate hostname mismatches, certificates expiring soon ($\le 30$d), deprecated TLS 1.0/1.1 protocols, or HTTP-only services.
+- **LOW** (1 pt): Missing security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options), weak HSTS max-age duration, or technology disclosure headers.
+- **INFO** (0 pts): Domain attack surface context observations ($\ge 10$ live assets).
+
+#### Host and Domain Band Computation:
+1. **Host Severity Band**:
+   Derived directly from the host's **worst finding tier**:
+   - Any `CRITICAL` finding $\rightarrow$ Host band **CRITICAL**
+   - Else any `HIGH` finding $\rightarrow$ Host band **HIGH**
+   - Else any `MEDIUM` finding $\rightarrow$ Host band **MEDIUM**
+   - Else any `LOW` finding $\rightarrow$ Host band **LOW**
+   - Else $\rightarrow$ Host band **INFO** (clean host)
+   The numerical point sum serves as a secondary sort key within each band.
+2. **Domain Severity Band**:
+   Derived from the aggregate host bands:
+   - Any `CRITICAL` host $\rightarrow$ Domain band **CRITICAL**
+   - Else any `HIGH` host $\rightarrow$ Domain band **HIGH** (flagged as an escalation note if $\ge 3$ high hosts exist)
+   - Else any `MEDIUM` host $\rightarrow$ Domain band **MEDIUM**
+   - Else any `LOW` host $\rightarrow$ Domain band **LOW**
+   - Else $\rightarrow$ Domain band **INFO**
+
 
 ## Running Tests and Linting
 

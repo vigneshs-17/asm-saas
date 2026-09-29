@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from asm.cli import main
 from asm.discovery import CrtshError
 from asm.models import HostProbeResult, HostProbeStatus, SubdomainResult, UrlProbeResult
@@ -451,3 +453,67 @@ class TestInspectCLI:
         assert data["domain"] == "example.com"
         assert data["counts"]["hosts_inspected"] == 1
         assert len(data["results"]) == 1
+
+
+class TestScoreCLI:
+    """Test suite for 'asm score' CLI command and error handling."""
+
+    def test_score_without_discover_flag_exits_2(self) -> None:
+        """Verify score command without required --discover exits with argparse error."""
+        with pytest.raises(SystemExit) as exc_info:
+            main(["score"])
+        assert exc_info.value.code == 2
+
+    def test_score_missing_discover_file_exits_1(self, capsys: pytest.CaptureFixture) -> None:
+        """Verify score command with nonexistent discover file exits 1 with clean error."""
+        exit_code = main(["score", "--discover", "nonexistent_discover.json"])
+        assert exit_code == 1
+
+        captured = capsys.readouterr()
+        assert "Error: Discover report file not found:" in captured.err
+
+    def test_score_domain_mismatch_exits_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Verify score command exits 1 when report domains disagree."""
+        disc_file = tmp_path / "disc.json"
+        disc_file.write_text(json.dumps({"domain": "alpha.com", "results": []}))
+
+        probe_file = tmp_path / "probe.json"
+        probe_file.write_text(json.dumps({"domain": "beta.com", "results": []}))
+
+        exit_code = main(["score", "--discover", str(disc_file), "--probe", str(probe_file)])
+        assert exit_code == 1
+
+        captured = capsys.readouterr()
+        assert "does not match expected 'alpha.com'" in captured.err
+
+    def test_score_success_workflow(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        """Verify full score CLI execution outputs summary and writes report JSON."""
+        disc_file = tmp_path / "disc.json"
+        disc_file.write_text(
+            json.dumps({
+                "domain": "target.org",
+                "results": [
+                    {"subdomain": "target.org", "resolved": True},
+                ],
+            })
+        )
+
+        exit_code = main(["score", "--discover", str(disc_file), "-o", str(tmp_path)])
+        assert exit_code == 0
+
+        captured = capsys.readouterr()
+        assert "ASM RISK SCORE REPORT: target.org" in captured.out
+        assert "Domain Severity Band: INFO" in captured.out
+
+        score_files = list(tmp_path.glob("target.org_score_*.json"))
+        assert len(score_files) == 1
+        with score_files[0].open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert data["domain"] == "target.org"
+        assert data["inputs_present"] == ["discover"]
+        assert data["domain_band"] == "INFO"
+        assert len(data["hosts"]) == 1
+
