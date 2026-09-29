@@ -18,6 +18,8 @@
 - Use logging, not print (except CLI output)
 - Tests for all logic; tests never touch the network (use mocks and fixtures)
 - Before saying "done": run pytest and ruff check . and show the results
+- When adding or editing CI/Docker config, reuse the exact action and image
+  versions already pinned in the repo. Never introduce an older version.
 
 ## Security (non-negotiable)
 - Validate all user input
