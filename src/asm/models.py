@@ -24,6 +24,7 @@ class HostProbeStatus(StrEnum):
     SKIPPED_UNTRUSTED = "SKIPPED_UNTRUSTED"
     SKIPPED_PRIVATE_IP = "SKIPPED_PRIVATE_IP"
     SKIPPED_UNRESOLVED = "SKIPPED_UNRESOLVED"
+    SKIPPED_NOT_HTTPS = "SKIPPED_NOT_HTTPS"
 
 
 class ProbeErrorType(StrEnum):
@@ -320,6 +321,151 @@ class PortScanReport:
             "scan_started_utc": self.scan_started_utc,
             "scan_finished_utc": self.scan_finished_utc,
             "port_list_used": self.port_list_used,
+            "counts": self.counts,
+            "results": [r.to_dict() for r in self.results],
+        }
+
+
+@dataclass
+class CertInfo:
+    """Detailed information and security flags for a TLS certificate.
+
+    Attributes:
+        subject_cn: Common Name from the certificate subject.
+        sans: List of DNS Subject Alternative Names.
+        issuer: Formatted issuer distinguished name.
+        not_before: ISO 8601 UTC timestamp of validity start.
+        not_after: ISO 8601 UTC timestamp of validity end.
+        days_until_expiry: Number of days until certificate expires.
+        serial_hex: Hexadecimal string of certificate serial number.
+        tls_version: Negotiated TLS protocol version (e.g. 'TLSv1.3').
+        hostname_matches: True if the scanned hostname matches CN or SANs.
+        is_trusted: True if the certificate validates against standard CA bundle.
+        verify_error: Verification error message if not trusted.
+        source: Inspection method used ('from_response' or 'from_socket').
+        expired: True if current time is past not_after.
+        not_yet_valid: True if current time is before not_before.
+        issuer_equals_subject: True if issuer matches subject (indicates likely self-signed).
+        hostname_mismatch: True if hostname does not match cert CN or SANs.
+        expiring_soon: True if days_until_expiry <= 30 and not yet expired.
+        deprecated_tls: True if negotiated TLS version is TLS 1.0 or 1.1.
+    """
+
+    subject_cn: str | None = None
+    sans: list[str] = field(default_factory=list)
+    issuer: str = ""
+    not_before: str = ""
+    not_after: str = ""
+    days_until_expiry: float = 0.0
+    serial_hex: str | None = None
+    tls_version: str | None = None
+    hostname_matches: bool = False
+    is_trusted: bool = False
+    verify_error: str | None = None
+    source: str = "from_response"
+    expired: bool = False
+    not_yet_valid: bool = False
+    issuer_equals_subject: bool = False
+    hostname_mismatch: bool = False
+    expiring_soon: bool = False
+    deprecated_tls: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert CertInfo to dictionary for JSON export."""
+        return asdict(self)
+
+
+@dataclass
+class HeaderInfo:
+    """Security headers evaluation and information disclosure detection.
+
+    Attributes:
+        present_headers: Dictionary of monitored security headers found.
+        missing_headers: List of monitored security headers that were absent.
+        hsts_max_age: Parsed max-age value from Strict-Transport-Security.
+        hsts_weak: True if HSTS is present but max-age < 15552000 (180 days).
+        server: Value of Server header if disclosed.
+        x_powered_by: Value of X-Powered-By header if disclosed.
+        x_aspnet_version: Value of X-AspNet-Version header if disclosed.
+        server_disclosed: True if Server header reveals software/version.
+        x_powered_by_disclosed: True if X-Powered-By header is present.
+        x_aspnet_version_disclosed: True if X-AspNet-Version header is present.
+        error: Error message if headers could not be fetched.
+    """
+
+    present_headers: dict[str, str] = field(default_factory=dict)
+    missing_headers: list[str] = field(default_factory=list)
+    hsts_max_age: int | None = None
+    hsts_weak: bool = False
+    server: str | None = None
+    x_powered_by: str | None = None
+    x_aspnet_version: str | None = None
+    server_disclosed: bool = False
+    x_powered_by_disclosed: bool = False
+    x_aspnet_version_disclosed: bool = False
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert HeaderInfo to dictionary for JSON export."""
+        return asdict(self)
+
+
+@dataclass
+class HostInspectResult:
+    """Inspection outcome for a single host covering TLS certificate and headers.
+
+    Attributes:
+        subdomain: Hostname inspected.
+        status: Inspection status (PROBED, SKIPPED_UNTRUSTED, etc.).
+        skip_reason: Explanation if skipped.
+        cert: Certificate inspection findings, or None if skipped/unreachable.
+        headers: Header inspection findings, or None if skipped/unreachable.
+    """
+
+    subdomain: str
+    status: str = HostProbeStatus.PROBED.value
+    skip_reason: str | None = None
+    cert: CertInfo | None = None
+    headers: HeaderInfo | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert HostInspectResult to dictionary for JSON export."""
+        return {
+            "subdomain": self.subdomain,
+            "status": self.status,
+            "skip_reason": self.skip_reason,
+            "cert": self.cert.to_dict() if self.cert is not None else None,
+            "headers": self.headers.to_dict() if self.headers is not None else None,
+        }
+
+
+@dataclass
+class InspectReport:
+    """Top-level report containing TLS certificate and HTTP security header findings.
+
+    Attributes:
+        domain: Target base domain.
+        source_report: Filename of the input probe report.
+        inspect_started_utc: ISO 8601 UTC timestamp of inspection start.
+        inspect_finished_utc: ISO 8601 UTC timestamp of inspection completion.
+        counts: Summary statistics.
+        results: Detailed results for each host.
+    """
+
+    domain: str
+    source_report: str
+    inspect_started_utc: str
+    inspect_finished_utc: str
+    counts: dict[str, int] = field(default_factory=dict)
+    results: list[HostInspectResult] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert InspectReport to dictionary for JSON export."""
+        return {
+            "domain": self.domain,
+            "source_report": self.source_report,
+            "inspect_started_utc": self.inspect_started_utc,
+            "inspect_finished_utc": self.inspect_finished_utc,
             "counts": self.counts,
             "results": [r.to_dict() for r in self.results],
         }

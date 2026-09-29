@@ -206,7 +206,8 @@ async def scan_single_port(
             )
 
             # Rule 1: A port is OPEN only when asyncio.open_connection fully succeeds
-            # AND returns a usable connection (reader/writer, no exception). Anything else is not OPEN.
+            # AND returns a usable connection (reader/writer, no exception).
+            # Anything else is not OPEN.
             if reader is None or writer is None:
                 return PortResult(
                     port=port,

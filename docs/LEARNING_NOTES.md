@@ -301,3 +301,95 @@ DNS Rebinding is an attack where an attacker controls an authoritative nameserve
 1. **Prevention of Security Drift:** In multi-stage security tools (Discovery -> HTTP Probing -> Port Scanning -> Vulnerability Assessment), each stage performs network I/O. If validation logic is duplicated across separate files, improvements or bug fixes made in one scanner (e.g. discovering a bypass in IPv4-mapped IPv6 address parsing) might not be applied to other stages, leaving gaps.
 2. **Consistent Policy Enforcement:** Centralizing functions like `load_and_validate_report`, `is_safe_public_ip`, and `validate_host_and_scope` ensures that all active modules adhere strictly to the exact same authorization boundaries, private IP filters, and error handling rules.
 3. **Testability & Auditability:** Having a single, dedicated module with unit tests proves that core security boundaries are tested and verified independently of protocol-specific networking logic.
+
+---
+
+# Part 4: TLS Certificate Inspection & HTTP Security Headers
+
+## 1. Plain-English Architecture Walkthrough
+
+### `src/asm/tls_inspect.py`
+- **What it is:** Pure standard library TLS certificate inspector and evaluator.
+- **Two-Pass Public API Verification Strategy:**
+  - **Pass 1 (Verified):** Uses `ssl.create_default_context()` to connect to `host:443`. If the certificate chain validates successfully against the operating system's trusted root CA store, `is_trusted = True` and the parsed certificate dictionary is read via `sslsock.getpeercert()`.
+  - **Pass 2 (Unverified Fallback):** If verification fails (e.g. expired, self-signed, invalid CA chain), an unverified context is created using public standard library API (`ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE`). This allows the TLS handshake to complete, records `is_trusted = False`, captures the exact verification error (`verify_error`), and extracts negotiated TLS protocol version and key flags.
+- **Key Functions & Logic:**
+  - `matches_hostname(hostname, sans, common_name)`: Implements RFC 6125 wildcard matching. Prioritizes Subject Alternative Names (SANs) over Common Name (CN). Ensures single-level wildcards (`*.example.com`) only match single subdomains (`api.example.com`) and never multi-level domains (`a.b.example.com`) or the apex domain (`example.com`).
+  - `parse_cert_dict(cert_dict, ...)`: Converts `getpeercert()` output into `CertInfo`. Parses validity dates into ISO 8601 UTC via `ssl.cert_time_to_seconds`, calculates exact `days_until_expiry`, and evaluates security flags.
+  - Flags: `expired` (now past notAfter), `not_yet_valid` (now before notBefore), `issuer_equals_subject` (likely self-signed), `hostname_mismatch`, `expiring_soon` (30 days or fewer remaining), and `deprecated_tls` (TLS 1.0 or 1.1).
+
+### Note on Weak Signature Algorithm Detection
+- **Why `weak_sig` is omitted in v1:** Python's standard library `ssl.getpeercert()` decodes X.509 certificates using OpenSSL's internal C routines but intentionally omits the certificate signature algorithm OID from its returned dictionary. Hand-parsing binary DER/ASN.1 structures in the standard library without external libraries is fragile and error-prone across different X.509 extensions.
+- **Production Standard:** In enterprise Attack Surface Management tools, comprehensive certificate parsing (including signature algorithms like MD5/SHA-1 and full certificate chains) is performed using the dedicated `cryptography` library (`cryptography.x509`).
+
+### `src/asm/headers_inspect.py`
+- **What it is:** HTTP security header evaluator and single-connection TLS coordinator.
+- **Single-Connection Preference:**
+  - Performs an HTTPS GET to `https://<host>/` using `httpx.Client(verify=True)`.
+  - Evaluates HTTP response headers directly.
+  - Reuses the active TLS connection by reading `response.extensions.get("network_stream").get_extra_info("ssl_object")` to extract certificate data in the exact same TCP round-trip.
+  - **Robust Fallback:** If the stream is closed, `ssl_object` is None, or `getpeercert()` returns an empty dictionary, the coordinator falls back to a direct `ssl+socket` connection to `host:443`, recording whether the cert was obtained `from_response` or `from_socket`.
+- **Security Header Analysis:**
+  - Monitored Headers: `Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`.
+  - HSTS Parsing: Extracts `max-age` in seconds. Flags `hsts_weak = True` if `max-age < 15552000` (180 days).
+  - Information Disclosure: Checks for `Server`, `X-Powered-By`, and `X-AspNet-Version` headers that leak server software and backend runtime versions to attackers.
+
+### `src/asm/models.py` (Inspection Extensions)
+- Added `CertInfo` (`dataclass`): Certificate metadata and boolean flags.
+- Added `HeaderInfo` (`dataclass`): Present/missing headers, HSTS max-age, and disclosure flags.
+- Added `HostInspectResult` (`dataclass`): Combined per-host inspection result.
+- Added `InspectReport` (`dataclass`): Top-level export schema for inspect reports.
+
+### `src/asm/cli.py` (`handle_inspect`)
+- Added `asm inspect <probe_report.json> --authorized [-o DIR] [-v]`.
+- Enforces the `--authorized` gate before initiating any network inspection.
+- Filters probe results to inspect only hosts that were verified reachable over HTTPS in Step 2 (`SKIPPED_NOT_HTTPS`).
+- Displays a clean CLI summary and exports the JSON report.
+
+---
+
+## 2. Five Step 4 Cybersecurity Interview Questions & Answers
+
+### Question 1: What does a TLS certificate actually prove, and what do certificate expiry, self-signing, and hostname mismatch indicate for an organization's attack surface?
+**Answer:**
+- **What a TLS Certificate Proves:** A TLS certificate cryptographically binds a public key to an identity (a domain name). When signed by a trusted Certificate Authority (CA) in the client's trust store, it proves two things: (1) **Authentication** (the client is speaking to the legitimate owner of the domain) and (2) **Confidentiality/Integrity** (enables symmetric session key exchange so network traffic cannot be eavesdropped on or tampered with).
+- **Attack Surface Implications:**
+  - **Expired Certificate:** Indicates poor asset management, broken automated certificate lifecycle management (e.g. Certbot/ACME failure), and immediately causes browser security warnings that destroy user trust or break API integrations.
+  - **Self-Signed Certificate (`issuer_equals_subject`):** Means no trusted third-party CA validated domain ownership. Attackers on the local network (or via ARP/DNS poisoning) can easily generate their own self-signed certificates and execute Man-in-the-Middle (MitM) attacks.
+  - **Hostname Mismatch:** Indicates that the domain serving traffic does not match the names in the certificate's SAN or CN. This commonly happens when a staging site points to production CDN infrastructure, when a virtual host is misconfigured, or after an incomplete domain migration.
+
+---
+
+### Question 2: What is HTTP Strict Transport Security (HSTS), and why does a weak `max-age` value (e.g. less than 180 days) undermine its security guarantee?
+**Answer:**
+- **What HSTS Does:** HSTS (`Strict-Transport-Security`) is a response header that instructs web browsers to **never** load the site over plain HTTP and to automatically convert all insecure `http://` links to `https://` before sending any request. It also prevents users from clicking through SSL certificate warnings.
+- **Why `max-age` Matters:**
+  - When a user types `example.com` into their browser, the initial request is sent over unencrypted HTTP port 80. An attacker on the local network (e.g. public Wi-Fi) can intercept this initial request using an SSL-stripping tool (like `sslstrip`) before the server can redirect to HTTPS.
+  - HSTS caches the requirement to use HTTPS in the user's browser for the duration of `max-age` seconds.
+  - A short `max-age` (e.g. a few hours or days) expires quickly. If a user does not visit the site frequently, their cached HSTS rule expires, reopening the window for SSL-stripping and downgrade attacks. The security community (and Chromium HSTS Preload list) mandates a minimum `max-age` of at least 180 days (15,552,000 seconds), with 1–2 years recommended.
+
+---
+
+### Question 3: What is the primary security objective of Content Security Policy (CSP), and what types of attacks does it mitigate?
+**Answer:**
+- **Primary Objective:** CSP is an HTTP response header (`Content-Security-Policy`) that allows site administrators to declare an approved allowlist of sources from which the browser is permitted to load and execute dynamic resources (JavaScript, CSS, images, iframes, fonts, media).
+- **Attacks Mitigated:**
+  - **Cross-Site Scripting (XSS):** By restricting script execution to approved domains and disallowing inline scripts (`'unsafe-inline'`) or `eval()` (`'unsafe-eval'`), CSP prevents injected malicious scripts from executing even if an attacker successfully injects code into an HTML page.
+  - **Clickjacking / UI Redressing:** Using the `frame-ancestors` directive (which supersedes `X-Frame-Options`), CSP dictates which parent domains are allowed to embed the current page inside an `<iframe>`, preventing attackers from tricking users into clicking invisible buttons.
+  - **Data Exfiltration:** CSP restricts where forms can be submitted (`form-action`) and where background network requests can be sent (`connect-src`), preventing malicious scripts from beaconing stolen session tokens or credentials to external attacker-controlled servers.
+
+---
+
+### Question 4: How do information-disclosure headers (such as `Server`, `X-Powered-By`, `X-AspNet-Version`) assist an attacker during the reconnaissance phase?
+**Answer:**
+- **Technology Stack Fingerprinting:** Headers like `Server: Apache/2.4.49`, `X-Powered-By: PHP/7.4.3`, or `X-AspNet-Version: 4.0.30319` explicitly tell an attacker the exact web server software, programming language runtime, and web framework versions powering the application.
+- **Accelerating Exploit Discovery:** Rather than sending noisy, generalized probe payloads that might trigger a Web Application Firewall (WAF), an attacker can immediately cross-reference the leaked version numbers against public vulnerability databases (CVEs) and exploit repositories (e.g. finding that Apache 2.4.49 is vulnerable to path traversal CVE-2021-41773).
+- **Remediation:** Production servers should suppress, strip, or minimize these headers (e.g. `ServerTokens Prod` in Apache, `server_tokens off` in Nginx, or removing `X-Powered-By` in Express/PHP) to enforce defense-in-depth and make reconnaissance more costly for adversaries.
+
+---
+
+### Question 5: Why is the single-connection preference with a two-pass fallback pattern an ideal design for Attack Surface Management tools?
+**Answer:**
+1. **Network Efficiency & Politeness:** Opening new TCP connections and performing cryptographic TLS handshakes consumes network bandwidth and CPU cycles on both the scanner and the target server. By reading the active TLS peer certificate directly from the underlying transport stream of the HTTP response (`network_stream`), the tool collects both HTTP headers and TLS certificates in a single round-trip.
+2. **Graceful Degradation:** Production networks are messy. If a certificate is invalid (expired or self-signed), a strict client like `httpx` will abort the connection immediately during TLS verification. By catching this verification failure and executing a targeted unverified fallback (`verify_mode = ssl.CERT_NONE`), the scanner avoids crashing, records the exact cause of untrust, and still inspects the host's headers and protocol version.
+3. **Audit Trail & Transparency:** Tracking the source of inspection (`from_response` vs. `from_socket`) ensures the resulting ASM report clearly indicates whether the host allowed a standard verified session or required low-level socket fallback.

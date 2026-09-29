@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from asm.discovery import CrtshError, fetch_crtsh_data, parse_subdomains
+from asm.headers_inspect import run_inspection
 from asm.models import (
     DiscoveryReport,
     HostPortScanResult,
@@ -127,6 +128,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to save the JSON port scan report (default: output)",
     )
     portscan_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging",
+    )
+
+    # Subcommand: inspect
+    inspect_parser = subparsers.add_parser(
+        "inspect",
+        help="Inspect TLS certificates and HTTP security headers for live HTTPS hosts",
+    )
+    inspect_parser.add_argument(
+        "report_file",
+        help="Path to Step 2 probe report JSON file",
+    )
+    inspect_parser.add_argument(
+        "--authorized",
+        action="store_true",
+        default=False,
+        help="Confirm authorization to perform active inspection against target domain",
+    )
+    inspect_parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_dir",
+        default="output",
+        help="Directory to save the JSON inspect report (default: output)",
+    )
+    inspect_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -486,6 +516,124 @@ def handle_portscan(report_file_arg: str, authorized: bool, output_dir_arg: str)
     return 0
 
 
+def handle_inspect(report_file_arg: str, authorized: bool, output_dir_arg: str) -> int:
+    """Execute the active TLS certificate and HTTP security headers inspection workflow.
+
+    Args:
+        report_file_arg: Path to Step 2 probe report JSON file.
+        authorized: User confirmation of testing authorization.
+        output_dir_arg: Target directory for the inspect report.
+
+    Returns:
+        Exit code: 0 on success, 1 on authorization or validation error.
+    """
+    # 1. Load and validate probe report as untrusted input
+    try:
+        report_data, domain, resolved_hosts, skipped_unresolved_count = load_and_validate_report(
+            report_file_arg
+        )
+    except ReportValidationError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
+
+    # 2. Authorization Gate (strictly enforced before any network requests)
+    if not authorized:
+        sys.stderr.write(
+            f"Active inspection sends requests to {domain}. Re-run with --authorized "
+            "to confirm you own it or have written permission to test it.\n"
+        )
+        return 1
+
+    results_data = report_data.get("results", [])
+    report_path = Path(report_file_arg)
+
+    print(f"[*] Inspecting TLS and security headers for live HTTPS hosts of '{domain}'...")
+    inspect_report = run_inspection(results_data, domain, report_path.name)
+
+    # 3. Save report to JSON file
+    start_dt = datetime.fromisoformat(inspect_report.inspect_started_utc)
+    filename_ts = start_dt.strftime("%Y%m%dT%H%M%SZ")
+    output_dir = Path(output_dir_arg)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_file = output_dir / f"{domain}_inspect_{filename_ts}.json"
+
+    with report_file.open("w", encoding="utf-8") as f:
+        json.dump(inspect_report.to_dict(), f, indent=2)
+
+    # 4. Print summary
+    counts = inspect_report.counts
+    print("\n=== Inspection Summary ===")
+    print(f"Domain:              {domain}")
+    print(f"Hosts Inspected:     {counts.get('hosts_inspected', 0)}")
+    print(f"Valid Certificates:  {counts.get('certs_valid', 0)}")
+    print(f"Expired Certs:       {counts.get('certs_expired', 0)}")
+    print(f"Expiring Soon (<=30d): {counts.get('certs_expiring_soon', 0)}")
+    print(f"Missing HSTS:        {counts.get('hosts_missing_hsts', 0)}")
+    print(f"Skipped Not HTTPS:   {counts.get('skipped_not_https', 0)}")
+    print(f"Skipped Untrusted:   {counts.get('skipped_untrusted', 0)}")
+    print(f"Skipped Private IP:  {counts.get('skipped_private_ip', 0)}")
+    print(f"Report File:         {report_file}")
+
+    # 5. Print host findings
+    print("\n=== Host Findings ===")
+    probed_hosts = [r for r in inspect_report.results if r.status == HostProbeStatus.PROBED.value]
+    if not probed_hosts:
+        print("No live HTTPS hosts were inspected.")
+    else:
+        for hr in probed_hosts:
+            print(f"[+] {hr.subdomain}")
+            # Cert line
+            if hr.cert is None:
+                print("    - Cert: NOT AVAILABLE (unreachable)")
+            else:
+                c = hr.cert
+                status_parts = []
+                version_str = f", {c.tls_version}" if c.tls_version else ""
+                if c.expired:
+                    status_parts.append(f"EXPIRED{version_str}")
+                elif c.not_yet_valid:
+                    status_parts.append(f"NOT YET VALID{version_str}")
+                elif c.is_trusted and not c.hostname_mismatch:
+                    days_exp = int(c.days_until_expiry)
+                    status_parts.append(f"VALID (expires in {days_exp} days{version_str})")
+                elif not c.is_trusted:
+                    err_msg = c.verify_error or "invalid CA"
+                    status_parts.append(f"UNTRUSTED ({err_msg}{version_str})")
+
+                if c.issuer_equals_subject:
+                    status_parts.append("LIKELY SELF-SIGNED")
+                if c.hostname_mismatch:
+                    status_parts.append("HOSTNAME MISMATCH")
+                if c.deprecated_tls:
+                    status_parts.append(f"DEPRECATED TLS ({c.tls_version})")
+
+                status_desc = ", ".join(status_parts) if status_parts else "UNKNOWN"
+                print(f"    - Cert: {status_desc} [{c.source}]")
+
+            # Headers line
+            if hr.headers is None:
+                print("    - Headers: NOT AVAILABLE (unreachable)")
+            elif hr.headers.error:
+                print(f"    - Headers: Error fetching headers ({hr.headers.error})")
+            else:
+                missing = hr.headers.missing_headers
+                if missing:
+                    print(f"    - Missing Headers: {', '.join(missing)}")
+                else:
+                    print("    - Missing Headers: None (all monitored headers present)")
+                if hr.headers.hsts_weak:
+                    print(f"    ! Weak HSTS: max-age is {hr.headers.hsts_max_age}s (< 180 days)")
+                if hr.headers.server_disclosed or hr.headers.x_powered_by_disclosed:
+                    disclosures = []
+                    if hr.headers.server:
+                        disclosures.append(f"Server: {hr.headers.server}")
+                    if hr.headers.x_powered_by:
+                        disclosures.append(f"X-Powered-By: {hr.headers.x_powered_by}")
+                    print(f"    ! Disclosed: {', '.join(disclosures)}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main CLI entrypoint."""
     parser = build_parser()
@@ -499,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_probe(args.report_file, args.authorized, args.output_dir)
     if args.command == "portscan":
         return handle_portscan(args.report_file, args.authorized, args.output_dir)
+    if args.command == "inspect":
+        return handle_inspect(args.report_file, args.authorized, args.output_dir)
 
     return 0
 

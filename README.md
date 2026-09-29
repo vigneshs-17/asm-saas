@@ -131,13 +131,65 @@ Report File:         output\example.com_portscan_20260929T045524Z.json
     - 8443/https-alt (guess by port)
 ```
 
+### 4. Inspect TLS Certificates and Security Headers (Active)
+```bash
+asm inspect output/example.com_probe_20260929T041500Z.json --authorized
+```
+
+Options:
+- `--authorized`: Confirm authorization to perform active inspection against target domain (required).
+- `-o`, `--output DIR`: Directory to save the inspection report (default: `output`).
+- `-v`, `--verbose`: Enable verbose debug logging.
+
+Security & Inspection Flags Explained:
+- **`expired`**: Certificate validity period ended (`now > not_after`). Browsers will display an invalid certificate warning and block connections.
+- **`not_yet_valid`**: Certificate start date is in the future (`now < not_before`).
+- **`issuer_equals_subject`**: Certificate subject matches issuer. Indicates a likely self-signed certificate, not definitive proof of untrust.
+- **`hostname_mismatch`**: Hostname does not match the Subject Alternative Names (SANs) or Common Name (CN) per RFC 6125.
+- **`expiring_soon`**: Certificate expires within 30 days. Needs rotation to prevent service disruption.
+- **`deprecated_tls`**: Server negotiated insecure, deprecated TLS protocol versions (`TLSv1.0` or `TLSv1.1`).
+- **`hsts_weak`**: `Strict-Transport-Security` is present but `max-age` is under 180 days (15,552,000s), leaving clients vulnerable to downgrade attacks.
+- **`server_disclosed` / `x_powered_by_disclosed`**: Response headers leak web server or framework versions (e.g. `Server: cloudflare`, `X-Powered-By: PHP/7.4.3`), assisting attackers in reconnaissance.
+
+Sample Inspection Output:
+```text
+[*] Inspecting TLS and security headers for live HTTPS hosts of 'example.com'...
+
+=== Inspection Summary ===
+Domain:              example.com
+Hosts Inspected:     2
+Valid Certificates:  2
+Expired Certs:       0
+Expiring Soon (<=30d): 0
+Missing HSTS:        2
+Skipped Not HTTPS:   0
+Skipped Untrusted:   0
+Skipped Private IP:  0
+Report File:         output\example.com_inspect_20260929T060910Z.json
+
+=== Host Findings ===
+[+] example.com
+    - Cert: VALID (expires in 87 days, TLSv1.3) [from_socket]
+    - Missing Headers: Strict-Transport-Security, Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
+    ! Disclosed: Server: cloudflare
+[+] www.example.com
+    - Cert: VALID (expires in 87 days, TLSv1.3) [from_socket]
+    - Missing Headers: Strict-Transport-Security, Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
+    ! Disclosed: Server: cloudflare
+```
+
 ---
 
 ## Running Tests and Linting
 
-To run the unit test suite (100% mocked, zero network calls):
+To run the unit test suite (100% mocked, zero network calls, integration tests deselected):
 ```bash
 pytest
+```
+
+To run real network integration tests explicitly (scans `scanme.nmap.org` and `expired.badssl.com`):
+```bash
+pytest -m integration
 ```
 
 To run the linter:

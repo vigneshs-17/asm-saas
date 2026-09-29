@@ -336,3 +336,118 @@ class TestPortScanCLIExecution:
         assert data["counts"]["hosts_scanned"] == 1
         assert data["counts"]["total_open_ports"] == 2
         assert data["counts"]["skipped_unresolved"] == 2
+
+
+class TestInspectCLI:
+    """Test suite for 'asm inspect' CLI command and safety gate."""
+
+    def test_inspect_without_authorized_flag_exits_1(self, tmp_path: Path, capsys):
+        """Verify inspect without --authorized prints warning and exits 1 with 0 network calls."""
+        probe_file = tmp_path / "probe_report.json"
+        probe_file.write_text(
+            json.dumps({
+                "domain": "secure.org",
+                "results": [
+                    {
+                        "subdomain": "secure.org",
+                        "status": "PROBED",
+                        "https": {"reachable": True},
+                    }
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        with patch("asm.cli.run_inspection") as mock_inspect:
+            exit_code = main(["inspect", str(probe_file)])
+            assert exit_code == 1
+            mock_inspect.assert_not_called()
+
+        captured = capsys.readouterr()
+        assert "Active inspection sends requests to secure.org" in captured.err
+        assert "--authorized" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_inspect_missing_report_file_exits_1(self, capsys):
+        """Verify non-existent report file prints error to stderr and exits 1."""
+        exit_code = main(["inspect", "non_existent_probe.json", "--authorized"])
+        assert exit_code == 1
+
+        captured = capsys.readouterr()
+        assert "Error: Discovery report file not found" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_inspect_success_generates_report(self, tmp_path: Path, capsys):
+        """Verify inspect command completes, prints summary, and writes JSON report."""
+        probe_file = tmp_path / "probe_report.json"
+        probe_file.write_text(
+            json.dumps({
+                "domain": "example.com",
+                "results": [
+                    {
+                        "subdomain": "example.com",
+                        "status": "PROBED",
+                        "https": {"reachable": True},
+                    }
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        from asm.models import CertInfo, HeaderInfo, HostInspectResult, InspectReport
+
+        mock_inspect_report = InspectReport(
+            domain="example.com",
+            source_report="probe_report.json",
+            inspect_started_utc="2026-09-29T12:00:00+00:00",
+            inspect_finished_utc="2026-09-29T12:00:02+00:00",
+            counts={
+                "hosts_inspected": 1,
+                "certs_valid": 1,
+                "certs_expired": 0,
+                "certs_expiring_soon": 0,
+                "hosts_missing_hsts": 0,
+                "skipped_untrusted": 0,
+                "skipped_private_ip": 0,
+                "skipped_not_https": 0,
+            },
+            results=[
+                HostInspectResult(
+                    subdomain="example.com",
+                    status="PROBED",
+                    cert=CertInfo(
+                        subject_cn="example.com",
+                        sans=["example.com"],
+                        issuer="DigiCert",
+                        days_until_expiry=60.0,
+                        tls_version="TLSv1.3",
+                        is_trusted=True,
+                        source="from_response",
+                    ),
+                    headers=HeaderInfo(
+                        present_headers={"Strict-Transport-Security": "max-age=31536000"},
+                        missing_headers=[],
+                    ),
+                )
+            ],
+        )
+
+        with patch("asm.cli.run_inspection", return_value=mock_inspect_report):
+            exit_code = main(["inspect", str(probe_file), "--authorized", "-o", str(tmp_path)])
+            assert exit_code == 0
+
+        captured = capsys.readouterr()
+        assert "=== Inspection Summary ===" in captured.out
+        assert "Valid Certificates:  1" in captured.out
+        assert "=== Host Findings ===" in captured.out
+        assert "[+] example.com" in captured.out
+        assert "Cert: VALID (expires in 60 days, TLSv1.3) [from_response]" in captured.out
+
+        inspect_files = list(tmp_path.glob("example.com_inspect_*.json"))
+        assert len(inspect_files) == 1
+        with inspect_files[0].open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert data["domain"] == "example.com"
+        assert data["counts"]["hosts_inspected"] == 1
+        assert len(data["results"]) == 1
