@@ -1,3 +1,5 @@
+![CI](https://github.com/vigneshs-17/asm-saas/actions/workflows/ci.yml/badge.svg)
+
 # ASM SaaS - Attack Surface Management CLI
 
 A lightweight, modular, and defensible Attack Surface Management (ASM) reconnaissance tool designed for cybersecurity engineers and students.
@@ -46,6 +48,12 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
    - Windows file sharing (`445` SMB)
    - Legacy plaintext protocols (`21`, `23`, `25`, `110`, `143`)
 7. **Politeness & Rate Limiting**: Capped at max 10 concurrent ports per host and max 5 hosts in parallel, with polite pacing delays between connections.
+
+---
+
+## Architecture
+
+`asm` operates as a staged pipeline (`discover` -> `probe` -> `portscan` -> `inspect` -> `score`), where each stage reads the previous stage's JSON report, and active stages require `--authorized`.
 
 ---
 
@@ -160,7 +168,7 @@ Domain:              example.com
 Hosts Inspected:     2
 Valid Certificates:  2
 Expired Certs:       0
-Expiring Soon (<=30d): 0
+Expiring Soon (<=30d): 1
 Missing HSTS:        2
 Skipped Not HTTPS:   0
 Skipped Untrusted:   0
@@ -169,13 +177,14 @@ Report File:         output\example.com_inspect_20260929T060910Z.json
 
 === Host Findings ===
 [+] example.com
-    - Cert: VALID (expires in 87 days, TLSv1.3) [from_socket]
+    - Cert: VALID (expires in 27 days, TLSv1.3) [from_socket]
     - Missing Headers: Strict-Transport-Security, Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
     ! Disclosed: Server: cloudflare
 [+] www.example.com
-    - Cert: VALID (expires in 87 days, TLSv1.3) [from_socket]
+    - Cert: VALID (expires in 27 days, TLSv1.3) [from_socket]
     - Missing Headers: Strict-Transport-Security, Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
     ! Disclosed: Server: cloudflare
+```
 
 ### 5. Risk Scoring & Combined Report (Passive / Local Aggregation)
 ```bash
@@ -192,6 +201,17 @@ Options:
 - `--inspect FILE`: Path to Step 4 inspect report JSON file (optional).
 - `-o`, `--output DIR`: Directory to save the final score report (default: `output`).
 - `-v`, `--verbose`: Enable verbose debug logging.
+
+Sample Score Output:
+```text
+Domain Severity Band: HIGH
+Total Domain Risk Score: 46 pts
+Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
+  [HIGH] expired.badssl.com  - Expired TLS Certificate (7 pts)
+  [HIGH] wrong.host.badssl.com - Untrusted Certificate Authority (7 pts)
+  [MEDIUM] self-signed.badssl.com - Self-Signed Certificate (4 pts)
+  [MEDIUM] badssl.com - Certificate Expiring Soon (4 pts)
+```
 
 > [!NOTE]
 > **Heuristic Triage Model (Not CVSS):**
