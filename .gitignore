@@ -1,0 +1,35 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Output directory for generated reports
+output/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

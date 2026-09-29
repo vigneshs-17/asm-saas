@@ -1,0 +1,37 @@
+{
+  "domain": "example.com",
+  "scan_started_utc": "2026-09-29T04:15:00.000000+00:00",
+  "scan_finished_utc": "2026-09-29T04:15:01.000000+00:00",
+  "source": "crt.sh",
+  "counts": {
+    "total_discovered": 4,
+    "resolved": 2,
+    "unresolved": 2
+  },
+  "results": [
+    {
+      "subdomain": "api.example.com",
+      "ip_addresses": ["93.184.216.34"],
+      "status": "RESOLVED",
+      "resolved": true
+    },
+    {
+      "subdomain": "www.example.com",
+      "ip_addresses": ["93.184.216.34"],
+      "status": "RESOLVED",
+      "resolved": true
+    },
+    {
+      "subdomain": "dev.example.com",
+      "ip_addresses": [],
+      "status": "NXDOMAIN",
+      "resolved": false
+    },
+    {
+      "subdomain": "old.example.com",
+      "ip_addresses": [],
+      "status": "NO_ANSWER",
+      "resolved": false
+    }
+  ]
+}
