@@ -9,18 +9,21 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from asm.discovery import CrtshError, fetch_crtsh_data, parse_subdomains
 from asm.models import (
     DiscoveryReport,
+    HostPortScanResult,
     HostProbeResult,
     HostProbeStatus,
+    PortScanReport,
     ProbeReport,
     SubdomainResult,
 )
+from asm.portscan import DEFAULT_PORTS, run_port_scan
 from asm.prober import probe_hosts_concurrently
 from asm.resolver import resolve_subdomains_concurrently
+from asm.scan_common import ReportValidationError, load_and_validate_report
 from asm.validators import DomainValidationError, validate_domain
 
 logger = logging.getLogger("asm")
@@ -34,6 +37,11 @@ def setup_logging(verbose: bool = False) -> None:
         format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if not verbose:
+        # Silence noisy third-party and standard library logs unless verbose (-v) is enabled
+        for noisy_logger in ("httpx", "httpcore", "asyncio"):
+            logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,6 +98,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to save the JSON probe report (default: output)",
     )
     probe_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging",
+    )
+
+    # Subcommand: portscan
+    portscan_parser = subparsers.add_parser(
+        "portscan",
+        help="Actively scan common TCP ports on resolved hosts",
+    )
+    portscan_parser.add_argument(
+        "report_file",
+        help="Path to Step 1 discovery report JSON file",
+    )
+    portscan_parser.add_argument(
+        "--authorized",
+        action="store_true",
+        default=False,
+        help="Confirm authorization to perform active port scanning against target domain",
+    )
+    portscan_parser.add_argument(
+        "-o",
+        "--output",
+        dest="output_dir",
+        default="output",
+        help="Directory to save the JSON port scan report (default: output)",
+    )
+    portscan_parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -201,27 +238,16 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
     Returns:
         Exit code: 0 on success, 1 on authorization or validation error.
     """
-    report_path = Path(report_file_arg)
-
-    # 1. Validate file presence
-    if not report_path.is_file():
-        sys.stderr.write(f"Error: Discovery report file not found: {report_file_arg}\n")
-        return 1
-
-    # 2. Parse report JSON
+    # 1. Load and validate discovery report as untrusted input
     try:
-        with report_path.open("r", encoding="utf-8") as f:
-            report_data: dict[str, Any] = json.load(f)
-    except Exception as exc:
-        sys.stderr.write(f"Error: Failed to parse discovery report JSON: {exc}\n")
+        report_data, domain, resolved_hosts, skipped_unresolved_count = load_and_validate_report(
+            report_file_arg
+        )
+    except ReportValidationError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
         return 1
 
-    domain = report_data.get("domain")
-    if not domain or not isinstance(domain, str):
-        sys.stderr.write("Error: Discovery report is missing a valid 'domain' field\n")
-        return 1
-
-    # 3. Authorization Gate (strictly enforced before any network requests)
+    # 2. Authorization Gate (strictly enforced before any network requests)
     if not authorized:
         sys.stderr.write(
             f"Active probing sends requests to {domain}. Re-run with --authorized "
@@ -229,33 +255,13 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
         )
         return 1
 
-    # 4. Extract resolved subdomains
-    raw_results = report_data.get("results", [])
-    if not isinstance(raw_results, list):
-        sys.stderr.write("Error: Discovery report 'results' field must be a list\n")
-        return 1
-
-    resolved_hosts: list[str] = []
-    skipped_unresolved_count = 0
-
-    for item in raw_results:
-        if isinstance(item, dict):
-            subdomain = item.get("subdomain")
-            if not subdomain or not isinstance(subdomain, str):
-                continue
-            is_resolved = item.get("resolved") is True or item.get("status") == "RESOLVED"
-            if is_resolved:
-                resolved_hosts.append(subdomain)
-            else:
-                skipped_unresolved_count += 1
-
     start_mono = time.monotonic()
     probe_start_dt = datetime.now(UTC)
     probe_started_utc = probe_start_dt.isoformat()
 
     results: list[HostProbeResult] = []
 
-    # 5. Probing execution
+    # 3. Probing execution
     if not resolved_hosts:
         print("[*] 0 resolved hosts to probe.")
     else:
@@ -266,7 +272,7 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
     probe_finished_utc = probe_finish_dt.isoformat()
     elapsed_seconds = round(time.monotonic() - start_mono, 2)
 
-    # 6. Statistical counts
+    # 4. Statistical counts
     hosts_probed = sum(1 for r in results if r.status == HostProbeStatus.PROBED.value)
     https_live = sum(1 for r in results if r.https is not None and r.https.reachable)
     http_only = sum(
@@ -300,6 +306,7 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
         "skipped_unresolved": skipped_unresolved_count,
     }
 
+    report_path = Path(report_file_arg)
     report = ProbeReport(
         domain=domain,
         source_report=str(report_path.name),
@@ -309,7 +316,7 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
         results=results,
     )
 
-    # 7. Save probe report
+    # 5. Save probe report
     output_dir = Path(output_dir_arg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -319,7 +326,7 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
     with report_file.open("w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, indent=2)
 
-    # 8. Print summary
+    # 6. Print summary
     print("\n=== Probe Summary ===")
     print(f"Domain:              {domain}")
     print(f"Hosts Probed:        {hosts_probed}")
@@ -352,6 +359,133 @@ def handle_probe(report_file_arg: str, authorized: bool, output_dir_arg: str) ->
     return 0
 
 
+def handle_portscan(report_file_arg: str, authorized: bool, output_dir_arg: str) -> int:
+    """Execute the active TCP port scanning workflow.
+
+    Enforces authorization gate, validates discovery report input, scans
+    fixed TCP ports across resolved hosts, and writes a port scan report.
+
+    Args:
+        report_file_arg: Path to Step 1 discovery report JSON file.
+        authorized: User confirmation of testing authorization.
+        output_dir_arg: Target directory for the port scan report.
+
+    Returns:
+        Exit code: 0 on success, 1 on authorization or validation error.
+    """
+    # 1. Load and validate discovery report as untrusted input
+    try:
+        report_data, domain, resolved_hosts, skipped_unresolved_count = load_and_validate_report(
+            report_file_arg
+        )
+    except ReportValidationError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
+
+    # 2. Authorization Gate (strictly enforced before any network requests)
+    if not authorized:
+        sys.stderr.write(
+            f"Active port scanning connects to {domain}. Re-run with --authorized "
+            "to confirm you own it or have written permission to test it.\n"
+        )
+        return 1
+
+    start_mono = time.monotonic()
+    scan_start_dt = datetime.now(UTC)
+    scan_started_utc = scan_start_dt.isoformat()
+
+    results: list[HostPortScanResult] = []
+
+    # 3. Port scanning execution
+    if not resolved_hosts:
+        print("[*] 0 resolved hosts to scan.")
+    else:
+        print(
+            f"[*] Scanning common ports on {len(resolved_hosts)} resolved hosts for '{domain}'..."
+        )
+        results = run_port_scan(resolved_hosts, domain)
+
+    scan_finish_dt = datetime.now(UTC)
+    scan_finished_utc = scan_finish_dt.isoformat()
+    elapsed_seconds = round(time.monotonic() - start_mono, 2)
+
+    # 4. Statistical counts
+    hosts_scanned = sum(1 for r in results if r.status == HostProbeStatus.PROBED.value)
+    hosts_skipped = sum(1 for r in results if r.status != HostProbeStatus.PROBED.value)
+    total_open_ports = sum(len(r.open_ports) for r in results)
+    skipped_untrusted = sum(
+        1 for r in results if r.status == HostProbeStatus.SKIPPED_UNTRUSTED.value
+    )
+    skipped_private_ip = sum(
+        1 for r in results if r.status == HostProbeStatus.SKIPPED_PRIVATE_IP.value
+    )
+    skipped_at_scan_time = sum(
+        1 for r in results if r.status == HostProbeStatus.SKIPPED_UNRESOLVED.value
+    )
+    total_skipped_unresolved = skipped_unresolved_count + skipped_at_scan_time
+
+    counts = {
+        "hosts_scanned": hosts_scanned,
+        "hosts_skipped": hosts_skipped,
+        "total_open_ports": total_open_ports,
+        "skipped_untrusted": skipped_untrusted,
+        "skipped_private_ip": skipped_private_ip,
+        "skipped_unresolved": total_skipped_unresolved,
+    }
+
+    report_path = Path(report_file_arg)
+    report = PortScanReport(
+        domain=domain,
+        source_report=str(report_path.name),
+        scan_started_utc=scan_started_utc,
+        scan_finished_utc=scan_finished_utc,
+        port_list_used=DEFAULT_PORTS,
+        counts=counts,
+        results=results,
+    )
+
+    # 5. Save report to JSON file
+    output_dir = Path(output_dir_arg)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    filename_ts = scan_start_dt.strftime("%Y%m%dT%H%M%SZ")
+    report_file = output_dir / f"{domain}_portscan_{filename_ts}.json"
+
+    with report_file.open("w", encoding="utf-8") as f:
+        json.dump(report.to_dict(), f, indent=2)
+
+    # 6. Print summary
+    print("\n=== Port Scan Summary ===")
+    print(f"Domain:              {domain}")
+    print(f"Hosts Scanned:       {hosts_scanned}")
+    print(f"Hosts Skipped:       {hosts_skipped}")
+    print(f"Total Open Ports:    {total_open_ports}")
+    print(f"Skipped Untrusted:   {skipped_untrusted}")
+    print(f"Skipped Private IP:  {skipped_private_ip}")
+    print(f"Skipped Unresolved:  {total_skipped_unresolved}")
+    print(f"Scan Duration:       {elapsed_seconds}s")
+    print(f"Report File:         {report_file}")
+
+    # 7. Print open ports & risk flags per host
+    print("\n=== Open Ports & Risk Flags ===")
+    scanned_hosts = [r for r in results if r.status == HostProbeStatus.PROBED.value]
+    if not scanned_hosts or total_open_ports == 0:
+        print("No open ports discovered.")
+    else:
+        for host_res in scanned_hosts:
+            if not host_res.open_ports:
+                continue
+            print(f"[+] {host_res.subdomain}")
+            for p in host_res.open_ports:
+                banner_str = f" [Banner: {p.banner}]" if p.banner else ""
+                print(f"    - {p.port}/{p.service_guess}{banner_str}")
+            if host_res.risk_flags:
+                flags_str = ", ".join(host_res.risk_flags)
+                print(f"    ! Risk Flags: {flags_str}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main CLI entrypoint."""
     parser = build_parser()
@@ -363,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
         return handle_discover(args.domain, args.output_dir)
     if args.command == "probe":
         return handle_probe(args.report_file, args.authorized, args.output_dir)
+    if args.command == "portscan":
+        return handle_portscan(args.report_file, args.authorized, args.output_dir)
 
     return 0
 

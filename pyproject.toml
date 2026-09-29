@@ -46,4 +46,7 @@ ignore = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --strict-markers"
+addopts = "-v --strict-markers -m 'not integration'"
+markers = [
+    "integration: real network integration tests (deselected by default in CI)",
+]

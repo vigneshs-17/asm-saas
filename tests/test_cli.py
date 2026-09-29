@@ -220,3 +220,119 @@ class TestProbeCLIExecution:
         assert data["counts"]["hosts_probed"] == 2
         assert data["counts"]["https_live"] == 2
         assert data["counts"]["skipped_unresolved"] == 2
+
+
+class TestPortScanCLIExecution:
+    """Test suite for 'asm portscan' command dispatch and authorization gate."""
+
+    def test_portscan_missing_authorized_flag_exits_1(self, tmp_path: Path, capsys):
+        """Verify omitting --authorized prints warning with domain and makes 0 connections."""
+        report_file = tmp_path / "test_report.json"
+        report_file.write_text(
+            json.dumps({"domain": "my-target.com", "results": []}),
+            encoding="utf-8",
+        )
+
+        with patch("asm.cli.run_port_scan") as mock_scan:
+            exit_code = main(["portscan", str(report_file)])
+            assert exit_code == 1
+            mock_scan.assert_not_called()
+
+        captured = capsys.readouterr()
+        expected_msg = (
+            "Active port scanning connects to my-target.com. Re-run with --authorized "
+            "to confirm you own it or have written permission to test it."
+        )
+        assert expected_msg in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_portscan_missing_report_file_exits_1(self, capsys):
+        """Verify non-existent report file prints error to stderr and exits 1."""
+        exit_code = main(["portscan", "non_existent_report.json", "--authorized"])
+        assert exit_code == 1
+
+        captured = capsys.readouterr()
+        assert "Error: Discovery report file not found" in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_portscan_zero_resolved_hosts(self, tmp_path: Path, capsys):
+        """Verify report with 0 resolved hosts skips scanning, writes report, and exits 0."""
+        report_file = tmp_path / "unresolved_report.json"
+        report_file.write_text(
+            json.dumps({
+                "domain": "target.org",
+                "results": [
+                    {"subdomain": "sub.target.org", "status": "NXDOMAIN", "resolved": False}
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        with patch("asm.cli.run_port_scan") as mock_scan:
+            exit_code = main(["portscan", str(report_file), "--authorized", "-o", str(tmp_path)])
+            assert exit_code == 0
+            mock_scan.assert_not_called()
+
+        captured = capsys.readouterr()
+        assert "0 resolved hosts to scan" in captured.out
+
+        portscan_files = list(tmp_path.glob("target.org_portscan_*.json"))
+        assert len(portscan_files) == 1
+        with portscan_files[0].open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert data["counts"]["hosts_scanned"] == 0
+        assert data["counts"]["skipped_unresolved"] == 1
+
+    def test_portscan_success_flow(self, tmp_path: Path, capsys):
+        """Verify successful portscan run outputs summary, writes report, and exits 0."""
+        fixture_path = Path(__file__).parent / "fixtures" / "discovery_report_sample.json"
+
+        from asm.models import HostPortScanResult, PortResult
+
+        mock_results = [
+            HostPortScanResult(
+                subdomain="api.example.com",
+                status=HostProbeStatus.PROBED.value,
+                open_ports=[
+                    PortResult(
+                        port=80,
+                        state="OPEN",
+                        service_guess="http (guess by port)",
+                        banner=None,
+                        risk_flags=[],
+                    ),
+                    PortResult(
+                        port=443,
+                        state="OPEN",
+                        service_guess="https (guess by port)",
+                        banner=None,
+                        risk_flags=[],
+                    ),
+                ],
+                closed_ports=[21, 22],
+                filtered_ports=[],
+                risk_flags=[],
+            ),
+        ]
+
+        with patch("asm.cli.run_port_scan", return_value=mock_results):
+            exit_code = main(
+                ["portscan", str(fixture_path), "--authorized", "-o", str(tmp_path)]
+            )
+            assert exit_code == 0
+
+        captured = capsys.readouterr()
+        assert "=== Port Scan Summary ===" in captured.out
+        assert "=== Open Ports & Risk Flags ===" in captured.out
+        assert "80/http (guess by port)" in captured.out
+
+        portscan_files = list(tmp_path.glob("example.com_portscan_*.json"))
+        assert len(portscan_files) == 1
+        with portscan_files[0].open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert data["domain"] == "example.com"
+        assert data["counts"]["hosts_scanned"] == 1
+        assert data["counts"]["total_open_ports"] == 2
+        assert data["counts"]["skipped_unresolved"] == 2

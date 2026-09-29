@@ -220,3 +220,106 @@ class ProbeReport:
             "counts": self.counts,
             "results": [result.to_dict() for result in self.results],
         }
+
+
+class PortStatus(StrEnum):
+    """Classification of a TCP port connection attempt."""
+
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    FILTERED = "FILTERED"
+
+
+@dataclass
+class PortResult:
+    """Outcome of probing a single TCP port on a host.
+
+    Attributes:
+        port: TCP port number (e.g. 22, 80, 3306).
+        state: Port connection state (OPEN, CLOSED, FILTERED).
+        service_guess: Presumed service name based on standard port assignment.
+        banner: Sanitized banner string if captured, or None.
+        risk_flags: Security risk tags associated with this port (e.g. DATABASE_EXPOSURE).
+        response_time_ms: Round-trip connect time in milliseconds.
+    """
+
+    port: int
+    state: str = PortStatus.FILTERED.value
+    service_guess: str = "unknown (guess by port)"
+    banner: str | None = None
+    risk_flags: list[str] = field(default_factory=list)
+    response_time_ms: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert PortResult to dictionary for JSON serialization."""
+        return asdict(self)
+
+
+@dataclass
+class HostPortScanResult:
+    """Scan results for all target TCP ports on a single host.
+
+    Attributes:
+        subdomain: Hostname scanned.
+        status: Host status (PROBED, SKIPPED_UNTRUSTED, SKIPPED_PRIVATE_IP, SKIPPED_UNRESOLVED).
+        skip_reason: Explanation if the host was skipped.
+        open_ports: Detailed results for open ports (service, banner, flags).
+        closed_ports: List of closed port numbers.
+        filtered_ports: List of filtered (timed out/dropped) port numbers.
+        risk_flags: Summary of all risk flags triggered across open ports on this host.
+    """
+
+    subdomain: str
+    status: str = HostProbeStatus.PROBED.value
+    skip_reason: str | None = None
+    open_ports: list[PortResult] = field(default_factory=list)
+    closed_ports: list[int] = field(default_factory=list)
+    filtered_ports: list[int] = field(default_factory=list)
+    risk_flags: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert HostPortScanResult to dictionary for JSON export."""
+        return {
+            "subdomain": self.subdomain,
+            "status": self.status,
+            "skip_reason": self.skip_reason,
+            "open_ports": [p.to_dict() for p in self.open_ports],
+            "closed_ports": self.closed_ports,
+            "filtered_ports": self.filtered_ports,
+            "risk_flags": self.risk_flags,
+        }
+
+
+@dataclass
+class PortScanReport:
+    """Top-level report containing the results of a TCP port scan.
+
+    Attributes:
+        domain: Root domain scanned.
+        source_report: Discovery report filename used as input.
+        scan_started_utc: ISO 8601 UTC timestamp when scan started.
+        scan_finished_utc: ISO 8601 UTC timestamp when scan finished.
+        port_list_used: List of ports scanned.
+        counts: Summary counts of hosts and open ports.
+        results: Detailed results for each host.
+    """
+
+    domain: str
+    source_report: str
+    scan_started_utc: str
+    scan_finished_utc: str
+    port_list_used: list[int] = field(default_factory=list)
+    counts: dict[str, int] = field(default_factory=dict)
+    results: list[HostPortScanResult] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert PortScanReport to dictionary for JSON export."""
+        return {
+            "domain": self.domain,
+            "source_report": self.source_report,
+            "scan_started_utc": self.scan_started_utc,
+            "scan_finished_utc": self.scan_finished_utc,
+            "port_list_used": self.port_list_used,
+            "counts": self.counts,
+            "results": [r.to_dict() for r in self.results],
+        }

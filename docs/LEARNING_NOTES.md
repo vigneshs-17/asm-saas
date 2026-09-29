@@ -205,3 +205,99 @@ Before sending any HTTP packets to a resolved host, `asm probe` resolves the hos
 DNS Rebinding is an attack where an attacker controls an authoritative nameserver for a domain. When our tool resolves the domain during the pre-check, the nameserver returns a legitimate public IP address (passing the SSRF filter). However, when the HTTP client subsequently resolves the host to establish a socket connection milliseconds later, the nameserver returns an internal IP address (such as `127.0.0.1` or `169.254.169.254`).
 
 *Future Mitigation (v2):* Connecting directly to the pre-verified IP address via an explicit IP socket while passing the hostname in the `Host` header and TLS SNI extension completely prevents DNS rebinding.
+
+---
+
+# Part 3: v1 Step 3 — Lightweight TCP Port Scanning
+
+## 1. Plain-English Code Walkthrough
+
+### `src/asm/scan_common.py`
+- **What it is:** Centralized security module containing shared input validation, report loading, and SSRF defense primitives.
+- **Why it exists:** Both `prober.py` (HTTP probing) and `portscan.py` (TCP scanning) require identical security checks: treating the input report as untrusted data, re-validating domain syntax/scope, unwrapping IPv4-mapped IPv6 addresses, and blocking internal network ranges. Centralizing this prevents "security drift" between modules.
+- **Key Functions:**
+  - `load_and_validate_report(report_path)`: Opens JSON report, verifies `domain` and `results`, filters hosts with `status == "RESOLVED"`, and counts skipped unresolved hosts. Raises `ReportValidationError`.
+  - `is_safe_public_ip(ip_str)`: Unwraps `ip.ipv4_mapped` and asserts `ip.is_global and not ip.is_multicast`.
+  - `check_host_for_ssrf(hostname)`: Resolves host records and blocks private/loopback/CGNAT addresses.
+  - `validate_host_and_scope(hostname, base_domain)`: Ensures the hostname passes strict RFC 1035 syntax validation and belongs to the authorized domain scope.
+
+### `src/asm/portscan.py`
+- **What it is:** Asynchronous TCP connect port scanner and banner grabber built with Python's standard library `asyncio`.
+- **Key Functions & Safety Controls:**
+  - `DEFAULT_PORTS`: Fixed list of 16 common ports (`21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 6379, 8080, 8443`). Never scans any port outside this set.
+  - `compute_risk_flags(port)`: Flags high-risk exposures: `DATABASE_EXPOSURE` (3306, 5432, 6379), `RDP_EXPOSURE` (3389), `SMB_EXPOSURE` (445), `TELNET_INSECURE_REMOTE_ACCESS` (23), and `PLAINTEXT_PROTOCOL` (strictly limited to 21, 23, 25, 110, 143; never flags 80, 8080, 443, 8443, or 22).
+  - `grab_banner(reader, writer, port)`: Safely captures service greetings with a 2s timeout and 256-byte limit. For SSH (`port 22`), it listens passively without sending bytes (avoiding handshake breakage). For ports 21, 25, 110, 143, it sends a single `\r\n` CRLF prompt. For all other ports, it listens passively.
+  - `sanitize_banner(raw_bytes)`: Strips non-printable ASCII control characters, collapses whitespace, and truncates to 256 characters.
+  - `scan_single_port(host, port, port_semaphore)`: Executes `asyncio.wait_for(asyncio.open_connection(host, port), timeout=3.0)`.
+    - **Strict Connection Validation:** A port is classified as `OPEN` *only* if `asyncio.open_connection` succeeds with valid reader/writer streams, `writer.is_closing()` is False, socket fileno != -1, and `reader.at_eof()` is False (not closed prematurely).
+    - **Error Mapping:** `TimeoutError` strictly maps to `FILTERED`. `ConnectionRefusedError` (and Windows `WSAECONNREFUSED` / 10061) strictly maps to `CLOSED`. `OSError` (network unreachable / host down) and any unexpected exceptions strictly map to `FILTERED` (never `OPEN` on error).
+  - `scan_host_ports(hostname, base_domain, ...)`: Validates host scope, performs DNS resolution at scan time (marking `SKIPPED_UNRESOLVED` if DNS fails so one bad host never aborts the scan), runs the SSRF check, and scans ports concurrently.
+  - Concurrency limiting: Max 10 ports in parallel per host (`port_semaphore`), max 5 hosts in parallel (`host_semaphore`), with a polite delay between connections.
+
+### `tests/test_integration_portscan.py`
+- **What it is:** Real-network integration test against `scanme.nmap.org`.
+- **Safety & Isolation:** Decorated with `@pytest.mark.integration` and deselected by default in CI and standard test runs via `addopts = "-v --strict-markers -m 'not integration'"` in `pyproject.toml`.
+- **Purpose:** Verifies live socket classification: confirms that dropped/firewalled ports (such as 8080 and 8443 on `scanme.nmap.org`) return `FILTERED`, while actual listening ports return `OPEN`.
+
+### `src/asm/models.py` (Port Scan Extensions)
+- Added `PortStatus` (`StrEnum`: `OPEN`, `CLOSED`, `FILTERED`).
+- Added `PortResult` (`dataclass`): Port number, state, guessed service, banner, risk flags, and response time.
+- Added `HostPortScanResult` (`dataclass`): Per-host breakdown of open, closed, and filtered ports with host-level risk tags.
+- Added `PortScanReport` (`dataclass`): Top-level export schema for port scan reports.
+
+### `src/asm/cli.py` (`handle_portscan` and Quiet Logging)
+- Added `asm portscan <report.json> --authorized [-o DIR] [-v]`.
+- Enforces the `--authorized` gate before connecting to any sockets.
+- **Logging Fix**: Silences third-party and standard library debug logs (`httpx`, `httpcore`, `asyncio`) unless `-v` is explicitly passed, keeping default output clean.
+
+---
+
+## 2. Five Step 3 Cybersecurity Interview Questions & Answers
+
+### Question 1: What is the technical and practical difference between a TCP Connect scan and a SYN "Stealth" scan?
+**Answer:**
+- **TCP Connect Scan (`-sT` in Nmap / `asyncio.open_connection` in Python):**
+  - Uses the operating system's standard network API (`connect()` system call) to complete the full three-way TCP handshake (`SYN -> SYN-ACK -> ACK`). Once connected, the application closes the socket (`FIN` or `RST`).
+  - *Advantages:* Runs entirely in user-space with standard unprivileged user accounts; requires no raw socket privileges or special kernel drivers (e.g. WinPcap/Npcap on Windows); cross-platform and reliable.
+  - *Disadvantages:* Slower than SYN scanning; readily logged by application-layer server logs as established connections.
+- **TCP SYN "Stealth" Scan (`-sS` in Nmap):**
+  - Sends a raw `SYN` packet. If the target responds with `SYN-ACK` (port open), the scanner immediately sends a `RST` packet to tear down the connection before the three-way handshake completes.
+  - *Advantages:* Faster; historically bypassed basic application-layer logging (though modern stateful firewalls and IDS/IPS detect SYN scans easily).
+  - *Disadvantages:* Requires raw socket creation (`SOCK_RAW`), which mandates Administrator/root privileges and custom packet crafting.
+
+---
+
+### Question 2: In TCP port scanning, what is the operational distinction between `CLOSED` and `FILTERED`?
+**Answer:**
+- **`CLOSED`:**
+  - The target host is online and received the TCP `SYN` packet, but no service is listening on that port. The target's operating system kernel immediately generates an active TCP `RST` (Reset) packet (or `RST-ACK`) and sends it back to the scanner.
+  - *Security Insight:* Proves that the host is alive, responsive, and routing traffic, and that there is no intermediate firewall silently discarding packets on that port.
+- **`FILTERED`:**
+  - The scanner sent a TCP `SYN` packet, but received no response within the timeout window (or received an ICMP Type 3 "Destination Unreachable / Communication Administratively Prohibited" error).
+  - *Security Insight:* Indicates that a stateful firewall, packet filter, or cloud security group (e.g. AWS Security Group or iptables) is silently dropping packets before they reach the target operating system.
+
+---
+
+### Question 3: Why should an Attack Surface Management (ASM) tool scan a fixed list of common ports rather than the full 1–65,535 range?
+**Answer:**
+1. **Pareto Principle (80/20 Rule):** Over 95% of exposed enterprise assets, misconfigurations, and external attack vectors reside on a small cluster of well-known ports (HTTP/HTTPS, SSH, RDP, SMB, standard databases). A curated 16-port scan detects the vast majority of critical vulnerabilities.
+2. **Speed & Efficiency:** Scanning 65,535 ports per host across hundreds of subdomains would take hours or days per scan and consume massive network bandwidth. A 16-port scan takes under 5 seconds per host.
+3. **IDS/IPS & Abuse Evasion:** Sweeping full port ranges triggers threshold-based Intrusion Detection/Prevention Systems (IDS/IPS), causes defensive firewalls to blacklist the scanner's IP, and generates automated abuse complaints from ISPs and hosting providers.
+4. **Targeted Risk Identification:** Scanning ports like 3389 (RDP) or 445 (SMB) immediately identifies critical exposures without generating unnecessary network noise.
+
+---
+
+### Question 4: What are the operational risks of banner grabbing, and why must protocols like SSH (port 22) be treated differently from SMTP or FTP?
+**Answer:**
+- **Crash Risks on Fragile Services:** Sending random binary payloads, generic HTTP requests, or malformed data to proprietary or legacy network daemons (e.g. SCADA/ICS devices, medical equipment, or older print servers) can trigger buffer overflows, unhandled socket exceptions, or denial-of-service crashes.
+- **Protocol Etiquette (SSH vs. Prompt Protocols):**
+  - **SSH (Port 22):** The SSH protocol specification (RFC 4253) states that upon TCP connection, the **server speaks first** by sending its protocol identification string (e.g., `SSH-2.0-OpenSSH_8.9p1`). If a scanner immediately sends bytes before reading the server's identification, the SSH daemon considers it a protocol violation and closes the connection.
+  - **Banner Protocols (FTP 21, SMTP 25, POP3 110, IMAP 143):** These protocols often wait for a client prompt or greeting. Sending a single `\r\n` CRLF cleanly prompts the server to return its standard welcome banner without sending dangerous fuzzing payloads.
+
+---
+
+### Question 5: Why is centralizing shared security controls (SSRF guards and domain validation) into `scan_common.py` an essential software architecture pattern?
+**Answer:**
+1. **Prevention of Security Drift:** In multi-stage security tools (Discovery -> HTTP Probing -> Port Scanning -> Vulnerability Assessment), each stage performs network I/O. If validation logic is duplicated across separate files, improvements or bug fixes made in one scanner (e.g. discovering a bypass in IPv4-mapped IPv6 address parsing) might not be applied to other stages, leaving gaps.
+2. **Consistent Policy Enforcement:** Centralizing functions like `load_and_validate_report`, `is_safe_public_ip`, and `validate_host_and_scope` ensures that all active modules adhere strictly to the exact same authorization boundaries, private IP filters, and error handling rules.
+3. **Testability & Auditability:** Having a single, dedicated module with unit tests proves that core security boundaries are tested and verified independently of protocol-specific networking logic.

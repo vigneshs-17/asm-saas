@@ -26,6 +26,27 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 7. **End-to-End Deadline**: Enforces a strict 10.0-second total deadline per URL.
 8. **TLS Certificate Fallback**: Flags invalid certificates (`tls_valid = False`), then retries once with `verify=False` solely to test service availability.
 
+### Phase 3: Lightweight TCP Port Scanning (`asm portscan`)
+1. **Mandatory Authorization Gate**: Requires `--authorized` confirmation before opening any socket connections.
+2. **Fixed Default Port List Only**: Scans exactly 16 high-value common ports (no arbitrary ranges or intrusive full scans):
+   - Ports: `21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 6379, 8080, 8443`
+3. **Asynchronous TCP Connect Scan**: Built with standard library `asyncio` (`open_connection`). No raw sockets, no SYN packets, and no kernel-level driver requirements.
+4. **Strict State Classification**:
+   - `OPEN`: Connection established.
+   - `CLOSED`: Connection refused (`RST` received; host is up, port closed).
+   - `FILTERED`: Connection timed out or dropped (firewall block).
+5. **Non-Intrusive Banner Grabbing**:
+   - For SSH (`port 22`): Listens passively (SSH servers speak first).
+   - For `21, 25, 110, 143`: Sends a single `\r\n` CRLF prompt to trigger service greeting.
+   - For all other ports: Listens passively for up to 2 seconds without sending payloads.
+   - Sanitizes and truncates banners to at most 256 printable characters.
+6. **Exposure Risk Flags**:
+   - Database exposure (`3306`, `5432`, `6379`)
+   - Remote access (`3389` RDP, `23` Telnet)
+   - Windows file sharing (`445` SMB)
+   - Legacy plaintext protocols (`21`, `23`, `25`, `110`, `143`)
+7. **Politeness & Rate Limiting**: Capped at max 10 concurrent ports per host and max 5 hosts in parallel, with polite pacing delays between connections.
+
 ---
 
 ## Installation & Setup
@@ -63,20 +84,6 @@ Options:
 - `-o`, `--output DIR`: Directory to save the discovery report (default: `output`).
 - `-v`, `--verbose`: Enable debug logging.
 
-Sample Discovery Output:
-```text
-[*] Discovering subdomains for 'example.com' via crt.sh...
-[*] Found 6 unique subdomains. Resolving DNS records...
-
-=== Discovery Summary ===
-Domain:              example.com
-Subdomains Found:    6
-Resolved (Active):   4
-Unresolved:          2
-Scan Duration:       0.85s
-Report File:         output\example.com_20260929T041500Z.json
-```
-
 ---
 
 ### 2. Probe Live Hosts (Active)
@@ -84,41 +91,44 @@ Report File:         output\example.com_20260929T041500Z.json
 asm probe output/example.com_20260929T041500Z.json --authorized
 ```
 
-> [!IMPORTANT]
-> **The `--authorized` Flag:**
-> Active probing sends HTTP/HTTPS GET requests directly to the target servers. To prevent accidental or unauthorized scanning, `asm probe` requires the `--authorized` flag.
-> If run without `--authorized`, the CLI will read the local report only to display the target domain, will make **zero network requests**, and will exit with code 1:
-> ```text
-> Active probing sends requests to example.com. Re-run with --authorized to confirm you own it or have written permission to test it.
-> ```
+---
+
+### 3. Scan Common TCP Ports (Active)
+```bash
+asm portscan output/example.com_20260929T041500Z.json --authorized
+```
 
 Options:
-- `--authorized`: Confirm ownership or written authorization (required).
-- `-o`, `--output DIR`: Directory to save the probe report (default: `output`).
-- `-v`, `--verbose`: Enable debug logging.
+- `--authorized`: Confirm authorization to perform active network connections (required).
+- `-o`, `--output DIR`: Directory to save the port scan report (default: `output`).
+- `-v`, `--verbose`: Enable verbose debug logging.
 
-Sample Probe Output:
+Sample Port Scan Output:
 ```text
-[*] Probing 4 resolved hosts for 'example.com' (HTTPS/HTTP)...
+[*] Scanning common ports on 2 resolved hosts for 'example.com'...
 
-=== Probe Summary ===
+=== Port Scan Summary ===
 Domain:              example.com
-Hosts Probed:        4
-HTTPS Live:          3
-HTTP Only:           1
-Unreachable:         0
-TLS Invalid:         0
+Hosts Scanned:       2
+Hosts Skipped:       0
+Total Open Ports:    8
 Skipped Untrusted:   0
 Skipped Private IP:  0
-Skipped Unresolved:  2
-Scan Duration:       1.42s
-Report File:         output\example.com_probe_20260929T041600Z.json
+Skipped Unresolved:  4
+Scan Duration:       6.16s
+Report File:         output\example.com_portscan_20260929T045524Z.json
 
-=== Live Hosts ===
-https://example.com/ [200] Example Domain
-https://api.example.com/ [200] API Gateway
-https://www.example.com/ [200] Example Domain
-http://legacy.example.com/ [200] Legacy Portal
+=== Open Ports & Risk Flags ===
+[+] example.com
+    - 80/http (guess by port)
+    - 443/https (guess by port)
+    - 8080/http-alt (guess by port)
+    - 8443/https-alt (guess by port)
+[+] www.example.com
+    - 80/http (guess by port)
+    - 443/https (guess by port)
+    - 8080/http-alt (guess by port)
+    - 8443/https-alt (guess by port)
 ```
 
 ---
@@ -140,13 +150,14 @@ ruff check .
 ## Legal and Ethical Use
 
 > [!CAUTION]
-> **Authorization Requirement:** Only scan targets that you own or have explicit written permission to test.
+> **Authorization & Policy Requirements:** Only scan targets that you own or have explicit written permission to test.
 >
-> 1. **Passive Reconnaissance (`asm discover`)**: Interacts with third-party Certificate Transparency logs and recursive DNS. However, continuous or high-volume enumeration without authorization can violate terms of service or trigger defensive blocks.
-> 2. **Active Probing (`asm probe`)**: Connects directly to target ports 80 and 443. Conducting unauthorized active scanning may violate:
+> 1. **Active Port Scanning Policy Violations**: Port scanning generates detectable TCP connection sequences. Even against authorized targets or bug bounty scopes, port scanning may violate:
+>    - **Network Service Provider (ISP) Acceptable Use Policies (AUP)**: Many residential and commercial ISPs prohibit unsolicited port scanning.
+>    - **University, Campus, and Enterprise Network Policies**: Performing port scans from campus or corporate networks without clearance can result in immediate MAC/port disconnection or disciplinary action.
+> 2. **Statutory Legal Frameworks**:
 >    - **United States**: Computer Fraud and Abuse Act (CFAA, 18 U.S.C. § 1030)
 >    - **United Kingdom**: Computer Misuse Act 1990
->    - **India**: Information Technology Act, 2000 (Section 43 for unauthorized access and Section 66 for computer-related offenses)
->    - Applicable local cybercrime and unauthorized access legislation worldwide.
+>    - **India**: Information Technology Act, 2000 (Section 43: unauthorized access and data downloading; Section 66: computer-related offenses / hacking)
 >
 > Always respect rate limits, adhere strictly to authorized testing scopes, and never attempt to bypass defensive controls.

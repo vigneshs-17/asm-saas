@@ -22,7 +22,20 @@ from asm.models import (
     RedirectHop,
     UrlProbeResult,
 )
-from asm.validators import DomainValidationError, validate_domain
+from asm.scan_common import (
+    check_host_for_ssrf,
+    is_safe_public_ip,
+    validate_host_and_scope,
+)
+
+__all__ = [
+    "check_host_for_ssrf",
+    "is_safe_public_ip",
+    "probe_host",
+    "probe_hosts_concurrently",
+    "probe_url",
+    "validate_host_and_scope",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -68,74 +81,6 @@ def is_general_tls_error(exc: BaseException) -> bool:
     return _find_exception_in_chain(exc, ssl.SSLError) is not None
 
 
-def is_safe_public_ip(ip_str: str) -> bool:
-    """Check if an IP address is a safe, globally routable public address.
-
-    First unwraps IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1 -> 127.0.0.1),
-    then verifies that ip.is_global is True and ip.is_multicast is False.
-    This safely filters out:
-    - Private networks (RFC 1918)
-    - Loopback addresses (127.0.0.0/8, ::1)
-    - Link-local addresses (169.254.0.0/16, fe80::/10)
-    - Reserved ranges
-    - CGNAT addresses (100.64.0.0/10)
-    - Unspecified addresses (0.0.0.0, ::)
-    - Multicast groups
-    """
-    try:
-        ip = ipaddress.ip_address(ip_str)
-    except ValueError:
-        return False
-
-    # Unwrap IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1 -> 127.0.0.1)
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-
-    return bool(ip.is_global and not ip.is_multicast)
-
-
-def check_host_for_ssrf(
-    hostname: str,
-    resolver: dns.resolver.Resolver | None = None,
-) -> tuple[bool, str | None]:
-    """Resolve a host and check whether any resolved IP is internal/private.
-
-    Note: This pre-probe check prevents the tool from probing internal networks (SSRF).
-    Protection against DNS rebinding (where an authoritative DNS server changes the
-    IP address to an internal IP between our DNS check and the HTTP request) will be handled in v2.
-
-    Args:
-        hostname: Subdomain to resolve.
-        resolver: Optional Resolver instance for testing.
-
-    Returns:
-        (True, None) if safe, or (False, reason) if any resolved IP is non-public.
-    """
-    active_resolver = resolver if resolver is not None else dns.resolver.Resolver()
-    active_resolver.lifetime = 3.0
-    active_resolver.timeout = 3.0
-
-    resolved_ips: list[str] = []
-    for rdtype in ("A", "AAAA"):
-        try:
-            answers = active_resolver.resolve(hostname, rdtype)
-            for rdata in answers:
-                resolved_ips.append(rdata.to_text())
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers):
-            pass
-        except Exception as exc:
-            logger.debug("DNS check error for %s (%s): %s", hostname, rdtype, exc)
-
-    if not resolved_ips:
-        # If no IPs resolve during pre-check, we allow it to proceed to HTTP prober
-        # which will report connection error/NXDOMAIN appropriately
-        return True, None
-
-    for ip in resolved_ips:
-        if not is_safe_public_ip(ip):
-            return False, f"Host '{hostname}' resolved to non-public/private IP: {ip}"
-
-    return True, None
 
 
 def is_redirect_in_scope(target_url: str, base_domain: str) -> bool:
@@ -512,21 +457,12 @@ def probe_host(
         HostProbeResult.
     """
     # 1. Re-validate domain and check scope
-    try:
-        validated_host = validate_domain(hostname)
-    except DomainValidationError as exc:
+    validated_host, scope_error = validate_host_and_scope(hostname, base_domain)
+    if not validated_host or scope_error:
         return HostProbeResult(
             subdomain=hostname,
             status=HostProbeStatus.SKIPPED_UNTRUSTED.value,
-            skip_reason=f"Failed domain validation: {exc}",
-        )
-
-    norm_base = base_domain.lower().rstrip(".")
-    if not (validated_host == norm_base or validated_host.endswith(f".{norm_base}")):
-        return HostProbeResult(
-            subdomain=hostname,
-            status=HostProbeStatus.SKIPPED_UNTRUSTED.value,
-            skip_reason=f"Host '{hostname}' is out of scope for root domain '{base_domain}'",
+            skip_reason=scope_error,
         )
 
     # 2. SSRF Protection: Pre-probe private IP check
