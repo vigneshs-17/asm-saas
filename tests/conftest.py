@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+
+from asm.api.main import app
+from asm.db.models import Base
+from asm.db.session import get_db
 
 
 @pytest.fixture
@@ -23,3 +33,66 @@ def mock_sleep():
     """Autouse fixture to mock time.sleep across tests so no test actually waits."""
     with patch("time.sleep", return_value=None) as mocked:
         yield mocked
+
+
+def validate_test_database_url(test_db_url: str) -> None:
+    """Ensure TEST_DATABASE_URL strictly points to a database name ending with '_test'."""
+    parsed = urlsplit(test_db_url)
+    db_name = parsed.path.lstrip("/").split("?")[0]
+    if not db_name.endswith("_test"):
+        pytest.fail(
+            f"Safety check failed: database name '{db_name}' in TEST_DATABASE_URL "
+            f"must end with '_test' to prevent running tests against non-test databases."
+        )
+
+
+@pytest.fixture(scope="session")
+def db_engine():
+    """Verify TEST_DATABASE_URL and yield an Engine for the test database."""
+    test_db_url = os.getenv("TEST_DATABASE_URL")
+    if not test_db_url:
+        pytest.skip("TEST_DATABASE_URL not set; skipping database integration tests")
+
+    # Safety check: database name in TEST_DATABASE_URL MUST end with '_test'
+    validate_test_database_url(test_db_url)
+
+    engine = create_engine(test_db_url, pool_pre_ping=True)
+
+    # Verify database connectivity
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as err:
+        pytest.fail(f"Could not connect to PostgreSQL at TEST_DATABASE_URL: {err}")
+
+    # Ensure tables exist for test suite
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture
+def db_session(db_engine) -> Generator[Session, None, None]:
+    """Provide an isolated database session that is rolled back after each test."""
+    connection = db_engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
+
+    yield session
+
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture
+def client(db_session: Session) -> Generator[TestClient, None, None]:
+    """Provide a FastAPI TestClient with get_db overridden to use the isolated test session."""
+
+    def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()

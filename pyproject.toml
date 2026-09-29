@@ -14,6 +14,12 @@ authors = [
 dependencies = [
     "httpx>=0.27.0",
     "dnspython>=2.6.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.2.0",
+    "alembic>=1.13.0",
+    "pydantic-settings>=2.4.0",
 ]
 
 [project.optional-dependencies]
@@ -49,4 +55,5 @@ python_files = ["test_*.py"]
 addopts = "-v --strict-markers -m 'not integration'"
 markers = [
     "integration: real network integration tests (deselected by default in CI)",
+    "db: tests requiring a real PostgreSQL database (run when TEST_DATABASE_URL is set)",
 ]

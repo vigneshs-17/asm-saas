@@ -111,8 +111,94 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$(pwd)/output:/app/output" asm-sa
 > docker run --rm -v "${PWD}/output:/app/output" asm-saas probe output/<report>.json --authorized
 > ```
 
-
 ---
+
+## Run the API (v2, local only)
+
+In v2, ASM SaaS expands into a modular reconnaissance service featuring a FastAPI REST API backed by PostgreSQL and SQLAlchemy 2.0.
+
+### 1. Environment Configuration
+Create a local `.env` configuration file from the template:
+```bash
+cp .env.example .env
+```
+Ensure `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `DATABASE_URL` are defined in `.env`.
+
+### 2. Start the Stack with Docker Compose
+```bash
+docker compose up --build
+```
+On startup:
+1. `db`: Initializes the pinned `postgres:18.6-alpine` database service and waits until healthy.
+2. `migrate`: Executes `alembic upgrade head` in a one-shot container to establish all tables (`domains`, `scan_runs`, `scan_results`).
+3. `api`: Starts `uvicorn` serving the FastAPI application once migrations succeed.
+
+> [!WARNING]
+> **No Authentication / Localhost Only:**
+> The API currently has no authentication layer. In `docker-compose.yml`, port 8000 is bound **strictly to loopback `127.0.0.1:8000`** (not `0.0.0.0`) to prevent unauthorized network access.
+
+### 3. Verify Health
+```bash
+curl -i http://127.0.0.1:8000/health
+```
+Response:
+```json
+{"status":"ok","database":"connected"}
+```
+
+### 4. Register Monitored Domains
+Register a target domain (requires `"authorized": true` in the request body):
+```bash
+curl -i -X POST http://127.0.0.1:8000/domains \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "example.com",
+    "authorized": true,
+    "authorization_note": "Target owner written authorization"
+  }'
+```
+Response:
+```json
+{
+  "id": 1,
+  "name": "example.com",
+  "authorized": true,
+  "authorization_note": "Target owner written authorization",
+  "created_at": "2026-09-29T18:00:00Z"
+}
+```
+
+List registered domains:
+```bash
+curl -i http://127.0.0.1:8000/domains
+```
+
+### 5. Local Database Testing Setup
+To run the database integration test suite locally against PostgreSQL:
+1. Ensure a PostgreSQL 18 instance is available.
+2. Create the dedicated test database `asm_test` (e.g. via `psql` or `docker compose exec`):
+   ```bash
+   docker compose exec db psql -U <user> -d <db> -c "CREATE DATABASE asm_test;"
+   ```
+3. Run Alembic migrations against `asm_test`:
+   ```bash
+   # Windows (PowerShell)
+   $env:DATABASE_URL = "postgresql+psycopg://<user>:<password>@localhost:5432/asm_test"
+   alembic upgrade head
+
+   # Linux / macOS
+   DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost:5432/asm_test" alembic upgrade head
+   ```
+4. Set `TEST_DATABASE_URL` (safety check: the database name must end with `_test`) and run tests:
+   ```bash
+   # Windows (PowerShell)
+   $env:TEST_DATABASE_URL = "postgresql+psycopg://<user>:<password>@localhost:5432/asm_test"
+   pytest -m db
+
+   # Linux / macOS
+   TEST_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost:5432/asm_test" pytest -m db
+   ```
+
 
 ## Usage
 

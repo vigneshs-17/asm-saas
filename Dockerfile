@@ -40,6 +40,10 @@ COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/*.whl \
     && rm -rf /wheels
 
+# Copy migrations and alembic configuration for container migrations
+COPY --chown=asm:asm alembic.ini ./
+COPY --chown=asm:asm migrations/ ./migrations/
+
 # Drop root privileges
 USER asm
 

@@ -546,4 +546,93 @@ DNS Rebinding is an attack where an attacker controls an authoritative nameserve
   2. **VCS Metadata Leakage:** Omitting `.git` in `.dockerignore` causes the entire Git commit history to be bundled into the image. Attackers who obtain the container image can run `git log`, inspect deleted commits, inspect commit messages, and extract historical credentials previously committed and rolled back.
   3. **Performance Degradation & Cache Invalidation:** Sending gigabytes of node modules, virtual environments, or output reports bloats build times and continuously invalidates Docker's build layer cache, resulting in unnecessarily slow CI/CD pipelines.
 
+---
+
+# Part 7: v2 Step 1 — Service Foundation: Compose, Database, Migrations & Domains API
+
+## 1. Plain-English Code Walkthrough & Architecture
+
+### `src/asm/config.py` (Pydantic Settings)
+- **What it is:** A centralized configuration module powered by `pydantic-settings`.
+- **Why it exists:** Modern applications must separate configuration from code (12-Factor App methodology). Hardcoding database URIs or credentials in source code creates severe security vulnerabilities.
+- **Key Design Decision (No Default Credentials):** `DATABASE_URL` is marked as required with no default value. If the application or CLI starts without `DATABASE_URL` configured in the environment or `.env`, it fails immediately at startup with an informative error rather than silently attempting to connect with an insecure fallback like `postgres:postgres`.
+
+### `src/asm/db/models.py` (SQLAlchemy 2.0 ORM)
+- **What it is:** Declarative database models defining the relational persistence layer for attack surface reconnaissance.
+- **Key Entities:**
+  - `Domain`: Represents a target domain registered for reconnaissance. Includes `name` (unique, indexed, normalized), `authorized` (boolean), `authorization_note` (optional string), and `created_at` (UTC timestamp).
+  - **Fail-Safe Default:** `authorized` defaults to `False` in the database schema. Even if a record were inserted bypassing API validation, it remains unauthorized by default.
+  - `ScanRun`: Represents an instance of a scheduled or manual scan pipeline run for a domain. Tracks `domain_id` (foreign key with `ON DELETE CASCADE`), `status` (`queued`, `running`, `succeeded`, `failed`), `created_at`, `started_at`, `finished_at`, and `error` detail.
+  - `ScanResult`: Stores individual stage reports produced during a scan run (`discover`, `probe`, `portscan`, `inspect`, `score`). Uses PostgreSQL's native binary JSON format (`JSONB`) to store polymorphic scan outputs efficiently while enabling indexing and queryability.
+
+### `src/asm/db/session.py` (Database Engine & Session Dependency)
+- **What it is:** Session management module providing database connection pools and FastAPI request-scoped sessions.
+- **Key Functions:**
+  - `get_engine()`: Creates a cached SQLAlchemy engine with connection pool pre-ping enabled (`pool_pre_ping=True`) to automatically discard stale or terminated connections.
+  - `get_db()`: Generator function designed for FastAPI dependency injection (`Depends(get_db)`). Yields a fresh database session per request and guarantees `session.close()` in a `finally` block, preventing database connection leaks.
+
+### `alembic.ini` & `migrations/` (Alembic Schema Evolution)
+- **What it is:** Database migration framework tailored for SQLAlchemy models.
+- **Key Design Decision (Decoupled Connection String):** `alembic.ini` contains no database URL or credentials. Instead, `migrations/env.py` dynamically resolves `DATABASE_URL` at runtime from `asm.config.get_settings()`, ensuring migrations adapt automatically to local development, Docker Compose, and CI environments without credential duplication.
+- **Container Integration:** `alembic.ini` and `migrations/` are copied into the Docker runtime image, allowing a lightweight one-shot `migrate` container in Docker Compose to execute `alembic upgrade head` before the API server boots.
+
+### Docker Compose Architecture & PostgreSQL 18 Volume Path
+- **Postgres 18 Volume Mount Finding:** In PostgreSQL 18, the official image documentation and container configuration declare the persistent volume at `/var/lib/postgresql` with internal cluster directory `PGDATA=/var/lib/postgresql/18/docker` (verified via `docker inspect postgres:18.6-alpine --format '{{json .Config.Volumes}}'`). Older PostgreSQL versions (<18) used `/var/lib/postgresql/data`. Mounting to `/var/lib/postgresql` ensures full cluster persistence across container rebuilds.
+- **Service Dependency Sequencing:** In `docker-compose.yml`, the `db` service runs with a healthcheck (`pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}`). The one-shot `migrate` service depends on `db: condition: service_healthy`. The `api` service depends on `migrate: condition: service_completed_successfully`. A single `docker compose up` automatically brings up the database, applies all migrations, and launches the API.
+- **Loopback Port Binding (`127.0.0.1:8000`):** The API currently has no authentication mechanism. Publishing the port on `0.0.0.0` would expose the reconnaissance API to all devices on the local network. Binding strictly to `127.0.0.1:8000` ensures only local loopback processes can communicate with the service.
+
+### `src/asm/api/` (FastAPI REST Service)
+- **`schemas.py`**: Pydantic models for request validation (`DomainCreate`) and response serialization (`DomainRead`, `HealthResponse`).
+- **`routes.py`**:
+  - `GET /health`: Runs `SELECT 1` on the active database session. Returns 200 OK with `{"status": "ok", "database": "connected"}` if reachable, or 503 Service Unavailable if disconnected.
+  - `POST /domains`: Enforces the authorization gate (rejects with 422 if `authorized` is not True), verifies domain RFC syntax via `validate_domain()`, normalizes via `normalize_domain()`, and rejects duplicates with HTTP 409 Conflict.
+  - `GET /domains` & `GET /domains/{id}`: Returns all domains or single domain details (404 if missing).
+- **`main.py`**: Global error handling ensures unexpected internal errors return clean JSON without exposing Python stack traces or internal filenames to clients.
+
+---
+
+## 2. Five v2 Step 1 Interview Questions & Answers
+
+### Question 1: What are the security, maintenance, and performance trade-offs of using an ORM (like SQLAlchemy 2.0) versus Raw SQL queries?
+**Answer:**
+- **Security (SQL Injection Mitigation):** ORMs automatically parameterize queries by default, separating SQL command syntax from user-supplied data and effectively eliminating SQL injection vulnerabilities. With raw SQL, developers must manually ensure every query uses bound parameters rather than string concatenation or f-strings.
+- **Type Safety & Refactoring:** SQLAlchemy 2.0's typed ORM (`Mapped[T]`, `mapped_column()`, `select()`) integrates with static analysis tools (`mypy`, IDE language servers). Renaming a column or changing a data type immediately surfaces compiler/linter warnings across the entire codebase, whereas raw SQL strings fail silently until executed at runtime.
+- **Database Portability & Dialect Abstraction:** The ORM abstracts vendor-specific SQL quirks (e.g. differences in date/time math, autoincrement keywords, or boolean representations between SQLite, PostgreSQL, and MySQL).
+- **Trade-offs:** High-throughput analytical queries or complex recursive CTEs (Common Table Expressions) can sometimes be slower or more cumbersome to express through ORM abstractions than raw SQL. In high-performance data warehousing or large batch scans, hybrid approaches (using SQLAlchemy's Core `select()` or typed raw SQL with explicit parameter bindings) provide the best of both worlds.
+
+---
+
+### Question 2: Why are automated database migrations (Alembic) essential for team collaboration and production deployment pipelines?
+**Answer:**
+- **Deterministic Schema Synchronization:** In a team setting, each developer's local database and the shared staging/production databases must evolve in lockstep. Without migrations, developers resort to running ad-hoc `ALTER TABLE` statements manually, leading to "schema drift" where environments diverge and software breaks unpredictably during deployment.
+- **Version Control for DDL:** Migration scripts are committed to git alongside the application code that depends on them. This ensures that any git branch or historical release can reproduce the exact schema state it requires (`alembic upgrade head` or `alembic downgrade -1`).
+- **Zero-Downtime Deployment Support:** Automated migrations allow operations teams to execute forward-compatible migrations (e.g. adding nullable columns or creating indexes concurrently) in automated CI/CD pipelines before deploying new container code, preventing service interruptions.
+
+---
+
+### Question 3: Why is binding an unauthenticated web service to `127.0.0.1` rather than `0.0.0.0` a critical defense-in-depth measure?
+**Answer:**
+- **Network Interface Exposure:**
+  - `0.0.0.0` (INADDR_ANY) binds the server socket to **all** network interfaces on the host, including physical Ethernet, Wi-Fi adapters, VPN interfaces, and virtual bridges.
+  - `127.0.0.1` (loopback) binds exclusively to the local host interface. Packets directed to `127.0.0.1` can only originate from processes running on the exact same operating system kernel; the network stack drops external packets arriving on physical interfaces destined for loopback addresses.
+- **Security Implications:** When an API does not yet possess an authentication and authorization layer (e.g. API keys, JWTs, mTLS), binding to `0.0.0.0` allows anyone on the local Wi-Fi, campus network, or corporate subnet to submit requests, register targets, or inspect reconnaissance data. Binding strictly to `127.0.0.1` prevents unauthorized network access by default.
+
+---
+
+### Question 4: How does 12-Factor environment-based configuration improve both operational security and deployment flexibility?
+**Answer:**
+- **Separation of Config from Code (Factor III):** The Twelve-Factor App methodology mandates that anything that varies between deployments (database credentials, API keys, service endpoints) must be stored in the environment, not in code or version control.
+- **Secret Leakage Prevention:** Committing credentials or connection strings to Git risks exposure in repositories, CI logs, or public mirrors. Environment-based config allows sensitive secrets to be injected dynamically at runtime via Docker secrets, Kubernetes secrets, or `.env` files that remain strictly `.gitignore`d.
+- **Write-Once, Deploy-Anywhere (Portability):** A single, immutable container image artifact can be built once and deployed across development, automated testing, staging, and production environments without rebuilding or modifying code—only the environment variables passed to the container change.
+
+---
+
+### Question 5: Why is a database-backed background job queue necessary for long-running scanner tasks instead of executing them synchronously inside HTTP request handlers?
+**Answer:**
+- **HTTP Timeout & Thread Starvation:** Attack surface reconnaissance operations (DNS resolution across hundreds of subdomains, TCP port scans, TLS handshakes, HTTP probing) take anywhere from 10 seconds to several minutes to complete. If executed synchronously inside an HTTP request handler:
+  1. Reverse proxies (Nginx, Cloudflare, AWS ALB) and client browsers will timeout after 30–60 seconds, severing the HTTP connection.
+  2. Web server worker threads (uvicorn/gunicorn) remain blocked waiting for network I/O, rapidly exhausting the server's connection pool and causing denial of service for other users.
+- **Resilience & State Recovery:** A database-backed job queue records each scan run with a state lifecycle (`queued` $\to$ `running` $\to$ `succeeded` / `failed`). If the application container crashes, restarts, or scales, uncompleted jobs remain safely persisted in the database and can be retried or resumed without losing scan context or customer requests.
+
+
 
