@@ -1,10 +1,21 @@
 """SQLAlchemy 2.0 declarative models for ASM SaaS."""
 
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -47,6 +58,26 @@ class ScanRun(Base):
     """Represents a scheduled or active multi-stage scan execution for a domain."""
 
     __tablename__ = "scan_runs"
+    __table_args__ = (
+        Index(
+            "uq_scan_runs_active_domain",
+            "domain_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+        Index(
+            "uq_scan_runs_domain_idempotency",
+            "domain_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+        Index(
+            "ix_scan_runs_claimable",
+            "created_at",
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     domain_id: Mapped[int] = mapped_column(
@@ -65,6 +96,18 @@ class ScanRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Worker claiming & fencing
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     # Relationships
     domain: Mapped["Domain"] = relationship(back_populates="scan_runs")
     results: Mapped[list["ScanResult"]] = relationship(
@@ -72,12 +115,47 @@ class ScanRun(Base):
         cascade="all, delete-orphan",
         order_by="ScanResult.id.asc()",
     )
+    stages: Mapped[list["ScanStage"]] = relationship(
+        back_populates="scan_run",
+        cascade="all, delete-orphan",
+        order_by="ScanStage.id.asc()",
+    )
+
+
+class ScanStage(Base):
+    """Execution status and duration tracking for a single pipeline stage."""
+
+    __tablename__ = "scan_stages"
+    __table_args__ = (
+        UniqueConstraint("scan_run_id", "stage", name="uq_scan_stages_run_stage"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    scan_run_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Stage name: discover / probe / portscan / inspect / score
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Stage status: pending / running / succeeded / failed / skipped
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Relationships
+    scan_run: Mapped["ScanRun"] = relationship(back_populates="stages")
 
 
 class ScanResult(Base):
     """Artifact report produced by a single scan pipeline stage."""
 
     __tablename__ = "scan_results"
+    __table_args__ = (
+        UniqueConstraint("scan_run_id", "stage", name="uq_scan_results_run_stage"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     scan_run_id: Mapped[int] = mapped_column(

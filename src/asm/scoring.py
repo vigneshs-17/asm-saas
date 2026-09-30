@@ -659,6 +659,55 @@ def score_domain_reports(
         discover_path, report_type="discover"
     )
 
+    probe_results: list[dict[str, Any]] | None = None
+    if probe_path:
+        _, _, probe_results = load_and_validate_generic_report(
+            probe_path, report_type="probe", expected_domain=target_domain
+        )
+        inputs_present.append("probe")
+
+    portscan_results: list[dict[str, Any]] | None = None
+    if portscan_path:
+        _, _, portscan_results = load_and_validate_generic_report(
+            portscan_path, report_type="portscan", expected_domain=target_domain
+        )
+        inputs_present.append("portscan")
+
+    inspect_results: list[dict[str, Any]] | None = None
+    if inspect_path:
+        _, _, inspect_results = load_and_validate_generic_report(
+            inspect_path, report_type="inspect", expected_domain=target_domain
+        )
+        inputs_present.append("inspect")
+
+    return score_domain_payloads(
+        target_domain=target_domain,
+        disc_results=disc_results,
+        probe_results=probe_results,
+        portscan_results=portscan_results,
+        inspect_results=inspect_results,
+        inputs_present=inputs_present,
+    )
+
+
+def score_domain_payloads(
+    target_domain: str,
+    disc_results: list[dict[str, Any]],
+    probe_results: list[dict[str, Any]] | None = None,
+    portscan_results: list[dict[str, Any]] | None = None,
+    inspect_results: list[dict[str, Any]] | None = None,
+    inputs_present: list[str] | None = None,
+) -> ScoreReport:
+    """Aggregate findings from in-memory stage result payloads and compute risk scores."""
+    if inputs_present is None:
+        inputs_present = ["discover"]
+        if probe_results is not None:
+            inputs_present.append("probe")
+        if portscan_results is not None:
+            inputs_present.append("portscan")
+        if inspect_results is not None:
+            inputs_present.append("inspect")
+
     all_hosts: set[str] = set()
     for entry in disc_results:
         sub = entry.get("subdomain")
@@ -666,31 +715,19 @@ def score_domain_reports(
             all_hosts.add(sub.strip().lower())
 
     probe_findings_map: dict[str, list[Finding]] = {}
-    if probe_path:
-        _, _, probe_results = load_and_validate_generic_report(
-            probe_path, report_type="probe", expected_domain=target_domain
-        )
-        inputs_present.append("probe")
+    if probe_results is not None:
         probe_findings_map = evaluate_probe_findings(probe_results)
         for h in probe_findings_map:
             all_hosts.add(h.lower())
 
     portscan_findings_map: dict[str, list[Finding]] = {}
-    if portscan_path:
-        _, _, portscan_results = load_and_validate_generic_report(
-            portscan_path, report_type="portscan", expected_domain=target_domain
-        )
-        inputs_present.append("portscan")
+    if portscan_results is not None:
         portscan_findings_map = evaluate_portscan_findings(portscan_results)
         for h in portscan_findings_map:
             all_hosts.add(h.lower())
 
     inspect_findings_map: dict[str, list[Finding]] = {}
-    if inspect_path:
-        _, _, inspect_results = load_and_validate_generic_report(
-            inspect_path, report_type="inspect", expected_domain=target_domain
-        )
-        inputs_present.append("inspect")
+    if inspect_results is not None:
         inspect_findings_map = evaluate_inspect_findings(inspect_results)
         for h in inspect_findings_map:
             all_hosts.add(h.lower())

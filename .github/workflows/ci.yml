@@ -57,6 +57,11 @@ jobs:
         run: |
           test "$(docker run --rm --entrypoint whoami asm-saas)" = "asm"
 
+      - name: Verify worker entry point import
+        run: |
+          docker run --rm --entrypoint python asm-saas -c "from asm.worker.__main__ import main"
+
+
   db-test:
     name: Database Migrations & API Tests
     runs-on: ubuntu-latest

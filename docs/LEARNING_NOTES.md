@@ -634,5 +634,119 @@ DNS Rebinding is an attack where an attacker controls an authoritative nameserve
   2. Web server worker threads (uvicorn/gunicorn) remain blocked waiting for network I/O, rapidly exhausting the server's connection pool and causing denial of service for other users.
 - **Resilience & State Recovery:** A database-backed job queue records each scan run with a state lifecycle (`queued` $\to$ `running` $\to$ `succeeded` / `failed`). If the application container crashes, restarts, or scales, uncompleted jobs remain safely persisted in the database and can be retried or resumed without losing scan context or customer requests.
 
+---
+
+# Part 5: v2.2 — Scan Jobs with a Robust Job Lifecycle
+
+## 1. Plain-English Code Walkthrough
+
+### `src/asm/db/models.py` (Lifecycle & Stage Tracking Extensions)
+- **`ScanRun` Extensions:** Added distributed leasing and lifecycle fields:
+  - `claim_token` (`UUID`): A unique fencing token generated on every claim to prevent zombie workers from corrupting state.
+  - `claimed_by` and `claimed_at`: Identifies the active worker node (`hostname:pid:uuid`).
+  - `lease_expires_at`: Heartbeat expiration timestamp (calculated with DB clock `now()`).
+  - `attempts` and `max_attempts`: Retry budget counter (defaults to 3).
+  - `next_attempt_at`: Exponential backoff schedule for retries.
+  - `idempotency_key`: Deduplication token scoped to the domain.
+  - Partial Unique Indexes:
+    - `uq_scan_runs_active_domain`: Guarantees at most one active (`queued` or `running`) scan per domain.
+    - `uq_scan_runs_domain_idempotency`: Prevents duplicate runs for identical idempotency keys.
+    - `ix_scan_runs_claimable`: Indexes eligible queued jobs for fast `SKIP LOCKED` querying.
+- **`ScanStage` (`scan_stages` table):** Records per-stage progress (`discover`, `probe`, `portscan`, `inspect`, `score`), status (`pending`, `running`, `succeeded`, `failed`, `skipped`), timestamps, duration in milliseconds, and error messages.
+- **`ScanResult` Constraint:** Added unique constraint `(scan_run_id, stage)` to guarantee idempotent artifact writes.
+
+### `migrations/versions/0002_scan_jobs_lifecycle.py`
+- Alembic migration script supporting bidirectional `upgrade()` and `downgrade()` for all new columns, tables, and partial indexes.
+
+### `src/asm/worker/exceptions.py`
+- **`SecurityGateError`:** Raised when domain authorization is missing or revoked. This is a terminal error; the run fails permanently and is never retried.
+- **`LostLeaseError`:** Raised when a worker detects its lease was reclaimed by another worker or a write returned 0 affected rows.
+- **`EXPECTED_SCANNER_ERRORS`:** Explicit tuple `(CrtshError, DomainValidationError, ReportValidationError, SecurityGateError)`. Known scanner exceptions fail only that stage; anything else is an unexpected worker exception that triggers retry backoff.
+
+### `src/asm/worker/runner.py`
+- **`IScannerRunner` Protocol:** Defines injectable runner methods for all 5 pipeline stages.
+- **`DirectScannerRunner`:** Production implementation invoking scanner core functions (`discovery`, `prober`, `portscan`, `headers_inspect`, `scoring`) directly in Python without shelling out to CLI or writing files to disk.
+
+### `src/asm/worker/worker.py`
+- **`ASMWorker`:** The background daemon engine claiming and executing scan runs:
+  - Claims jobs atomically with `FOR UPDATE SKIP LOCKED`.
+  - Runs periodic stale lease recovery and poison pill termination at the start of every poll cycle.
+  - Dedicated `HeartbeatThread` runs in its own thread with an independent database session, renewing `lease_expires_at` every 15s.
+  - Fenced writes: Every database write begins with `SELECT 1 FROM scan_runs WHERE id = :id AND status = 'running' AND claim_token = :token FOR SHARE` and verifies affected rowcounts.
+  - Resets stuck `running` stages back to `pending` on resume and logs previous crash errors.
+  - Catches `SIGTERM` signals between stages and performs graceful job release without penalizing retry attempts.
+
+### `src/asm/api/routes.py` & `src/asm/api/schemas.py`
+- **`POST /domains/{id}/scans`:** Order enforced: (a) 404 if no domain, (b) 422 if unauthorized, (c) 200 with existing run if idempotency key matches, (d) 202 on insert, or 409 with `active_scan_id` if blocked by active scan constraint.
+- **`GET /scans/{scan_id}`:** Returns `ScanRunDetail` with per-stage progress.
+- **`GET /domains/{id}/scans`:** Historical scan run listing with status filtering and pagination.
+- **`GET /scans/{scan_id}/results/{stage}`:** Returns raw JSON stage artifact report.
+
+---
+
+## 2. Five v2.2 Interview Questions & Answers
+
+### Question 1: How does PostgreSQL `FOR UPDATE SKIP LOCKED` work, and why is it superior to naive queue polling or premature Celery/Redis adoption?
+**Answer:**
+- **Mechanism:** When a worker executes `SELECT id FROM scan_runs WHERE status = 'queued' ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1`, PostgreSQL inspects the candidate rows. If another concurrent worker already holds a row lock on the oldest record, Postgres skips that locked row immediately without blocking and locks the next available unlocked row.
+- **Elimination of Lock Contention:** Standard `FOR UPDATE` causes all concurrent workers to block and serialize behind the first worker, creating lock wait queues and potential deadlocks. `SKIP LOCKED` gives each worker a distinct job immediately.
+- **Architectural Superiority for Single-Node / Early SaaS:**
+  1. **Transactional Integrity:** Enqueuing, job state transitions, and result persistence happen in the same ACID database. There is zero risk of dual-write discrepancies (e.g. state committed to Postgres but Redis job lost on broker crash).
+  2. **No Extra Infrastructure:** Adding Redis, Celery, or RabbitMQ introduces extra network hops, connection management, serialization overhead, and another failure domain to monitor and secure. PostgreSQL handles thousands of jobs per second with `SKIP LOCKED` before dedicated queues are needed.
+
+---
+
+### Question 2: What is the "Zombie Worker" problem, and how do fencing tokens (`claim_token`) prevent database corruption?
+**Answer:**
+- **The Zombie Worker Scenario:** Suppose Worker A claims a job with a 60-second lease. Due to a prolonged garbage-collection pause, heavy CPU thrashing, or a transient network partition, Worker A becomes unresponsive. Its lease expires. The recovery loop detects the expired lease and re-queues the run. Worker B claims the run and begins executing Stage 2. Suddenly, Worker A wakes back up ("zombie") and attempts to write its delayed Stage 1 results, potentially overwriting Worker B's fresh data.
+- **Fencing Token Solution:**
+  1. On every claim, a fresh `claim_token` (UUID) is generated and saved on `scan_runs`.
+  2. Every write transaction (stage start, result write, status update) must begin with:
+     ```sql
+     SELECT 1 FROM scan_runs
+     WHERE id = :id AND status = 'running' AND claim_token = :token
+     FOR SHARE;
+     ```
+  3. Because Worker B received a new `claim_token`, Worker A's fencing check returns 0 rows. Worker A detects it has lost the lease, raises `LostLeaseError`, and immediately aborts execution without modifying the database.
+
+---
+
+### Question 3: Why use a partial unique index (`WHERE status IN ('queued', 'running')`) rather than an application-level check-then-insert query?
+**Answer:**
+- **Check-then-Insert Race Condition:** In an application-level check (`if existing_scan: return 409; else: insert()`), two concurrent HTTP requests arriving at the exact same millisecond can both query the database simultaneously, both find no active scan, and both proceed to insert a new scan run.
+- **Database-Level Partial Unique Index:**
+  ```sql
+  CREATE UNIQUE INDEX uq_scan_runs_active_domain ON scan_runs (domain_id)
+  WHERE status IN ('queued', 'running');
+  ```
+  PostgreSQL enforces uniqueness at the storage engine level. When two concurrent transactions attempt to insert active runs for the same `domain_id`, PostgreSQL forces one to succeed and instantly aborts the other with a `UniqueViolation` error. The API catches this error and returns `409 Conflict` containing the active scan ID, eliminating race conditions entirely.
+
+---
+
+### Question 4: Why must network I/O never be performed inside an open database transaction, and why are fenced writes structured as short transactions?
+**Answer:**
+- **Connection Pool Exhaustion:** Database connection pools are finite (typically 10–50 connections). If a worker begins a transaction (`session.begin()`) and then executes an HTTP probe or port scan taking 10 to 30 seconds, that database connection remains idle and held for the entire duration of the network call. Under slight load, all database connections become exhausted, starving API requests and health checks.
+- **Row Lock Accumulation:** Open transactions hold locks on affected rows. If locks remain open during slow network calls, other workers or API queries trying to read or update those records block indefinitely.
+- **Short Transactions Pattern:**
+  1. The worker opens a short transaction ($\approx 1\text{ms}$), checks the fence token via `FOR SHARE`, updates the stage status to `running`, and immediately commits and releases the DB connection.
+  2. Network reconnaissance executes outside the database transaction.
+  3. Once finished, another short transaction ($\approx 2\text{ms}$) opens, verifies the fence token, inserts the artifact into `scan_results`, marks the stage as `succeeded`, and immediately commits.
+
+---
+
+### Question 5: How does dynamic exponential backoff with jitter in SQL prevent the "thundering herd" problem during worker crash recovery?
+**Answer:**
+- **The Problem:** If a worker node crashes or network partition occurs while 20 scan jobs are running, their leases will all expire around the same time. If a recovery query resets all 20 jobs to `'queued'` simultaneously with zero delay, all available workers will pounce on those 20 jobs at the exact same moment. If the failure was caused by target rate-limiting (e.g. crt.sh returning HTTP 429), slamming the target immediately will cause all 20 retried jobs to fail again.
+- **The Solution (Exponential Backoff with Jitter in SQL):**
+  ```sql
+  next_attempt_at = now() + (
+      LEAST(120.0, 10.0 * POWER(2.0, GREATEST(0, attempts - 1)))
+      + (random() * 5.0)
+  ) * INTERVAL '1 second'
+  ```
+  1. **Exponential Scaling:** Each failed attempt doubles the delay ($10\text{s} \to 20\text{s} \to 40\text{s}$, capped at 120s), giving remote servers and network partitions time to recover.
+  2. **Random Jitter ($0\text{s} \text{ to } 5\text{s}$):** Introduces randomization so that the 20 recovered jobs become eligible for claiming at staggered, smoothed intervals rather than all at once, preventing thundering-herd stampedes.
+
+
 
 

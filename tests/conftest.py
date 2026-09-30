@@ -96,3 +96,33 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def clean_db(db_engine) -> Generator[None, None, None]:
+    """Ensure database tables are truncated before and after multi-threaded concurrency tests."""
+    truncate_sql = text(
+        "TRUNCATE TABLE scan_results, scan_stages, scan_runs, domains "
+        "RESTART IDENTITY CASCADE"
+    )
+    with db_engine.begin() as conn:
+        conn.execute(truncate_sql)
+    yield
+    with db_engine.begin() as conn:
+        conn.execute(truncate_sql)
+
+
+@pytest.fixture
+def lifecycle_client(clean_db, db_engine) -> Generator[TestClient, None, None]:
+    """Provide a TestClient connected to db_engine with clean_db truncation for worker tests."""
+    def _override_get_db():
+        with Session(db_engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
+
+
+

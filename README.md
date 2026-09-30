@@ -173,31 +173,71 @@ List registered domains:
 curl -i http://127.0.0.1:8000/domains
 ```
 
-### 5. Local Database Testing Setup
-To run the database integration test suite locally against PostgreSQL:
-1. Ensure a PostgreSQL 18 instance is available.
-2. Create the dedicated test database `asm_test` (e.g. via `psql` or `docker compose exec`):
+### 5. Asynchronous Scan Jobs & Worker (v2.2)
+
+In v2.2, long-running scans run asynchronously via background workers claiming jobs from PostgreSQL using `FOR UPDATE SKIP LOCKED`.
+
+#### Start the Worker Service
+```bash
+docker compose up -d worker
+```
+Or run the worker process locally:
+```bash
+python -m asm.worker
+```
+
+#### Queue a Scan
+Queue a multi-stage scan for an authorized domain (returns `202 Accepted` immediately):
+```bash
+curl -i -X POST http://127.0.0.1:8000/domains/1/scans \
+  -H "Idempotency-Key: optional-uuid-token"
+```
+
+#### Check Scan Status and Stage Progress
+Retrieve real-time execution status and duration for all 5 pipeline stages:
+```bash
+curl -i http://127.0.0.1:8000/scans/1
+```
+
+#### Fetch Stage Artifact Reports
+Retrieve the raw JSON report produced by any completed stage (`discover`, `probe`, `portscan`, `inspect`, `score`):
+```bash
+curl -i http://127.0.0.1:8000/scans/1/results/score
+```
+
+#### List Domain Historical Scans
+```bash
+curl -i "http://127.0.0.1:8000/domains/1/scans?status=succeeded&limit=10"
+```
+
+### 6. Local Database Testing Setup
+To run the database integration test suite locally against a dedicated throwaway PostgreSQL 18 container:
+
+1. Start a throwaway PostgreSQL container named `asm-test-db` on port `5433`:
    ```bash
-   docker compose exec db psql -U <user> -d <db> -c "CREATE DATABASE asm_test;"
+   docker run -d --name asm-test-db -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=asm_test -p 127.0.0.1:5433:5432 postgres:18.6-alpine
    ```
-3. Run Alembic migrations against `asm_test`:
+
+2. Run Alembic migrations against `asm_test`:
    ```bash
    # Windows (PowerShell)
-   $env:DATABASE_URL = "postgresql+psycopg://<user>:<password>@localhost:5432/asm_test"
+   $env:DATABASE_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test"
    alembic upgrade head
 
    # Linux / macOS
-   DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost:5432/asm_test" alembic upgrade head
+   DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test" alembic upgrade head
    ```
-4. Set `TEST_DATABASE_URL` (safety check: the database name must end with `_test`) and run tests:
+
+3. Set `TEST_DATABASE_URL` (safety check: the database name must end with `_test`) and run tests:
    ```bash
    # Windows (PowerShell)
-   $env:TEST_DATABASE_URL = "postgresql+psycopg://<user>:<password>@localhost:5432/asm_test"
+   $env:TEST_DATABASE_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test"
    pytest -m db
 
    # Linux / macOS
-   TEST_DATABASE_URL="postgresql+psycopg://<user>:<password>@localhost:5432/asm_test" pytest -m db
+   TEST_DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test" pytest -m db
    ```
+
 
 
 ## Usage
