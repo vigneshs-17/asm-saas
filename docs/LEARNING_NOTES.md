@@ -813,6 +813,116 @@ DNS Rebinding is an attack where an attacker controls an authoritative nameserve
   - Conversely, scanners that wait arbitrarily long (e.g. `Retry-After: 3600`) cause background workers to block and freeze execution.
   - Setting a threshold (`Retry-After <= 10.0s`) allows the client to absorb momentary rate limiter bursts (sleeping and retrying once), while immediately aborting if the delay would cause worker lease timeouts, cleanly failing over to poison-pill/retry mechanisms.
 
+---
+
+# Part 7: v2.3 — Attack Surface Change Detection Between Scans
+
+## 1. Plain-English Code Walkthrough
+
+### Motivation & Architecture
+- **The Operational Problem:** Periodic scanning produces isolated snapshots in time. An analyst reviewing 1,000 hosts across multiple scan runs cannot manually inspect thousands of JSON lines to answer: *"What changed since our last scan? Did a new database port open? Did an SSL certificate expire? Was an HSTS header dropped?"*
+- **The Core Solution:** An automated differential engine executed upon scan completion. The engine locates the strictly earlier (`id < :current_id`) succeeded scan of the same domain, compares all stage reports, and records structured changes (`scan_changes` table) along with a summary JSON (`scan_runs.change_detection`).
+- **Pure Function Isolation (`detect_changes`):**
+  The comparison algorithm is decoupled from I/O, database transactions, and network calls. It accepts two dictionaries (`baseline_reports` and `new_reports`) and an `allow_removal` flag, returning a list of change dictionaries. This enables comprehensive unit testing with static fixtures and guaranteed deterministic output.
+
+### Finding-Based Diffing vs. Raw Field Diffing
+- **The Problem with Raw Field Diffing:**
+  Directly comparing JSON fields between scans (e.g., diffing `not_after`, `present_headers`, or open port lists) leads to brittle logic, duplicate business rules, and arbitrary severity invention. For example, comparing `not_after` strings cannot tell whether a certificate is expiring soon or expired, and inventing severities at the diff stage creates multiple conflicting sources of truth.
+- **The Finding-Based Solution:**
+  `src/asm/changes.py` delegates finding generation directly to the battle-tested evaluators in `src/asm/scoring.py` (`evaluate_probe_findings`, `evaluate_portscan_findings`, `evaluate_inspect_findings`).
+  - Findings are generated for both baseline and new reports using the exact same rules and catalog.
+  - Diffing is performed per `(host, finding_code, detail)`.
+  - **Exposure Additions:** A finding present only in the new scan inherits its exact severity tier (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`) directly from `FINDING_CATALOG` in `scoring.py`.
+  - **Exposure Reductions:** A finding present only in the baseline is classified as an exposure reduction with `INFO` severity—**provided** the host was successfully evaluated in the new scan (`status == "PROBED"`). If the host was unreachable or skipped, baseline findings are not resolved.
+  - This guarantees that risk scoring and change detection stay 100% synchronized with zero duplicated finding rules or invented severities.
+
+### "Unknown" Is Not "Absent"
+- A foundational law in defensive reconnaissance: **a failed observation does not equal the absence of a service or asset.**
+- **Network Flakes & Timeouts:**
+  - If a DNS query times out (`TIMEOUT`) or returns `ERROR`, the host might still exist. Emitting `STOPPED_RESOLVING` or `REMOVED_SUBDOMAIN` would create alarming false alerts. Only a definitive `RESOLVED` $\rightarrow$ `NXDOMAIN` transition triggers `STOPPED_RESOLVING`.
+  - If a port probe times out (`FILTERED`), a packet was dropped by a firewall or network blip. Emitting `PORT_NO_LONGER_OPEN` would lead security teams to believe a vulnerability was patched when it was merely packet loss. Only an explicit `CLOSED` state (RST received from the host) confirms the port is shut.
+  - If an HTTPS probe times out (`error_type == "TIMEOUT"`), `HTTPS_LOST` is not emitted. Only definitive errors (e.g. `CONNECT_ERROR`, `TLS_ERROR`) confirm that the HTTPS listener failed.
+
+### Source Awareness & Truncation Safety Rules
+- **The Threat of Source Switching:**
+  - `crt.sh` returns historical, active, and expired certificates across all time.
+  - `Cert Spotter` returns only currently unexpired issuances.
+  - If Scan 1 used `crt.sh` and Scan 2 fell back to `Cert Spotter`, comparing subdomain sets would falsely report that hundreds of older subdomains were "removed" (`REMOVED_SUBDOMAIN`).
+- **The Threat of Pagination Truncation:**
+  - If Cert Spotter hits its page cap (10 pages) or entry cap (5,000 records) on a large domain, the report records `"truncated": true`.
+  - Comparing a truncated scan against an untruncated baseline would erroneously report all subdomains beyond page 10 as deleted.
+- **The Defensive Rule:**
+  `evaluate_removal_eligibility` enforces that subdomain deletions are evaluated **if and only if**:
+  1. Both discovery reports share the exact same discovery source (`base_source == new_source`).
+  2. Neither report has `truncated == True`.
+  If either condition fails, removal detection is skipped and the reason is recorded in `scan_runs.change_detection["skip_reason"]`.
+
+### Database Design & Atomic Worker Finalization
+- **Schema & Indexes:**
+  `scan_changes` table stores:
+  `domain_id` (FK), `scan_run_id` (FK), `baseline_scan_run_id` (FK), `change_type`, `category` (`exposure` or `summary`), `severity`, `asset`, `detail`, `evidence`, `previous_state`, `new_state`, `observed_at`.
+  Unique constraint: `uq_scan_changes_run_type_asset_detail` on `(scan_run_id, change_type, asset, detail)`.
+  Composite index: `ix_scan_changes_domain_observed` on `(domain_id, observed_at DESC)`.
+- **Atomic Fenced Finalization:**
+  Changes are computed in-memory prior to committing the scan. If detection raises an exception, the exception is caught, logged, and stored in `summary["error"]` without failing the scan run. The changes and the final run status update (`status = 'succeeded'`) are committed atomically in the same database transaction.
+
+---
+
+## 2. Five Step 2.3 Cybersecurity Interview Questions & Answers
+
+### Question 1: Why is "unknown is not absent" a critical design principle in attack surface monitoring, and what vulnerabilities or operational failures occur when scanners violate it?
+**Answer:**
+In network reconnaissance, an observation failure is not evidence of absence. When a scanner attempts to probe an asset and receives no response, two fundamentally different physical realities could have occurred:
+1. **Definite Absence:** The service was turned off, port closed with a TCP `RST`, or hostname deleted with an authoritative `NXDOMAIN`.
+2. **Indeterminate State (Unknown):** A packet was dropped by an intermediate firewall (`FILTERED`), an upstream ISP route flapped, the DNS recursive resolver timed out (`TIMEOUT`), or the host hit a temporary connection limit.
+
+**Consequences of Violating the Principle:**
+- **Premature Vulnerability Closure (False Remediation):** If a firewall drops a probe packet against an exposed MySQL port (`3306`), a naive scanner that treats non-response as "absent" will emit `PORT_NO_LONGER_OPEN` and auto-close the ticket. The security team erroneously marks the finding as remediated while the database remains vulnerable to anyone bypassing the firewall.
+- **Notification Alert Fatigue:** If transient DNS timeouts cause subdomains to flip between "discovered", "removed", and "re-added" every day, analysts suffer from alert fatigue and begin ignoring notifications.
+- **Defensive Safeguard:** ASM SaaS requires explicit, positive counter-evidence before emitting removal or closure changes (e.g. `NXDOMAIN` for DNS, `CLOSED` with `RST` for ports, and non-timeout errors for HTTPS).
+
+---
+
+### Question 2: Why is finding-based diffing preferred over raw field diffing when computing exposure changes in an ASM pipeline?
+**Answer:**
+- **Single Source of Truth for Severity:** In a security platform, finding severity definitions (e.g. exposed DB is `CRITICAL`, missing HSTS is `LOW`, expired cert is `HIGH`) must reside in one authoritative place. If a diffing engine compares raw strings (like comparing certificate dates or HTTP headers) and assigns its own severities, two diverging severity rulesets emerge. In finding-based diffing, changes that introduce new exposure automatically inherit the exact severity tier and points computed by `scoring.py`.
+- **Domain Logic Encapsulation:** Raw fields often require multi-field context to interpret. For example, an expired certificate may have `expired: true`, `is_trusted: false`, and `issuer_equals_subject: true`. A raw diff engine might emit three conflicting changes for the same certificate. Scoring rules already implement deduplication precedence (e.g., an expired cert emits only `TLS_CERT_EXPIRED`). Diffing the evaluated finding set guarantees that change events reflect actionable security states rather than noisy JSON key differences.
+- **Resilience to Refactoring:** When new inspection rules or scoring tweaks are introduced in `scoring.py`, the change detection engine automatically inherits them without modifying diffing logic.
+
+---
+
+### Question 3: Explain why Certificate Transparency pagination truncation and source switching can cause catastrophic false positive "asset removal" alerts, and how ASM SaaS prevents them.
+**Answer:**
+- **The Threat of Source Asymmetry:**
+  - `crt.sh` is an archival aggregator spanning all historical certificate issuances, including certificates issued years ago for decommissioned subdomains.
+  - `Cert Spotter`'s unexpired endpoint only returns certificates that are currently cryptographically valid.
+  - If a weekly scan switches from `crt.sh` to `Cert Spotter` (because `crt.sh` timed out), comparing raw subdomain sets would reveal that dozens or hundreds of historical subdomains present in the baseline are missing from the fallback report. A naive diff engine would fire hundreds of `REMOVED_SUBDOMAIN` alerts.
+- **The Threat of Truncation:**
+  - To prevent memory exhaustion and rate-limit exhaustion, third-party API clients enforce pagination caps (e.g. Cert Spotter stops at 10 pages / 5,000 entries).
+  - If a large domain exceeds this cap, its report contains only a subset of assets and sets `"truncated": true`. Comparing this against an uncapped baseline would spuriously declare thousands of un-paginated subdomains as deleted.
+- **The ASM SaaS Mitigation:**
+  `evaluate_removal_eligibility()` enforces strict conditions: removal detection runs **only** if both the baseline and new scans used the identical source (e.g. both used `crt.sh` or both used `certspotter`) AND neither report was truncated. If either condition is violated, subdomain removal detection is bypassed, and a clear `skip_reason` is stored for transparency.
+
+---
+
+### Question 4: In an automated vulnerability management pipeline, how should the severity of change events be assigned, and why should exposure-reducing changes be treated differently from exposure-increasing changes?
+**Answer:**
+- **Asymmetric Risk Nature:** An event that *increases* exposure (e.g. a database port newly opening to the public internet, or a valid TLS cert expiring) creates immediate, active exploitability that requires urgent incident response. Therefore, it must inherit the high-priority severity of the vulnerability (`CRITICAL` or `HIGH`) to trigger pager alerts and SIEM escalations.
+- **Exposure Reductions Are Informational:** When an exposure is reduced (e.g. port 3306 closes, an expired cert is renewed, or an HSTS header is deployed), risk has decreased. The system is entering a safer state. Firing high-priority alerts for closed ports or renewed certs creates false alarms in SOC triage queues. Therefore, exposure-reducing changes are uniformly classified with `INFO` severity.
+- **Verification Prerequisite:** Crucially, an exposure reduction change can only be emitted if the target host was successfully verified as active (`status == "PROBED"`) in the new scan. If the scanner could not reach the host, the finding is not resolved—it remains in an unconfirmed state.
+
+---
+
+### Question 5: How does the worker maintain atomicity and fault tolerance when computing change detection at the end of a scan pipeline?
+**Answer:**
+- **Fault-Tolerant Isolation (Non-Fatal Diffing):**
+  Change detection is a post-processing analysis step; it must never cause an otherwise successful 5-stage scan to be marked as failed. In `_mark_run_final()`, change detection runs inside an isolated `try/except Exception` block. If an unexpected bug occurs during diffing, the worker catches the exception, logs a traceback, and populates `change_detection = {"error": str(err)}` while allowing the scan run to finish with status `succeeded`.
+- **Atomic Fenced Commit:**
+  If change detection succeeds, the generated change records (`ScanChange` objects) and the final scan run update (`ScanRun.status = 'succeeded'`, `ScanRun.finished_at`, `ScanRun.change_detection = summary`) are persisted within the **exact same database transaction**. If a database connectivity error or deadlock occurs during the commit, both the change records and the status update roll back together, ensuring no orphan change rows are ever left pointing to an unfinalized scan.
+- **Idempotency & Deduplication:**
+  The `scan_changes` table enforces a database-level unique constraint on `(scan_run_id, change_type, asset, detail)`. Even in the event of worker retries, identical change records cannot be duplicated.
+
+
 
 
 

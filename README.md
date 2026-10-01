@@ -216,7 +216,49 @@ curl -i http://127.0.0.1:8000/scans/1/results/score
 curl -i "http://127.0.0.1:8000/domains/1/scans?status=succeeded&limit=10"
 ```
 
-### 6. Local Database Testing Setup
+#### List Attack Surface Changes for a Domain
+Query historical attack surface changes detected for a domain, ordered newest-first:
+```bash
+# All changes (default limit: 50, offset: 0)
+curl -i http://127.0.0.1:8000/domains/1/changes
+
+# Filtered by severity, category, change_type, or timestamp
+curl -i "http://127.0.0.1:8000/domains/1/changes?severity=CRITICAL"
+curl -i "http://127.0.0.1:8000/domains/1/changes?category=exposure&since=2026-10-01T00:00:00Z"
+curl -i "http://127.0.0.1:8000/domains/1/changes?change_type=PORT_NEWLY_OPEN&limit=10"
+```
+
+#### List Attack Surface Changes for a Specific Scan Run
+Retrieve only the changes detected in a single scan run (404 if scan not found):
+```bash
+curl -i http://127.0.0.1:8000/scans/2/changes
+```
+
+### 6. Local Database Testing Setup & Migrations
+
+#### How the Test Suite Creates the Database Schema
+The pytest integration test suite (`pytest -m db`) creates its database schema programmatically via SQLAlchemy:
+- When running tests, the session-scoped fixture `db_engine` in `tests/conftest.py` connects to `TEST_DATABASE_URL` (after validating that the database name ends with `_test` for safety).
+- It executes `Base.metadata.create_all(bind=engine)`, ensuring all tables, columns, indexes, and constraints defined across `src/asm/db/models.py` exist before tests execute.
+- Per-test isolation is maintained via savepoint transactions (`join_transaction_mode="create_savepoint"`), rolling back all changes after each test.
+
+#### Migration Testing in CI (`db-test` Job)
+To verify that Alembic migration scripts remain in 100% synchronization with SQLAlchemy ORM models, the CI `db-test` workflow executes a strict 4-step verification sequence against PostgreSQL:
+```bash
+# 1. Apply all migrations up to head
+alembic upgrade head
+
+# 2. Check for schema drift between models.py and migrations (fails if diff exists)
+alembic check
+
+# 3. Verify reversible downgrade functionality
+alembic downgrade -1
+
+# 4. Re-apply to head for test execution
+alembic upgrade head
+```
+
+#### Running Database Tests Locally
 To run the database integration test suite locally against a dedicated throwaway PostgreSQL 18 container:
 
 1. Start a throwaway PostgreSQL container named `asm-test-db` on port `5433`:
@@ -224,14 +266,21 @@ To run the database integration test suite locally against a dedicated throwaway
    docker run -d --name asm-test-db -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=asm_test -p 127.0.0.1:5433:5432 postgres:18.6-alpine
    ```
 
-2. Run Alembic migrations against `asm_test`:
+2. Run the Alembic migration verification cycle:
    ```bash
    # Windows (PowerShell)
    $env:DATABASE_URL = "postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test"
    alembic upgrade head
+   alembic check
+   alembic downgrade -1
+   alembic upgrade head
 
    # Linux / macOS
-   DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test" alembic upgrade head
+   export DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test"
+   alembic upgrade head
+   alembic check
+   alembic downgrade -1
+   alembic upgrade head
    ```
 
 3. Set `TEST_DATABASE_URL` (safety check: the database name must end with `_test`) and run tests:
@@ -243,6 +292,7 @@ To run the database integration test suite locally against a dedicated throwaway
    # Linux / macOS
    TEST_DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5433/asm_test" pytest -m db
    ```
+
 
 
 
@@ -404,10 +454,36 @@ Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
    - Else any `HIGH` host $\rightarrow$ Domain band **HIGH** (flagged as an escalation note if $\ge 3$ high hosts exist)
    - Else any `MEDIUM` host $\rightarrow$ Domain band **MEDIUM**
    - Else any `LOW` host $\rightarrow$ Domain band **LOW**
-   - Else $\rightarrow$ Domain band **INFO**
+   
+---
 
+## Change Detection Engine (v2.3)
+
+`asm` features an automated attack surface differential engine that compares consecutive successful scans of the same domain to detect newly exposed services, resolved issues, and configuration drift.
+
+### Core Principles & Architecture
+1. **Pure Function Engine (`detect_changes`)**:
+   Core diffing logic resides in `src/asm/changes.py` as a pure function `detect_changes(baseline_reports, new_reports) -> list[dict]`. It requires no network or database connections and is tested with static JSON fixtures.
+2. **Strictly Earlier Baseline Selection**:
+   The baseline is selected as the most recent earlier scan for the same domain with `status = 'succeeded'` using `id < :current_id ORDER BY id DESC LIMIT 1`. Failed scans are never used as baselines, and the initial scan of a domain produces zero changes.
+3. **Finding-Based Diffing (Single Source of Truth for Severity)**:
+   Rather than comparing raw report fields, portscan and inspect changes are derived by diffing findings produced by `src/asm/scoring.py` finding evaluators.
+   - **Exposure Additions**: Take the exact severity tier (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`) of the finding they introduce.
+   - **Exposure Reductions**: Are assigned `INFO` severity. A baseline finding is considered resolved only if the host was successfully evaluated in the new scan (`status == "PROBED"`).
+4. **"Unknown" is Not "Absent"**:
+   Reconnaissance failures or non-definitive states never generate removal changes:
+   - A DNS `TIMEOUT` or `ERROR` does not emit `STOPPED_RESOLVING` (only a definite `RESOLVED` $\rightarrow$ `NXDOMAIN` transition does).
+   - An unreachable host or `FILTERED` port does not emit `PORT_NO_LONGER_OPEN` (only `OPEN` $\rightarrow$ `CLOSED` does).
+   - A probe timeout does not emit `HTTPS_LOST` (only non-timeout connection/TLS errors do).
+5. **Source Awareness & Truncation Safety**:
+   Subdomain removals (`REMOVED_SUBDOMAIN`) are evaluated **only** when both baseline and new scans used the same Certificate Transparency source (e.g. `crt.sh` vs `certspotter`) and neither report was truncated (`truncated: false`). If sources differ or either was truncated, removal detection is safely skipped with a descriptive `skip_reason`.
+6. **Atomic & Resilient Finalization**:
+   Change detection runs in memory prior to the final worker transaction. If detection encounters an unexpected error, the scan run still marks `succeeded`, recording the error in `scan_runs.change_detection`. Changes and the final status update are inserted atomically in the same database transaction with a unique constraint preventing duplicate change entries: `(scan_run_id, change_type, asset, detail)`.
+
+---
 
 ## Running Tests and Linting
+
 
 To run the unit test suite (100% mocked, zero network calls, integration tests deselected):
 ```bash

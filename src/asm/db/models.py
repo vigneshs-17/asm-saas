@@ -52,6 +52,11 @@ class Domain(Base):
         cascade="all, delete-orphan",
         order_by="ScanRun.id.desc()",
     )
+    changes: Mapped[list["ScanChange"]] = relationship(
+        back_populates="domain",
+        cascade="all, delete-orphan",
+        order_by="ScanChange.id.desc()",
+    )
 
 
 class ScanRun(Base):
@@ -120,6 +125,13 @@ class ScanRun(Base):
         cascade="all, delete-orphan",
         order_by="ScanStage.id.asc()",
     )
+    change_detection: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    changes: Mapped[list["ScanChange"]] = relationship(
+        back_populates="scan_run",
+        cascade="all, delete-orphan",
+        foreign_keys="[ScanChange.scan_run_id]",
+        order_by="ScanChange.id.asc()",
+    )
 
 
 class ScanStage(Base):
@@ -174,3 +186,61 @@ class ScanResult(Base):
 
     # Relationships
     scan_run: Mapped["ScanRun"] = relationship(back_populates="results")
+
+
+class ScanChange(Base):
+    """Structured change detected between two consecutive succeeded scans of a domain."""
+
+    __tablename__ = "scan_changes"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_run_id",
+            "change_type",
+            "asset",
+            "detail",
+            name="uq_scan_changes_run_type_asset_detail",
+        ),
+        Index("ix_scan_changes_domain_observed", "domain_id", text("observed_at DESC")),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    domain_id: Mapped[int] = mapped_column(
+        ForeignKey("domains.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    scan_run_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    baseline_scan_run_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    change_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    asset: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    detail: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    evidence: Mapped[str] = mapped_column(String(64), nullable=False)
+    previous_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    new_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    # Relationships
+    domain: Mapped["Domain"] = relationship(back_populates="changes")
+    scan_run: Mapped["ScanRun"] = relationship(
+        foreign_keys=[scan_run_id],
+        back_populates="changes",
+    )
+    baseline_scan_run: Mapped["ScanRun"] = relationship(
+        foreign_keys=[baseline_scan_run_id],
+    )
+

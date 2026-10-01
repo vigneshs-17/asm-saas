@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -489,7 +490,19 @@ class ASMWorker:
                     "One or more scan stages failed or were skipped",
                 )
             else:
-                self._mark_run_final(scan_run_id, claim_token, "succeeded", None)
+                summary, changes, baseline_id = self._perform_change_detection(
+                    scan_run_id, domain_id, reports
+                )
+                self._mark_run_final(
+                    scan_run_id,
+                    claim_token,
+                    "succeeded",
+                    None,
+                    change_detection=summary,
+                    changes=changes,
+                    domain_id=domain_id,
+                    baseline_scan_run_id=baseline_id,
+                )
 
         except SecurityGateError as exc:
             logger.warning(
@@ -685,17 +698,168 @@ class ASMWorker:
                 raise LostLeaseError(f"Failed to mark stage {stage} skipped: 0 rows affected")
             session.commit()
 
+    def _perform_change_detection(
+        self,
+        scan_run_id: int,
+        domain_id: int,
+        new_reports: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], int | None]:
+        """Perform in-memory change detection against the most recent earlier succeeded scan."""
+        from asm.changes import detect_changes, evaluate_removal_eligibility
+
+        with self.session_factory() as session:
+            baseline_row = session.execute(
+                text(
+                    """
+                    SELECT id FROM scan_runs
+                    WHERE domain_id = :domain_id AND status = 'succeeded' AND id < :current_id
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ),
+                {"domain_id": domain_id, "current_id": scan_run_id},
+            ).fetchone()
+
+            if not baseline_row:
+                summary = {
+                    "status": "baseline",
+                    "baseline_scan_run_id": None,
+                    "removal_detection": "skipped",
+                    "skip_reason": "No previous succeeded scan (first scan is baseline)",
+                    "error": None,
+                    "counts": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+                }
+                return summary, [], None
+
+            baseline_id = baseline_row[0]
+            results = session.execute(
+                text(
+                    """
+                    SELECT stage, report FROM scan_results
+                    WHERE scan_run_id = :baseline_id
+                    """
+                ),
+                {"baseline_id": baseline_id},
+            ).fetchall()
+            baseline_reports = {r[0]: r[1] for r in results}
+
+        base_disc = baseline_reports.get("discover") or {}
+        new_disc = new_reports.get("discover") or {}
+        allow_removal, skip_reason = evaluate_removal_eligibility(base_disc, new_disc)
+
+        try:
+            changes = detect_changes(baseline_reports, new_reports, allow_removal=allow_removal)
+            counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+            for ch in changes:
+                sev = ch.get("severity", "INFO").lower()
+                if sev in counts:
+                    counts[sev] += 1
+
+            summary = {
+                "status": "computed",
+                "baseline_scan_run_id": baseline_id,
+                "removal_detection": "performed" if allow_removal else "skipped",
+                "skip_reason": skip_reason,
+                "error": None,
+                "counts": counts,
+            }
+            return summary, changes, baseline_id
+
+        except Exception as exc:
+            logger.exception(
+                "Change detection failed for scan_run_id=%d against baseline_id=%d",
+                scan_run_id,
+                baseline_id,
+            )
+            summary = {
+                "status": "failed",
+                "baseline_scan_run_id": baseline_id,
+                "removal_detection": "skipped",
+                "skip_reason": None,
+                "error": sanitize_error_text(str(exc)),
+                "counts": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+            }
+            return summary, [], baseline_id
+
     def _mark_run_final(
         self,
         scan_run_id: int,
         claim_token: uuid.UUID,
         status: str,
         error_msg: str | None,
+        change_detection: dict[str, Any] | None = None,
+        changes: list[dict[str, Any]] | None = None,
+        domain_id: int | None = None,
+        baseline_scan_run_id: int | None = None,
     ) -> None:
         """Set terminal status for scan_run and clear claim tokens."""
         sanitized_error = sanitize_error_text(error_msg)
+        change_detection_json = (
+            json.dumps(change_detection) if change_detection is not None else None
+        )
         with self.session_factory() as session:
             self._verify_fence(session, scan_run_id, claim_token)
+
+            # Insert detected changes in the fenced transaction
+            if changes and baseline_scan_run_id and domain_id:
+                for ch in changes:
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO scan_changes (
+                                domain_id,
+                                scan_run_id,
+                                baseline_scan_run_id,
+                                change_type,
+                                category,
+                                severity,
+                                asset,
+                                detail,
+                                evidence,
+                                previous_state,
+                                new_state,
+                                observed_at,
+                                created_at
+                            ) VALUES (
+                                :domain_id,
+                                :scan_run_id,
+                                :baseline_scan_run_id,
+                                :change_type,
+                                :category,
+                                :severity,
+                                :asset,
+                                :detail,
+                                :evidence,
+                                CAST(:previous_state AS jsonb),
+                                CAST(:new_state AS jsonb),
+                                :observed_at,
+                                now()
+                            )
+                            """
+                        ),
+                        {
+                            "domain_id": domain_id,
+                            "scan_run_id": scan_run_id,
+                            "baseline_scan_run_id": baseline_scan_run_id,
+                            "change_type": ch["change_type"],
+                            "category": ch["category"],
+                            "severity": ch["severity"],
+                            "asset": ch["asset"],
+                            "detail": ch["detail"],
+                            "evidence": ch["evidence"],
+                            "previous_state": (
+                                json.dumps(ch["previous_state"])
+                                if ch.get("previous_state") is not None
+                                else None
+                            ),
+                            "new_state": (
+                                json.dumps(ch["new_state"])
+                                if ch.get("new_state") is not None
+                                else None
+                            ),
+                            "observed_at": ch["observed_at"],
+                        },
+                    )
+
             res = session.execute(
                 text(
                     """
@@ -705,7 +869,8 @@ class ASMWorker:
                         claimed_by = NULL,
                         claim_token = NULL,
                         lease_expires_at = NULL,
-                        error = :error
+                        error = :error,
+                        change_detection = CAST(:change_detection AS jsonb)
                     WHERE id = :id AND status = 'running' AND claim_token = :token
                     """
                 ),
@@ -714,6 +879,7 @@ class ASMWorker:
                     "status": status,
                     "error": sanitized_error,
                     "token": claim_token,
+                    "change_detection": change_detection_json,
                 },
             )
             if res.rowcount == 0:

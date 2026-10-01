@@ -1,11 +1,12 @@
-"""API endpoint and database integration tests for ASM SaaS."""
-
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from asm.api.main import app
+from asm.db.models import Domain, ScanChange, ScanRun
 from asm.db.session import get_db
 
 pytestmark = pytest.mark.db
@@ -141,4 +142,155 @@ def test_test_safety_check_rejects_non_test_database() -> None:
 
     with pytest.raises(pytest.fail.Exception, match="Safety check failed"):
         validate_test_database_url("postgresql+psycopg://user:pass@localhost:5432/asm_prod")
+
+
+def test_get_domain_changes_not_found(client: TestClient) -> None:
+    """GET /domains/{id}/changes returns 404 for unknown domain."""
+    response = client.get("/domains/999999/changes")
+    assert response.status_code == 404
+    assert "not found" in response.text.lower()
+
+
+def test_get_scan_changes_not_found(client: TestClient) -> None:
+    """GET /scans/{id}/changes returns 404 for unknown scan."""
+    response = client.get("/scans/999999/changes")
+    assert response.status_code == 404
+    assert "not found" in response.text.lower()
+
+
+def test_get_domain_changes_success_and_filters(
+    client: TestClient, db_session: Session
+) -> None:
+    """GET /domains/{id}/changes returns newest-first changes with filtering and pagination."""
+    domain = Domain(name="api-changes.com", authorized=True)
+    db_session.add(domain)
+    db_session.flush()
+
+    run1 = ScanRun(domain_id=domain.id, status="succeeded")
+    run2 = ScanRun(domain_id=domain.id, status="succeeded")
+    db_session.add_all([run1, run2])
+    db_session.flush()
+
+    t_now = datetime.now(UTC)
+    t_earlier = t_now - timedelta(hours=1)
+
+    c1 = ScanChange(
+        domain_id=domain.id,
+        scan_run_id=run2.id,
+        baseline_scan_run_id=run1.id,
+        change_type="PORT_NEWLY_OPEN",
+        category="exposure",
+        severity="CRITICAL",
+        asset="api-changes.com",
+        detail="3306",
+        evidence="portscan",
+        observed_at=t_earlier,
+    )
+    c2 = ScanChange(
+        domain_id=domain.id,
+        scan_run_id=run2.id,
+        baseline_scan_run_id=run1.id,
+        change_type="SECURITY_HEADER_REMOVED",
+        category="exposure",
+        severity="LOW",
+        asset="api-changes.com",
+        detail="Strict-Transport-Security",
+        evidence="inspect",
+        observed_at=t_now,
+    )
+    db_session.add_all([c1, c2])
+    db_session.flush()
+
+    # 1. Fetch all changes (newest first)
+    res = client.get(f"/domains/{domain.id}/changes")
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data) == 2
+    assert data[0]["change_type"] == "SECURITY_HEADER_REMOVED"
+    assert data[1]["change_type"] == "PORT_NEWLY_OPEN"
+
+    # 2. Filter by severity
+    res_crit = client.get(f"/domains/{domain.id}/changes?severity=CRITICAL")
+    assert res_crit.status_code == 200
+    crit_data = res_crit.json()
+    assert len(crit_data) == 1
+    assert crit_data[0]["detail"] == "3306"
+
+    # 3. Filter by since
+    since_iso = (t_now - timedelta(minutes=30)).isoformat()
+    res_since = client.get(f"/domains/{domain.id}/changes?since={since_iso}")
+    assert res_since.status_code == 200
+    since_data = res_since.json()
+    assert len(since_data) == 1
+    assert since_data[0]["change_type"] == "SECURITY_HEADER_REMOVED"
+
+    # 4. Pagination
+    res_pag = client.get(f"/domains/{domain.id}/changes?limit=1&offset=1")
+    assert res_pag.status_code == 200
+    pag_data = res_pag.json()
+    assert len(pag_data) == 1
+    assert pag_data[0]["change_type"] == "PORT_NEWLY_OPEN"
+
+
+def test_get_scan_changes_success(client: TestClient, db_session: Session) -> None:
+    """GET /scans/{id}/changes returns changes for a specific scan run."""
+    domain = Domain(name="scan-changes.com", authorized=True)
+    db_session.add(domain)
+    db_session.flush()
+
+    run1 = ScanRun(domain_id=domain.id, status="succeeded")
+    run2 = ScanRun(domain_id=domain.id, status="succeeded")
+    db_session.add_all([run1, run2])
+    db_session.flush()
+
+    c1 = ScanChange(
+        domain_id=domain.id,
+        scan_run_id=run2.id,
+        baseline_scan_run_id=run1.id,
+        change_type="PORT_NEWLY_OPEN",
+        category="exposure",
+        severity="HIGH",
+        asset="scan-changes.com",
+        detail="3389",
+        evidence="portscan",
+        observed_at=datetime.now(UTC),
+    )
+    db_session.add(c1)
+    db_session.flush()
+
+    res = client.get(f"/scans/{run2.id}/changes")
+    assert res.status_code == 200
+    data = res.json()
+    assert len(data) == 1
+    assert data[0]["change_type"] == "PORT_NEWLY_OPEN"
+    assert data[0]["detail"] == "3389"
+    assert data[0]["scan_run_id"] == run2.id
+
+
+def test_changes_endpoints_not_found_and_validation(
+    client: TestClient, db_session: Session
+) -> None:
+    """GET /domains/{id}/changes and /scans/{id}/changes return 404 on unknown IDs
+    and 422 on invalid since.
+    """
+    # 404 for unknown domain
+    res_domain = client.get("/domains/999999/changes")
+    assert res_domain.status_code == 404
+    assert "Domain with ID 999999 not found" in res_domain.json()["detail"]
+
+    # 404 for unknown scan
+    res_scan = client.get("/scans/999999/changes")
+    assert res_scan.status_code == 404
+    assert "Scan run with ID 999999 not found" in res_scan.json()["detail"]
+
+    # 422 for invalid since datetime
+    domain = Domain(name="validation-test.com", authorized=True)
+    db_session.add(domain)
+    db_session.flush()
+
+    res_invalid_since = client.get(f"/domains/{domain.id}/changes?since=not-a-datetime")
+    assert res_invalid_since.status_code == 422
+    assert "Invalid ISO-8601" in res_invalid_since.json()["detail"]
+
+
 

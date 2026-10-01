@@ -2,6 +2,7 @@
 
 import logging
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
@@ -15,10 +16,11 @@ from asm.api.schemas import (
     DomainCreate,
     DomainRead,
     HealthResponse,
+    ScanChangeRead,
     ScanRunDetail,
     ScanRunRead,
 )
-from asm.db.models import Domain, ScanResult, ScanRun, ScanStage
+from asm.db.models import Domain, ScanChange, ScanResult, ScanRun, ScanStage
 from asm.db.session import get_db
 from asm.validators import DomainValidationError, normalize_domain, validate_domain
 
@@ -329,3 +331,82 @@ def get_scan_stage_result(scan_id: int, stage: str, db: DbSession) -> dict[str, 
             detail=f"No artifact report found for stage '{stage}' in scan run {scan_id}.",
         )
     return res.report
+
+
+@router.get(
+    "/domains/{id}/changes",
+    response_model=list[ScanChangeRead],
+    summary="List attack surface changes detected for a domain",
+    responses={
+        200: {"description": "List of detected changes returned"},
+        404: {"description": "Domain ID not found"},
+    },
+)
+def list_domain_changes(
+    id: int,
+    db: DbSession,
+    change_type: Annotated[str | None, Query(description="Filter by change_type")] = None,
+    severity: Annotated[str | None, Query(description="Filter by severity")] = None,
+    category: Annotated[str | None, Query(description="Filter by category")] = None,
+    since: Annotated[
+        str | None,
+        Query(description="Filter changes observed on or after timestamp (ISO-8601)"),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> Sequence[ScanChange]:
+    """Retrieve historical attack surface changes for a domain, newest first."""
+    domain = db.get(Domain, id)
+    if not domain:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain with ID {id} not found.",
+        )
+
+    stmt = select(ScanChange).where(ScanChange.domain_id == id)
+    if change_type:
+        stmt = stmt.where(ScanChange.change_type == change_type)
+    if severity:
+        stmt = stmt.where(ScanChange.severity == severity)
+    if category:
+        stmt = stmt.where(ScanChange.category == category)
+    if since:
+        # Robustly handle unencoded '+' decoded as ' ' in query strings
+        try:
+            since_dt = datetime.fromisoformat(since.replace(" ", "+"))
+        except ValueError as err:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid ISO-8601 datetime format for 'since': {since}",
+            ) from err
+        stmt = stmt.where(ScanChange.observed_at >= since_dt)
+
+    stmt = (
+        stmt.order_by(ScanChange.observed_at.desc(), ScanChange.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return db.scalars(stmt).all()
+
+
+@router.get(
+    "/scans/{id}/changes",
+    response_model=list[ScanChangeRead],
+    summary="List attack surface changes detected in a scan run",
+    responses={
+        200: {"description": "List of scan changes returned"},
+        404: {"description": "Scan run ID not found"},
+    },
+)
+def get_scan_changes(id: int, db: DbSession) -> Sequence[ScanChange]:
+    """Retrieve attack surface changes detected specifically in a scan run."""
+    scan = db.get(ScanRun, id)
+    if not scan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan run with ID {id} not found.",
+        )
+
+    stmt = select(ScanChange).where(ScanChange.scan_run_id == id).order_by(ScanChange.id.asc())
+    return db.scalars(stmt).all()
+

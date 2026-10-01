@@ -1,6 +1,9 @@
 """Pydantic request and response schemas for the ASM SaaS REST API."""
 
+from __future__ import annotations
+
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -63,6 +66,7 @@ class ScanRunRead(BaseModel):
     error: str | None = None
     attempts: int = 0
     max_attempts: int = 3
+    change_detection: dict[str, Any] | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -71,6 +75,27 @@ class ScanRunDetail(ScanRunRead):
     """Detailed response schema for a scan run including stage progress."""
 
     stages: list[ScanStageRead] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ScanChangeRead(BaseModel):
+    """Response schema for an attack surface change record."""
+
+    id: int
+    domain_id: int
+    scan_run_id: int
+    baseline_scan_run_id: int
+    change_type: str
+    category: str
+    severity: str
+    asset: str
+    detail: str
+    evidence: str
+    previous_state: dict[str, Any] | None = None
+    new_state: dict[str, Any] | None = None
+    observed_at: datetime
+    created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
