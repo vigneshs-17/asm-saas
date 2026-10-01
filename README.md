@@ -253,6 +253,37 @@ curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
   -d '{"interval_hours": null}'
 ```
 
+#### Configure Domain Email Alerts
+Configure automated plain-text email alerts for detected attack surface exposures (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`):
+```bash
+# Enable email alerts (1 to 5 recipient emails, default threshold: MEDIUM)
+curl -i -X PUT http://127.0.0.1:8000/domains/1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alerts_enabled": true,
+    "alert_emails": ["security@example.com", "ops@example.com"],
+    "alert_min_severity": "HIGH"
+  }'
+
+# Disable email alerts
+curl -i -X PUT http://127.0.0.1:8000/domains/1/alerts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alerts_enabled": false,
+    "alert_emails": []
+  }'
+```
+
+#### List Alert Notifications for a Domain
+Query the history and delivery status of outbox alert notifications:
+```bash
+# List all notifications (newest first, includes plain-text email body)
+curl -i http://127.0.0.1:8000/domains/1/alert-notifications
+
+# Filter by delivery status (pending / sent / failed)
+curl -i "http://127.0.0.1:8000/domains/1/alert-notifications?status=pending&limit=10"
+```
+
 
 ### 6. Local Database Testing Setup & Migrations
 
@@ -521,6 +552,40 @@ Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
    A small random jitter (0 to 300 seconds) is added to `next_scan_at` to disperse execution times across the hour and prevent thundering herds on shared network and database infrastructure.
 7. **Explicit Trigger Provenance**:
    Every `scan_run` records its origin in the `trigger` column: `"manual"` for user-initiated scans via the API, and `"scheduled"` for automated recurring scans.
+
+---
+
+## Email Alerts & Outbox Engine (v2.4b)
+
+`asm` features an automated email alerting pipeline that dispatches security digests when a scan uncovers new attack surface exposures matching or exceeding a domain's severity threshold.
+
+### Key Architectural Invariants
+1. **Transactional Outbox Pattern**:
+   Alert notifications are never sent directly within scan execution. Instead, pending notification rows (`alert_notifications` table) are inserted within the **exact same fenced transaction** that records the detected changes and marks the `scan_run` as `succeeded`. This eliminates the dual-write problem: either both the changes and the notification records persist, or neither does.
+2. **In-Memory Fault Isolation**:
+   Alert digest formatting and recipient resolution run in memory before the final transaction. If formatting raises an unexpected error, the error is sanitized and recorded under `scan_runs.change_detection["alert_error"]`, no alert rows are inserted, and the scan still completes successfully. Alert formatting failures never cause scan failures.
+3. **Dedicated Outbox Delivery Polling**:
+   At the end of each poll cycle, the worker calls `deliver_pending_alerts()`, claiming due notifications (`status = 'pending' AND next_attempt_at <= now()`) in batches using `SELECT ... FOR UPDATE SKIP LOCKED`.
+4. **Row Lock During SMTP Send**:
+   The delivery transaction **holds the row lock during the SMTP transmission** (bounded by a strict 10-second socket timeout). This strictly prevents concurrent workers from double-sending the same notification without needing distributed locks or multi-phase commits. Upon success, `status = 'sent'` and `sent_at = now()` are committed, releasing the lock.
+5. **Database-Calculated Exponential Backoff**:
+   If delivery fails (e.g. SMTP server unreachable or handshake error), the worker records `last_error` and calculates the next retry using native PostgreSQL intervals:
+   `next_attempt_at = now() + make_interval(secs => :s)`.
+   Retries follow exponential delays (30s, 60s, 120s, 240s) up to 5 attempts before marking `status = 'failed'`.
+6. **Injection-Safe Plain-Text Digest**:
+   Alert emails are sent as clean, readable plain-text (no HTML) with strict CR/LF sanitization on all headers and subject lines to prevent email header injection attacks. Untrusted report strings are sanitized and truncated.
+7. **Local Testing with Mailpit**:
+   Delivery is disabled by default when `SMTP_HOST` is empty (`alert_notifications` stay pending). For local development and testing, run Mailpit via the Docker Compose `dev` profile:
+   ```bash
+   # Start Mailpit (SMTP on 1025, Web UI on http://127.0.0.1:8025)
+   docker compose --profile dev up -d mailpit
+
+   # Configure worker environment in .env
+   SMTP_HOST=localhost
+   SMTP_PORT=1025
+   SMTP_FROM=asm-alerts@example.com
+   ```
+   Open `http://127.0.0.1:8025` in your browser to inspect delivered alert digests in real-time.
 
 ---
 

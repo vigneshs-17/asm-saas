@@ -102,8 +102,8 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 def clean_db(db_engine) -> Generator[None, None, None]:
     """Ensure database tables are truncated before and after multi-threaded concurrency tests."""
     truncate_sql = text(
-        "TRUNCATE TABLE scan_changes, scan_results, scan_stages, scan_runs, domains "
-        "RESTART IDENTITY CASCADE"
+        "TRUNCATE TABLE alert_notifications, scan_changes, scan_results, scan_stages, "
+        "scan_runs, domains RESTART IDENTITY CASCADE"
     )
     with db_engine.begin() as conn:
         conn.execute(truncate_sql)

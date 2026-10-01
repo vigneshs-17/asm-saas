@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 
 from asm.api.schemas import (
     ActiveScanConflict,
+    AlertNotificationRead,
+    DomainAlertsUpdate,
     DomainCreate,
     DomainRead,
     DomainScheduleUpdate,
@@ -21,7 +23,7 @@ from asm.api.schemas import (
     ScanRunDetail,
     ScanRunRead,
 )
-from asm.db.models import Domain, ScanChange, ScanResult, ScanRun
+from asm.db.models import AlertNotification, Domain, ScanChange, ScanResult, ScanRun
 from asm.db.scans import enqueue_scan
 from asm.db.session import get_db
 from asm.validators import DomainValidationError, normalize_domain, validate_domain
@@ -428,5 +430,78 @@ def update_domain_schedule(
     db.commit()
     db.refresh(domain)
     return domain
+
+
+@router.put(
+    "/domains/{id}/alerts",
+    response_model=DomainRead,
+    summary="Configure attack surface change email alerts for a domain",
+    responses={
+        200: {"description": "Alert settings updated successfully"},
+        404: {"description": "Domain not found"},
+        422: {"description": "Domain not authorized or validation error"},
+    },
+)
+def update_domain_alerts(
+    id: int,
+    payload: DomainAlertsUpdate,
+    db: DbSession,
+) -> Domain:
+    """Configure or disable automated email alerts for detected attack surface exposures."""
+    domain = db.get(Domain, id)
+    if not domain:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain with ID {id} not found.",
+        )
+
+    if not domain.authorized:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Domain '{domain.name}' is not authorized.",
+        )
+
+    domain.alerts_enabled = payload.alerts_enabled
+    domain.alert_emails = [str(email) for email in payload.alert_emails]
+    domain.alert_min_severity = payload.alert_min_severity
+
+    db.commit()
+    db.refresh(domain)
+    return domain
+
+
+@router.get(
+    "/domains/{id}/alert-notifications",
+    response_model=list[AlertNotificationRead],
+    summary="List alert notifications for a domain",
+    responses={
+        200: {"description": "List of alert notifications returned"},
+        404: {"description": "Domain not found"},
+    },
+)
+def list_domain_alert_notifications(
+    id: int,
+    db: DbSession,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+) -> Sequence[AlertNotification]:
+    """Retrieve historical alert notifications for a domain with optional status filtering."""
+    domain = db.get(Domain, id)
+    if not domain:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain with ID {id} not found.",
+        )
+
+    query = select(AlertNotification).where(AlertNotification.domain_id == id)
+    if status_filter:
+        query = query.where(AlertNotification.status == status_filter)
+    query = (
+        query.order_by(AlertNotification.created_at.desc(), AlertNotification.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    return db.scalars(query).all()
 
 

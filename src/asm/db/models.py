@@ -41,6 +41,17 @@ class Domain(Base):
             "(scan_interval_hours >= 6 AND scan_interval_hours <= 720)",
             name="ck_domains_scan_interval_hours",
         ),
+        CheckConstraint(
+            "alert_min_severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')",
+            name="ck_domains_alert_min_severity",
+        ),
+        CheckConstraint(
+            "alerts_enabled = false OR "
+            "(jsonb_typeof(alert_emails) = 'array' AND "
+            "jsonb_array_length(alert_emails) >= 1 AND "
+            "jsonb_array_length(alert_emails) <= 5)",
+            name="ck_domains_alert_emails_count",
+        ),
         Index(
             "ix_domains_schedule_due",
             "next_scan_at",
@@ -57,6 +68,9 @@ class Domain(Base):
     next_scan_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None, index=True
     )
+    alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    alert_emails: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    alert_min_severity: Mapped[str] = mapped_column(String(16), default="MEDIUM", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,
@@ -73,6 +87,11 @@ class Domain(Base):
         back_populates="domain",
         cascade="all, delete-orphan",
         order_by="ScanChange.id.desc()",
+    )
+    alert_notifications: Mapped[list["AlertNotification"]] = relationship(
+        back_populates="domain",
+        cascade="all, delete-orphan",
+        order_by="AlertNotification.id.desc()",
     )
 
 
@@ -151,6 +170,11 @@ class ScanRun(Base):
         cascade="all, delete-orphan",
         foreign_keys="[ScanChange.scan_run_id]",
         order_by="ScanChange.id.asc()",
+    )
+    alert_notifications: Mapped[list["AlertNotification"]] = relationship(
+        back_populates="scan_run",
+        cascade="all, delete-orphan",
+        order_by="AlertNotification.id.asc()",
     )
 
 
@@ -263,4 +287,57 @@ class ScanChange(Base):
     baseline_scan_run: Mapped["ScanRun"] = relationship(
         foreign_keys=[baseline_scan_run_id],
     )
+
+
+class AlertNotification(Base):
+    """Transactional outbox record for scan change email alerts."""
+
+    __tablename__ = "alert_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_run_id",
+            "recipient",
+            name="uq_alert_notifications_run_recipient",
+        ),
+        Index(
+            "ix_alert_notifications_due",
+            "next_attempt_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index("ix_alert_notifications_domain_created", "domain_id", text("created_at DESC")),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    domain_id: Mapped[int] = mapped_column(
+        ForeignKey("domains.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    scan_run_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    recipient: Mapped[str] = mapped_column(String(255), nullable=False)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending", nullable=False, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False, index=True
+    )
+    last_error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    # Relationships
+    domain: Mapped["Domain"] = relationship(back_populates="alert_notifications")
+    scan_run: Mapped["ScanRun"] = relationship(back_populates="alert_notifications")
 

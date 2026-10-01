@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class HealthResponse(BaseModel):
@@ -38,6 +38,9 @@ class DomainRead(BaseModel):
     authorization_note: str | None = None
     scan_interval_hours: int | None = None
     next_scan_at: datetime | None = None
+    alerts_enabled: bool = False
+    alert_emails: list[str] = Field(default_factory=list)
+    alert_min_severity: str = "MEDIUM"
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
@@ -52,6 +55,60 @@ class DomainScheduleUpdate(BaseModel):
         le=720,
         description="Scan interval in hours (6 to 720), or null to disable schedule.",
     )
+
+
+class DomainAlertsUpdate(BaseModel):
+    """Request payload for configuring domain email alerts."""
+
+    alerts_enabled: bool
+    alert_emails: list[EmailStr] = Field(default_factory=list)
+    alert_min_severity: str = Field(
+        default="MEDIUM",
+        pattern="^(CRITICAL|HIGH|MEDIUM|LOW|INFO)$",
+        description="Minimum severity threshold to trigger alerts (CRITICAL..INFO)",
+    )
+
+    @field_validator("alert_emails")
+    @classmethod
+    def validate_no_crlf(cls, emails: list[EmailStr]) -> list[EmailStr]:
+        for e in emails:
+            if "\r" in e or "\n" in e:
+                raise ValueError(
+                    "Email addresses must not contain carriage return or newline characters"
+                )
+        return emails
+
+    @model_validator(mode="after")
+    def validate_email_count(self) -> DomainAlertsUpdate:
+        if self.alerts_enabled:
+            if len(self.alert_emails) < 1 or len(self.alert_emails) > 5:
+                raise ValueError(
+                    "When alerts are enabled, between 1 and 5 alert_emails must be provided"
+                )
+        else:
+            if len(self.alert_emails) > 5:
+                raise ValueError("No more than 5 alert_emails may be specified")
+        return self
+
+
+class AlertNotificationRead(BaseModel):
+    """Response schema for an outbox alert notification."""
+
+    id: int
+    domain_id: int
+    scan_run_id: int
+    recipient: str
+    subject: str
+    body: str
+    status: str
+    attempts: int
+    max_attempts: int
+    next_attempt_at: datetime
+    last_error: str | None = None
+    sent_at: datetime | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ScanStageRead(BaseModel):

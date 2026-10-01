@@ -17,6 +17,9 @@ from sqlalchemy import Engine, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from asm.alerts.delivery import send_smtp_email
+from asm.alerts.digest import build_alert_digest
+from asm.alerts.rules import should_trigger_alerts
 from asm.db.models import Domain, ScanResult
 from asm.db.scans import enqueue_scan
 from asm.scan_common import sanitize_error_text
@@ -103,6 +106,13 @@ class ASMWorker:
         poll_interval: float = 3.0,
         lease_duration: int = 60,
         heartbeat_interval: float = 15.0,
+        smtp_host: str | None = None,
+        smtp_port: int | None = None,
+        smtp_from: str | None = None,
+        smtp_username: str | None = None,
+        smtp_password: str | None = None,
+        smtp_starttls: bool | None = None,
+        smtp_timeout: float | None = None,
     ) -> None:
         if engine is None:
             from asm.db.session import get_engine
@@ -119,6 +129,39 @@ class ASMWorker:
             f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
         self.shutdown_requested = threading.Event()
+
+        # SMTP configuration for alert delivery
+        if smtp_host is not None:
+            self.smtp_host = smtp_host.strip() or None
+        else:
+            self.smtp_host = os.getenv("SMTP_HOST", "").strip() or None
+
+        self.smtp_port = (
+            smtp_port if smtp_port is not None else int(os.getenv("SMTP_PORT", "1025"))
+        )
+        self.smtp_from = (
+            smtp_from if smtp_from is not None else os.getenv("SMTP_FROM", "alerts@asm.local")
+        )
+        self.smtp_username = (
+            smtp_username
+            if smtp_username is not None
+            else (os.getenv("SMTP_USERNAME", "").strip() or None)
+        )
+        self.smtp_password = (
+            smtp_password
+            if smtp_password is not None
+            else (os.getenv("SMTP_PASSWORD", "").strip() or None)
+        )
+        self.smtp_starttls = (
+            smtp_starttls
+            if smtp_starttls is not None
+            else (os.getenv("SMTP_STARTTLS", "false").lower() in ("true", "1", "yes"))
+        )
+        self.smtp_timeout = (
+            smtp_timeout
+            if smtp_timeout is not None
+            else float(os.getenv("SMTP_TIMEOUT", "10.0"))
+        )
 
     def install_signal_handlers(self) -> None:
         """Register signal handlers to initiate graceful shutdown on SIGTERM / SIGINT."""
@@ -159,6 +202,14 @@ class ASMWorker:
         except Exception:
             logger.exception(
                 "Unexpected error in worker schedule_due_scans; continuing to job claiming"
+            )
+
+        # Step: Deliver pending alert notifications (outbox worker step)
+        try:
+            self.deliver_pending_alerts()
+        except Exception:
+            logger.exception(
+                "Unexpected error in worker deliver_pending_alerts; continuing to job claiming"
             )
 
         if self.shutdown_requested.is_set():
@@ -587,6 +638,50 @@ class ASMWorker:
                 summary, changes, baseline_id = self._perform_change_detection(
                     scan_run_id, domain_id, reports
                 )
+
+                # Build alert subject/body and recipient rows in memory BEFORE the final
+                # fenced transaction, inside try/except.
+                alert_rows: list[dict[str, str]] = []
+                if summary.get("status") == "computed":
+                    try:
+                        with self.session_factory() as session:
+                            domain_obj = session.get(Domain, domain_id)
+                            if (
+                                domain_obj
+                                and domain_obj.alerts_enabled
+                                and domain_obj.alert_emails
+                                and domain_obj.authorized
+                            ):
+                                should_alert, triggering_changes = should_trigger_alerts(
+                                    alerts_enabled=domain_obj.alerts_enabled,
+                                    alert_emails=domain_obj.alert_emails,
+                                    authorized=domain_obj.authorized,
+                                    alert_min_severity=domain_obj.alert_min_severity,
+                                    change_summary=summary,
+                                    changes=changes,
+                                )
+                                if should_alert:
+                                    subject, body = build_alert_digest(
+                                        domain_name=domain_obj.name,
+                                        scan_run_id=scan_run_id,
+                                        changes=changes,
+                                        triggering_changes=triggering_changes,
+                                    )
+                                    for email in domain_obj.alert_emails:
+                                        alert_rows.append({
+                                            "recipient": email,
+                                            "subject": subject,
+                                            "body": body,
+                                        })
+                    except Exception as alert_exc:
+                        logger.exception(
+                            "Failed building alerts for scan_run_id=%d: %s",
+                            scan_run_id,
+                            alert_exc,
+                        )
+                        summary["alert_error"] = sanitize_error_text(str(alert_exc))
+                        alert_rows = []
+
                 self._mark_run_final(
                     scan_run_id,
                     claim_token,
@@ -596,6 +691,7 @@ class ASMWorker:
                     changes=changes,
                     domain_id=domain_id,
                     baseline_scan_run_id=baseline_id,
+                    alert_rows=alert_rows,
                 )
 
         except SecurityGateError as exc:
@@ -884,6 +980,7 @@ class ASMWorker:
         changes: list[dict[str, Any]] | None = None,
         domain_id: int | None = None,
         baseline_scan_run_id: int | None = None,
+        alert_rows: list[dict[str, str]] | None = None,
     ) -> None:
         """Set terminal status for scan_run and clear claim tokens."""
         sanitized_error = sanitize_error_text(error_msg)
@@ -951,6 +1048,47 @@ class ASMWorker:
                                 else None
                             ),
                             "observed_at": ch["observed_at"],
+                        },
+                    )
+
+            # Insert alert notifications into outbox in the same fenced transaction
+            if alert_rows and domain_id:
+                for alert in alert_rows:
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO alert_notifications (
+                                domain_id,
+                                scan_run_id,
+                                recipient,
+                                subject,
+                                body,
+                                status,
+                                attempts,
+                                max_attempts,
+                                next_attempt_at,
+                                created_at
+                            ) VALUES (
+                                :domain_id,
+                                :scan_run_id,
+                                :recipient,
+                                :subject,
+                                :body,
+                                'pending',
+                                0,
+                                5,
+                                now(),
+                                now()
+                            )
+                            ON CONFLICT (scan_run_id, recipient) DO NOTHING
+                            """
+                        ),
+                        {
+                            "domain_id": domain_id,
+                            "scan_run_id": scan_run_id,
+                            "recipient": alert["recipient"],
+                            "subject": alert["subject"],
+                            "body": alert["body"],
                         },
                     )
 
@@ -1134,3 +1272,119 @@ class ASMWorker:
                 logger.info("Successfully released scan_run_id=%d gracefully", scan_run_id)
         except Exception as exc:
             logger.error("Failed graceful release for scan_run_id=%d: %s", scan_run_id, exc)
+
+    def deliver_pending_alerts(self, batch_limit: int = 10) -> int:
+        """Deliver pending alert notifications using transactional outbox pattern.
+
+        Each notification is processed in its own transaction.
+        The delivery transaction holds the row lock (FOR UPDATE SKIP LOCKED)
+        during the SMTP send (bounded by a socket timeout, default 10s).
+        Holding the row lock during send prevents double sends by concurrent
+        workers. If a crash occurs after SMTP accepts the email but before commit,
+        the transaction rolls back and the email may be re-sent (at-least-once).
+
+        Returns:
+            Number of alert notifications successfully delivered.
+        """
+        if not self.smtp_host:
+            return 0
+
+        delivered_count = 0
+        for _ in range(batch_limit):
+            with self.session_factory() as session:
+                # 1. Claim single pending notification with FOR UPDATE SKIP LOCKED
+                stmt = text(
+                    """
+                    SELECT id, domain_id, scan_run_id, recipient, subject,
+                           body, attempts, max_attempts
+                    FROM alert_notifications
+                    WHERE status = 'pending' AND next_attempt_at <= now()
+                    ORDER BY next_attempt_at ASC, id ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                    """
+                )
+                row = session.execute(stmt).mappings().fetchone()
+                if not row:
+                    break
+
+                delivery_error = None
+                try:
+                    # Hold row lock while sending via smtplib
+                    send_smtp_email(
+                        host=self.smtp_host,
+                        port=self.smtp_port,
+                        from_addr=self.smtp_from,
+                        to_addr=row["recipient"],
+                        subject=row["subject"],
+                        body=row["body"],
+                        username=self.smtp_username,
+                        password=self.smtp_password,
+                        use_starttls=self.smtp_starttls,
+                        timeout=self.smtp_timeout,
+                    )
+                except Exception as exc:
+                    delivery_error = sanitize_error_text(str(exc))
+                    logger.warning(
+                        "Alert delivery failed id=%d recipient=%s attempt=%d/%d: %s",
+                        row["id"],
+                        row["recipient"],
+                        row["attempts"] + 1,
+                        row["max_attempts"],
+                        delivery_error,
+                    )
+
+                if delivery_error is None:
+                    session.execute(
+                        text(
+                            """
+                            UPDATE alert_notifications
+                            SET status = 'sent',
+                                sent_at = now(),
+                                attempts = attempts + 1,
+                                last_error = NULL
+                            WHERE id = :id
+                            """
+                        ),
+                        {"id": row["id"]},
+                    )
+                    delivered_count += 1
+                else:
+                    new_attempts = row["attempts"] + 1
+                    if new_attempts >= row["max_attempts"]:
+                        session.execute(
+                            text(
+                                """
+                                UPDATE alert_notifications
+                                SET status = 'failed',
+                                    attempts = :attempts,
+                                    last_error = :err
+                                WHERE id = :id
+                                """
+                            ),
+                            {"id": row["id"], "attempts": new_attempts, "err": delivery_error},
+                        )
+                    else:
+                        # Exponential backoff: 30s * 2^(attempts-1) + jitter (0-5s)
+                        backoff_seconds = int(30 * (2 ** (new_attempts - 1)) + random.uniform(0, 5))
+                        session.execute(
+                            text(
+                                """
+                                UPDATE alert_notifications
+                                SET attempts = :attempts,
+                                    next_attempt_at = now() + make_interval(secs => :s),
+                                    last_error = :err
+                                WHERE id = :id
+                                """
+                            ),
+                            {
+                                "id": row["id"],
+                                "attempts": new_attempts,
+                                "err": delivery_error,
+                                "s": backoff_seconds,
+                            },
+                        )
+
+                session.commit()
+
+        return delivered_count
