@@ -13,18 +13,38 @@ from asm.db.models import AlertNotification, Domain
 @pytest.fixture
 def client(db_engine):
     """FastAPI TestClient configured with test database."""
+    from uuid import UUID
+
+    from asm.api.deps import get_current_user
+    from asm.db.models import User
     from asm.db.session import get_db
 
     session_factory = sessionmaker(bind=db_engine)
+    test_user_id = UUID("00000000-0000-0000-0000-000000000001")
 
     def override_get_db():
         with session_factory() as session:
             yield session
 
+    def override_get_current_user():
+        with session_factory() as session:
+            user = session.get(User, test_user_id)
+            if not user:
+                try:
+                    user = User(id=test_user_id, email="testuser@example.com")
+                    session.add(user)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    user = session.get(User, test_user_id)
+            return user
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = override_get_current_user
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
 
 
 @pytest.mark.db

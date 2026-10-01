@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -176,3 +177,66 @@ class ActiveScanConflict(BaseModel):
 
     detail: str
     active_scan_id: int
+
+
+class UserRead(BaseModel):
+    """Response schema for an authenticated user."""
+
+    id: UUID
+    email: str
+    created_at: datetime
+    last_seen_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrgCreate(BaseModel):
+    """Request payload for creating a new organization."""
+
+    name: str = Field(..., min_length=1, max_length=128, description="Organization name")
+
+
+class OrgRead(BaseModel):
+    """Response schema for an organization."""
+
+    id: int
+    name: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrgWithRoleRead(OrgRead):
+    """Response schema for an organization including the caller's role."""
+
+    role: str
+
+
+class OrgMemberRead(BaseModel):
+    """Response schema for an organization member."""
+
+    user_id: UUID
+    email: str
+    role: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OrgMemberAdd(BaseModel):
+    """Request payload for adding a member to an organization."""
+
+    email: EmailStr = Field(..., description="Email of the existing user to add")
+    role: Literal["owner", "admin", "viewer"] = Field(
+        default="viewer",
+        description="Role to assign to the new member",
+    )
+
+
+class OrgMemberUpdate(BaseModel):
+    """Request payload for updating an organization member's role."""
+
+    role: Literal["owner", "admin", "viewer"] = Field(
+        ...,
+        description="New role to assign to the member",
+    )

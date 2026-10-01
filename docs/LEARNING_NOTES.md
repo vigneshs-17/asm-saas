@@ -1110,6 +1110,124 @@ In network reconnaissance, an observation failure is not evidence of absence. Wh
   2. **Immutable Message Body:** The complete rendered plain-text `body` is stored directly on the notification row. This provides an immutable audit log of exactly what was transmitted to the customer, enabling forensic verification in compliance audits (e.g. SOC 2 or ISO 27001).
   3. **State & Error Tracking:** Columns `attempts`, `max_attempts`, `last_error`, `next_attempt_at`, and `sent_at` provide real-time observability into delivery health, enabling administrators to diagnose SMTP configuration errors or network partitions via the API (`GET /domains/{id}/alert-notifications`).
 
+---
+
+# Part 10: v3.1a — Supabase JWT Authentication, JWKS Key Rotation & RBAC
+
+## 1. Plain-English Code Walkthrough
+
+### Authentication vs. Authorization
+- **Authentication ("Who are you?"):**
+  Identity verification is completely outsourced to Supabase Auth. The backend contains no user registration endpoints, no password hashing, no session cookies, and no credential databases. Supabase handles user login, password resets, OAuth, and email verification, issuing cryptographically signed JSON Web Tokens (JWTs).
+- **Authorization ("What are you allowed to do?"):**
+  While Supabase establishes identity, authorization is strictly our domain. Our backend parses the verified user identity (`sub`), queries our local `memberships` table, and evaluates fine-grained permissions across customer organizations and reconnaissance operations.
+- **Email Verification Guardrail:**
+  Because organization membership invitations and additions are conducted via email, the Supabase project must enforce "Confirm email". Trusting unverified emails from an identity provider would allow an attacker to register an account with a target's corporate email address and automatically claim organization access.
+
+### JWKS Architecture & Key Rotation
+- **Asymmetric Cryptography:**
+  Tokens are signed with Supabase's private key and verified using public keys published on `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
+- **Decoupled Key Rotation:**
+  Because public keys are indexed by a Key ID (`kid`), Supabase can rotate signing keys without requiring backend restarts or configuration redeployments.
+- **Explicit Unknown-Kid Throttle:**
+  If a token arrives with an unknown `kid`, the backend allows a single refresh from Supabase. To defend against attackers flooding the API with random `kid` values to trigger denial-of-service (DoS) against our backend or Supabase, our code explicitly enforces a 10-second minimum refresh interval. Requests during the throttle window fail immediately with 401.
+
+### Algorithm Confusion Attacks & Defenses
+- **The Vulnerability:**
+  In a naive JWT library implementation that accepts both asymmetric (`RS256`/`ES256`) and symmetric (`HS256`) algorithms, an attacker can obtain the server's public key (which is publicly published on the JWKS endpoint) and sign a forged token using `HS256`, treating the public key PEM bytes as an HMAC secret. A vulnerable verifier looking up the public key would verify the HMAC signature and accept the forged claims (e.g. `sub: admin`).
+- **Defensive Safeguards:**
+  1. Strict algorithm allowlist: Only `ES256` and `RS256` are accepted.
+  2. Symmetric algorithms (`HS256`, `HS384`, `HS512`) and unsigned tokens (`none`) are rejected upfront before cryptographic processing.
+  3. Anonymous tokens (`is_anonymous: true`) are rejected with 401.
+
+### Anti-Enumeration Defensive Pattern: 404 vs. 403
+- **Information Leakage via 403:**
+  In a multi-tenant platform, returning `403 Forbidden` when a user tries to access `/orgs/42/members` informs the attacker that Organization `42` exists. An attacker can iterate through IDs from 1 to 100,000 to map out valid organization IDs.
+- **The 404 Guardrail:**
+  `require_org_role` returns `404 Not Found` whenever a user does not have a membership in the target organization. A non-member cannot distinguish between an organization that does not exist and an organization they lack access to. `403 Forbidden` is reserved strictly for authenticated members who lack sufficient role privilege (e.g., a `viewer` trying to add a member).
+
+### Last-Owner Invariant & Row Locking
+- **The Race Hazard:**
+  Suppose an organization has two owners, Alice and Bob. Both click "Demote to Viewer" at the exact same millisecond. If the system merely counts owners (`count == 2`) and updates, both transactions commit, leaving the organization with **zero owners**.
+- **Row-Locking Solution:**
+  Before counting owners, both `PATCH` and `DELETE` execute:
+  `SELECT 1 FROM organizations WHERE id = :id FOR UPDATE;`
+  This serializes the transactions on the organization row. The first transaction demotes one owner; the second transaction acquires the lock, recalculates remaining owners (`count == 0`), and is immediately rejected with `422 Unprocessable Entity`.
+
+---
+
+## 2. Five Step 3.1a Cybersecurity Interview Questions & Answers
+
+### Question 1: Explain the JWT Algorithm Confusion attack, how asymmetric public keys are weaponized in it, and how an API must defend against it.
+**Answer:**
+- **The Mechanism:**
+  JWTs support both asymmetric signature schemes (`RS256`/`ES256`, which require a private key to sign and a public key to verify) and symmetric HMAC schemes (`HS256`, which use the same shared secret for both signing and verification).
+  In an algorithm confusion attack, an attacker takes an API configured to verify asymmetric tokens, forges a token with payload claims granting administrative privileges, and changes the header algorithm to `"alg": "HS256"`.
+  The attacker then signs the token using the server's public key (e.g. retrieved from the public JWKS endpoint) as the HMAC secret.
+- **The Vulnerability:**
+  If the verification library accepts any algorithm specified in the token header and simply passes the configured public key into the verification function, the library interprets the public key as an HMAC secret key. Because the attacker signed the token using that exact public key, the HMAC verification succeeds!
+- **Defensive Safeguards:**
+  1. **Strict Algorithm Allowlist:** The application must explicitly restrict allowed algorithms to asymmetric algorithms only (`algorithms=["ES256", "RS256"]`). Any token specifying `HS256` or `none` is rejected immediately.
+  2. **Never Trust the Header Algorithm:** The server must dictate acceptable verification algorithms rather than allowing the client-controlled `alg` header to determine the verification logic.
+
+---
+
+### Question 2: Why is outsourcing authentication to an external Identity Provider (like Supabase Auth) while retaining internal authorization considered best practice in modern SaaS architectures?
+**Answer:**
+- **Separation of Concerns:**
+  Authentication answers *"Who is the user?"* while authorization answers *"What actions can this user perform on these resources?"*.
+  Identity management involves high-risk, specialized security requirements: password hashing (Argon2/bcrypt), credential breach detection, rate limiting, Multi-Factor Authentication (MFA), password reset flows, session invalidation, and OAuth integrations. Handling this internally introduces significant attack surfaces and compliance burdens (SOC 2, ISO 27001).
+- **Zero-Password Backend Architecture:**
+  By delegating authentication to Supabase Auth, the ASM SaaS backend never handles, hashes, or stores user passwords. The backend only validates short-lived, cryptographically signed JWTs using public keys (JWKS). Compromise of the application database exposes zero user credentials.
+- **Internal Domain Ownership of Authorization:**
+  Conversely, authorization depends directly on application business logic: organizations, workspace memberships, role tiers (`owner`, `admin`, `viewer`), and scan permissions. Outsourcing authorization to a third-party token provider leads to stale claim issues and complex claim synchronization. Retaining authorization in the application database guarantees real-time, ACID-compliant permission checks.
+
+---
+
+### Question 3: What is organizational ID enumeration, and why must multi-tenant authorization middleware return HTTP 404 rather than 403 to non-members?
+**Answer:**
+- **The Threat of ID Enumeration:**
+  In a multi-tenant platform, resources are scoped to organizations identified by integer IDs (e.g. `/orgs/1`, `/orgs/2`).
+  If the API returns `403 Forbidden` when an unauthorized user attempts to access an organization, the attacker learns that the organization exists. By writing a simple script iterating through IDs, an attacker can map out the entire organization directory, estimate platform customer volume, and identify high-value enterprise tenants.
+- **The Anti-Enumeration Principle (404 vs 403):**
+  To prevent information disclosure, the authorization dependency `require_org_role` returns `404 Not Found` whenever a user does not hold an active membership in the target organization.
+  From the perspective of an external caller, an unauthorized organization is indistinguishable from a non-existent organization.
+- **When 403 Is Legitimate:**
+  `403 Forbidden` is returned only when the user's membership in that organization has already been confirmed, but their role lacks sufficient privilege for the requested action (e.g. a confirmed `viewer` attempting `POST /orgs/1/members`).
+
+---
+
+### Question 4: How does JWKS key caching introduce denial-of-service risks through unknown Key IDs (`kid`), and how should backends defend against cache-miss flooding?
+**Answer:**
+- **The Unknown-Kid Cache Stampede Attack:**
+  In a JWKS architecture, the backend caches public keys indexed by their `kid` to avoid making HTTP requests to the Identity Provider on every API call.
+  However, when the Identity Provider rotates keys, legitimate tokens will arrive with a new `kid` not yet in the cache. A naive implementation responds to an unknown `kid` by immediately fetching fresh keys from the JWKS endpoint.
+  An attacker can exploit this by sending thousands of requests per second, each containing an invalid JWT with a randomized `kid` (`kid="random-uuid-1"`, `kid="random-uuid-2"`). The backend would execute an outbound HTTP request on every request, exhausting its connection pool, saturating network bandwidth, and triggering rate-limit bans from the JWKS provider.
+- **Defensive Safeguards:**
+  1. **Strict Throttled Refreshes:** The backend maintains an explicit minimum refresh interval (e.g. 10 seconds). If an unknown `kid` triggers a refresh, no further outbound HTTP calls are permitted until the window elapses.
+  2. **Bounded HTTP Timeouts:** All JWKS network requests enforce strict, short timeouts (5.0 seconds).
+  3. **Fast Rejection:** During the throttle window, unknown `kid` tokens are immediately rejected with `401 Unauthorized` without network I/O.
+
+---
+
+### Question 5: How does a pessimistic row lock (`SELECT ... FOR UPDATE`) solve the last-owner race condition in concurrent role management?
+**Answer:**
+- **The Last-Owner Invariant:**
+  An organization must maintain at least one active owner to prevent orphaned organizations that cannot be administered or billed.
+- **The Race Hazard:**
+  Suppose an organization has two owners, Alice and Bob. Both simultaneously submit requests to demote each other or remove their own accounts.
+  Under an un-fenced read-then-write sequence:
+  1. Transaction A reads owner count: finds 2 owners $\rightarrow$ check passes.
+  2. Transaction B reads owner count: finds 2 owners $\rightarrow$ check passes.
+  3. Transaction A commits demotion $\rightarrow$ 1 owner remaining.
+  4. Transaction B commits demotion $\rightarrow$ 0 owners remaining! The organization is permanently orphaned.
+- **The Pessimistic Lock Solution:**
+  Before evaluating the owner count, the transaction executes:
+  `SELECT 1 FROM organizations WHERE id = :id FOR UPDATE;`
+  PostgreSQL locks the parent organization row. Transaction A acquires the lock, counts owners, and demotes Bob. Transaction B is blocked at the database engine level until Transaction A commits.
+  When Transaction B unblocks, it reads the updated state under the lock, sees that only 1 owner remains, and is aborted with `422 Unprocessable Entity`.
+
+
 
 
 

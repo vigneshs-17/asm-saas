@@ -292,8 +292,65 @@ curl -i http://127.0.0.1:8000/domains/1/alert-notifications
 curl -i "http://127.0.0.1:8000/domains/1/alert-notifications?status=pending&limit=10"
 ```
 
+### 6. Authentication, Organizations & Role-Based Access Control (v3.1a)
 
-### 6. Local Database Testing Setup & Migrations
+In v3.1a, all API endpoints (except `/health`) require authentication via a valid Supabase JWT access token.
+*(Note: Multi-tenant scoping of domains, scans, changes, and alerts to specific organizations is scheduled for Phase v3.1b).*
+
+#### Identity Provider Architecture & Supabase Project Settings
+- **Supabase Owns Identity**: The backend never handles user passwords and provides no login/registration endpoints. Supabase Auth manages sign-in, password resets, and email verification.
+- **Mandatory Supabase Setting**: In your Supabase project under **Authentication -> Providers -> Email**, you **must ensure "Confirm email" is enabled**. Because organization invitations and member appointments lookup users by email, trusting an unconfirmed email address would allow attackers to claim memberships by registering with arbitrary victim emails.
+- **Zero-Secret Verification**: The backend validates tokens using public keys retrieved via JWKS from `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`. No API secret or service role key is stored on the server.
+- **Algorithm-Confusion Defense**: Only asymmetric algorithms `ES256` and `RS256` are allowed. Symmetric algorithms (`HS256`) and unsigned tokens (`none`) are rejected. Anonymous tokens (`is_anonymous: true`) are strictly rejected.
+
+#### How to Obtain a Test Token from Supabase
+You can obtain a valid JWT access token from your Supabase project using `curl` against the Supabase GoTrue Auth API:
+```bash
+curl -X POST 'https://<your-project-ref>.supabase.co/auth/v1/token?grant_type=password' \
+  -H 'apikey: <your-anon-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "user@example.com",
+    "password": "your-password"
+  }'
+```
+Extract `access_token` from the JSON response and pass it in the `Authorization: Bearer <token>` header on all requests.
+
+#### Managing Organizations and Members
+```bash
+# 1. Create a new organization (creator automatically becomes 'owner')
+curl -i -X POST http://127.0.0.1:8000/orgs \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Acme Cybersecurity"}'
+
+# 2. List organizations you belong to
+curl -i http://127.0.0.1:8000/orgs \
+  -H "Authorization: Bearer <token>"
+
+# 3. List organization members (accessible to viewers, admins, owners)
+curl -i http://127.0.0.1:8000/orgs/1/members \
+  -H "Authorization: Bearer <token>"
+
+# 4. Add a member by email (accessible to admins and owners; user must have signed in once)
+curl -i -X POST http://127.0.0.1:8000/orgs/1/members \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "analyst@example.com", "role": "viewer"}'
+
+# 5. Update a member's role (owner only; last owner cannot be demoted)
+curl -i -X PATCH http://127.0.0.1:8000/orgs/1/members/<user-uuid> \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "admin"}'
+
+# 6. Remove a member (owner only, or self-removal; last owner cannot be removed)
+curl -i -X DELETE http://127.0.0.1:8000/orgs/1/members/<user-uuid> \
+  -H "Authorization: Bearer <token>"
+```
+
+
+### 7. Local Database Testing Setup & Migrations
 
 #### How the Test Suite Creates the Database Schema
 The pytest integration test suite (`pytest -m db`) creates its database schema programmatically via SQLAlchemy:

@@ -9,14 +9,16 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from asm.api.deps import get_current_user
 from asm.api.main import app
-from asm.db.models import Base
+from asm.db.models import Base, User
 from asm.db.session import get_db
 
 
@@ -87,12 +89,22 @@ def db_session(db_engine) -> Generator[Session, None, None]:
 
 @pytest.fixture
 def client(db_session: Session) -> Generator[TestClient, None, None]:
-    """Provide a FastAPI TestClient with get_db overridden to use the isolated test session."""
+    """Provide a FastAPI TestClient with get_db and get_current_user overridden."""
+    test_user_id = UUID("00000000-0000-0000-0000-000000000001")
+    test_user = db_session.get(User, test_user_id)
+    if not test_user:
+        test_user = User(id=test_user_id, email="testuser@example.com")
+        db_session.add(test_user)
+        db_session.flush()
 
     def _override_get_db():
         yield db_session
 
+    def _override_get_current_user():
+        return test_user
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_current_user] = _override_get_current_user
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -102,8 +114,8 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 def clean_db(db_engine) -> Generator[None, None, None]:
     """Ensure database tables are truncated before and after multi-threaded concurrency tests."""
     truncate_sql = text(
-        "TRUNCATE TABLE alert_notifications, scan_changes, scan_results, scan_stages, "
-        "scan_runs, domains RESTART IDENTITY CASCADE"
+        "TRUNCATE TABLE memberships, organizations, users, alert_notifications, "
+        "scan_changes, scan_results, scan_stages, scan_runs, domains RESTART IDENTITY CASCADE"
     )
     with db_engine.begin() as conn:
         conn.execute(truncate_sql)
@@ -115,14 +127,32 @@ def clean_db(db_engine) -> Generator[None, None, None]:
 @pytest.fixture
 def lifecycle_client(clean_db, db_engine) -> Generator[TestClient, None, None]:
     """Provide a TestClient connected to db_engine with clean_db truncation for worker tests."""
+    test_user_id = UUID("00000000-0000-0000-0000-000000000001")
+
     def _override_get_db():
         with Session(db_engine) as session:
             yield session
 
+    def _override_get_current_user():
+        with Session(db_engine) as session:
+            user = session.get(User, test_user_id)
+            if not user:
+                try:
+                    user = User(id=test_user_id, email="testuser@example.com")
+                    session.add(user)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    user = session.get(User, test_user_id)
+            return user
+
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_current_user] = _override_get_current_user
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
 
 
 

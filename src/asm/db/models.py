@@ -341,3 +341,83 @@ class AlertNotification(Base):
     domain: Mapped["Domain"] = relationship(back_populates="alert_notifications")
     scan_run: Mapped["ScanRun"] = relationship(back_populates="alert_notifications")
 
+
+class User(Base):
+    """User account authenticated via Supabase access token (JIT upsert)."""
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    # Relationships
+    memberships: Mapped[list["Membership"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class Organization(Base):
+    """Customer organization / workspace."""
+
+    __tablename__ = "organizations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    # Relationships
+    memberships: Mapped[list["Membership"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+
+
+class Membership(Base):
+    """Role-based membership linking a user to an organization."""
+
+    __tablename__ = "memberships"
+    __table_args__ = (
+        UniqueConstraint("org_id", "user_id", name="uq_memberships_org_user"),
+        CheckConstraint(
+            "role IN ('owner', 'admin', 'viewer')",
+            name="ck_memberships_role",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    org_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        nullable=False,
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship(back_populates="memberships")
+    user: Mapped["User"] = relationship(back_populates="memberships")
+

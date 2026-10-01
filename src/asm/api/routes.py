@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
+from asm.api.deps import DbSession, get_current_user
 from asm.api.schemas import (
     ActiveScanConflict,
     AlertNotificationRead,
@@ -25,17 +25,15 @@ from asm.api.schemas import (
 )
 from asm.db.models import AlertNotification, Domain, ScanChange, ScanResult, ScanRun
 from asm.db.scans import enqueue_scan
-from asm.db.session import get_db
 from asm.validators import DomainValidationError, normalize_domain, validate_domain
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+public_router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
-DbSession = Annotated[Session, Depends(get_db)]
 
-
-@router.get(
+@public_router.get(
     "/health",
     response_model=HealthResponse,
     summary="Health check endpoint",
