@@ -12,7 +12,12 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 
 ### Phase 1: Passive Subdomain Discovery (`asm discover`)
 1. **Input Normalization & Validation**: Sanitizes target inputs (e.g. `http://EXAMPLE.COM:8080/path` -> `example.com`), verifies RFC compliance, and strictly rejects IP addresses and malformed domains.
-2. **Certificate Transparency (CT) Discovery**: Queries `crt.sh` via its JSON API with resilient retry logic, backoff, and timeouts to enumerate public subdomains.
+2. **Certificate Transparency (CT) Discovery & Fallback**:
+   - Queries `crt.sh` via its JSON API with resilient retry logic, backoff, and timeouts.
+   - If `crt.sh` fails after its retry budget (e.g. 502, 404, or timeout), discovery automatically falls back to the **SSLMate Cert Spotter API** (`https://api.certspotter.com/v1/issuances`).
+   - Supports optional `CERTSPOTTER_API_KEY` for higher rate limits (works without key within daily quotas).
+   - Enforces bounded pagination (max 10 pages, 5,000 entries) and rate limit handling (`Retry-After <= 10s`).
+   - Reports record discovery `source` (`"crt.sh"` or `"certspotter"`), sanitized `fallback_reason`, and `truncated` status.
 3. **Data Hygiene & Deduplication**: Cleans wildcards (`*.example.com`), separates multi-line entries, discards out-of-scope hostnames and email addresses, and removes duplicates.
 4. **Concurrent DNS Resolution**: Uses `dnspython` across a worker thread pool (max 20 workers) to resolve `A` (IPv4) and `AAAA` (IPv6) records for each discovered host.
 5. **Deterministic Precedence Mapping**: Categorizes host statuses (`RESOLVED`, `NXDOMAIN`, `TIMEOUT`, `ERROR`, `NO_ANSWER`).
@@ -123,6 +128,7 @@ Create a local `.env` configuration file from the template:
 cp .env.example .env
 ```
 Ensure `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `DATABASE_URL` are defined in `.env`.
+Optionally set `CERTSPOTTER_API_KEY` for Cert Spotter fallback (free tier works without a key within daily limits).
 
 ### 2. Start the Stack with Docker Compose
 ```bash

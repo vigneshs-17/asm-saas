@@ -747,6 +747,73 @@ DNS Rebinding is an attack where an attacker controls an authoritative nameserve
   1. **Exponential Scaling:** Each failed attempt doubles the delay ($10\text{s} \to 20\text{s} \to 40\text{s}$, capped at 120s), giving remote servers and network partitions time to recover.
   2. **Random Jitter ($0\text{s} \text{ to } 5\text{s}$):** Introduces randomization so that the 20 recovered jobs become eligible for claiming at staggered, smoothed intervals rather than all at once, preventing thundering-herd stampedes.
 
+---
+
+# Part 6: v2.2.1 — Fallback Certificate Transparency Discovery Source
+
+## 1. Plain-English Code Walkthrough
+
+### Why CT Fallback Was Introduced
+- **The Problem:** In live testing, `crt.sh` exhibited significant unreliability (failing 3 out of 4 attempts with HTTP 404, HTTP 502, and connection timeouts). Relying solely on `crt.sh` made it a single point of failure (SPOF) for the entire reconnaissance pipeline. If discovery failed, all subsequent stages (`probe`, `portscan`, `inspect`, `score`) were skipped.
+- **The Solution:** Added automated, transparent fallback to the **SSLMate Cert Spotter API** (`https://api.certspotter.com/v1/issuances`). When `crt.sh` exhausts its retry budget (3 attempts with exponential backoff), the orchestrator automatically queries Cert Spotter without user intervention or pipeline failure.
+
+### Key Differences: `crt.sh` vs. `Cert Spotter`
+1. **Unexpired vs. Historical Certificates:**
+   - `crt.sh` queries public Certificate Transparency logs across all time, returning active, expired, revoked, and legacy certificates.
+   - Cert Spotter's public/free issuances API returns only **unexpired** certificates. While this slightly reduces historical asset visibility (e.g. dormant subdomains that had certificates years ago and never renewed), it guarantees discovered assets are current and prevents pipeline stalling.
+2. **Pagination Architecture:**
+   - `crt.sh` returns all records in a single monolithic JSON payload (often causing server-side query timeouts on large domains).
+   - Cert Spotter paginates using issuance ID tokens (`&after=<last_id>`), terminating with an empty list `[]`.
+3. **Bounding and Guardrails:**
+   - Capped at `MAX_CERTSPOTTER_PAGES = 10` pages and `MAX_CERTSPOTTER_ENTRIES = 5000` entries to prevent unbounded memory growth and rate limit bans.
+   - When capped, the report records `"truncated": true`.
+4. **Rate Limit (429) & Retry-After Handling:**
+   - If Cert Spotter returns HTTP 429 with `Retry-After <= 10.0s`, the client waits that exact duration and retries once.
+   - If `Retry-After > 10.0s` or a second 429 is encountered, `CertSpotterError` is raised immediately.
+
+### Code Organization & Shared Processing
+- **Exception Hierarchy:**
+  `DiscoveryError(Exception)` acts as the base exception. `CrtshError`, `CertSpotterError`, and `AllSourcesFailedError` inherit from it. The worker's `EXPECTED_SCANNER_ERRORS` and the CLI catch `DiscoveryError`.
+- **Parsing Reuse:**
+  `transform_certspotter_to_raw_records()` transforms Cert Spotter `dns_names` lists into `name_value` newline-delimited strings, allowing 100% reuse of `parse_subdomains()` for wildcard stripping, lowercasing, deduplication, and scope validation.
+- **Auditability & Error Sanitization:**
+  `DiscoveryReport` records `"source": "crt.sh"` or `"source": "certspotter"`, `"fallback_reason"` (sanitized with `sanitize_error_text`, max 300 chars, stripped of control characters), and `"truncated": true|false`.
+- **Secret Protection:**
+  Optional `CERTSPOTTER_API_KEY` is sent as a `Bearer` token in the `Authorization` header, never logged, and never included in exception messages or reports.
+
+---
+
+## 2. Three Step 2.2.1 Cybersecurity Interview Questions & Answers
+
+### Question 1: Why is passive reconnaissance reliant on a single Certificate Transparency aggregator brittle, and how does secondary source fallback improve pipeline reliability?
+**Answer:**
+- **The Brittleness of Free Public APIs:** Public CT search engines like `crt.sh` operate on donated infrastructure, ingesting billions of certificate entries from global CT logs. They frequently experience database lock contention, 502/504 gateway timeouts, rate limiting, and maintenance outages under heavy automated scraping load.
+- **Single Point of Failure (SPOF):** In a phased reconnaissance pipeline where downstream stages depend on initial asset discovery, a transient failure in the CT search engine halts the entire pipeline, preventing security analysts from discovering live attack surfaces.
+- **Multi-Source Resilience:** Implementing secondary source fallback (such as SSLMate Cert Spotter) decouples pipeline availability from any single provider. By catching primary provider exhaustion and falling back to a structurally distinct API, the pipeline maintains high availability while tracking the exact fallback reason for transparency and auditability.
+
+---
+
+### Question 2: What is the architectural difference between crt.sh's historical log queries and Cert Spotter's unexpired-only issuance API, and what are the implications for attack surface visibility?
+**Answer:**
+- **crt.sh (Full Historical Archives):**
+  - Indexes all CT log entries indefinitely. Queries return historical subdomains that held certificates months or years in the past, even if the domain was decommissioned or the certificate expired.
+  - *Implication:* Excellent for uncovering historical assets, forgotten infrastructure, and potential subdomain takeover candidates (e.g. dangling CNAMEs for decommissioned services), but queries are slow and frequently time out.
+- **Cert Spotter (Active / Unexpired Issuances):**
+  - The public endpoint indexes currently valid, unexpired certificate issuances.
+  - *Implication:* Faster query response times, smaller payloads, and near-zero noise from long-dead subdomains. However, it will not discover dormant subdomains whose certificates expired and were not renewed.
+- **Defensive Design:** Treating `crt.sh` as the primary source ensures full historical visibility when available, while Cert Spotter acts as a fast, reliable fallback to guarantee active surface discovery when the primary aggregator is down.
+
+---
+
+### Question 3: How does bounded pagination with strict `Retry-After` enforcement prevent resource exhaustion and abusive request spikes?
+**Answer:**
+- **The Bounded Pagination Principle:** Without bounds, querying a massive wildcard domain (e.g. `*.wordpress.com` or cloud providers) could yield tens of thousands of pages, exhausting worker memory, consuming the entire rate limit quota, and hanging scanner workers for hours. Enforcing a hard page cap (10 pages) and entry cap (5,000 records), accompanied by a boolean `"truncated": true` audit flag, bounds execution time and resource consumption.
+- **`Retry-After` Threshold Guardrail:**
+  - Automated scanners that blindly retry on HTTP 429 can enter aggressive tight loops, triggering IP blacklisting or abusive traffic complaints.
+  - Conversely, scanners that wait arbitrarily long (e.g. `Retry-After: 3600`) cause background workers to block and freeze execution.
+  - Setting a threshold (`Retry-After <= 10.0s`) allows the client to absorb momentary rate limiter bursts (sleeping and retrying once), while immediately aborting if the delay would cause worker lease timeouts, cleanly failing over to poison-pill/retry mechanisms.
+
+
 
 
 

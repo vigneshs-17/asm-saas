@@ -75,6 +75,8 @@ class DiscoveryReport:
     scan_started_utc: str
     scan_finished_utc: str
     source: str = "crt.sh"
+    fallback_reason: str | None = None
+    truncated: bool = False
     counts: dict[str, int] = field(default_factory=dict)
     results: list[SubdomainResult] = field(default_factory=list)
 
@@ -85,6 +87,8 @@ class DiscoveryReport:
             "scan_started_utc": self.scan_started_utc,
             "scan_finished_utc": self.scan_finished_utc,
             "source": self.source,
+            "fallback_reason": self.fallback_reason,
+            "truncated": self.truncated,
             "counts": self.counts,
             "results": [result.to_dict() for result in self.results],
         }

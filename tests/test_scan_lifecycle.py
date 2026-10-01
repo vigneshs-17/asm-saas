@@ -564,3 +564,185 @@ def test_worker_sanitizes_remote_error_in_db(client: TestClient, db_engine):
         assert "\x1b" not in disc_stage.error
 
 
+def test_terminal_invariant_stage_failure(client: TestClient, db_engine):
+    """Terminal invariant: on stage failure, no stage remains 'running' or 'pending'."""
+    resp = client.post("/domains", json={"name": "terminal-stage-fail.com", "authorized": True})
+    domain_id = resp.json()["id"]
+
+    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_id = scan_resp.json()["id"]
+
+    runner = MockScannerRunner(discover_error=CrtshError("crt.sh connection timed out"))
+    worker = ASMWorker(engine=db_engine, runner=runner)
+    assert worker.run_poll_cycle() is True
+
+    with Session(db_engine) as session:
+        run = session.get(ScanRun, scan_id)
+        assert run.status == "failed"
+
+        stages = session.execute(
+            text("SELECT stage, status, error FROM scan_stages WHERE scan_run_id = :id"),
+            {"id": scan_id},
+        ).fetchall()
+
+        statuses = [s.status for s in stages]
+        assert "running" not in statuses
+        assert "pending" not in statuses
+
+        stages_by_name = {s.stage: s for s in stages}
+        assert stages_by_name["discover"].status == "failed"
+        for st in ("probe", "portscan", "inspect", "score"):
+            assert stages_by_name[st].status == "skipped"
+
+
+def test_terminal_invariant_unexpected_exception_max_attempts(client: TestClient, db_engine):
+    """Terminal invariant: on unexpected exc at max_attempts, no stage is 'running' or 'pending'."""
+    resp = client.post("/domains", json={"name": "terminal-unexp-fail.com", "authorized": True})
+    domain_id = resp.json()["id"]
+
+    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_id = scan_resp.json()["id"]
+
+    runner = MockScannerRunner(probe_error=RuntimeError("Simulated unhandled runner crash"))
+    worker = ASMWorker(engine=db_engine, runner=runner)
+
+    # Attempt 1
+    assert worker.run_poll_cycle() is True
+    with Session(db_engine) as session:
+        run = session.get(ScanRun, scan_id)
+        assert run.status == "queued"
+        run.next_attempt_at = None
+        session.commit()
+
+    # Attempt 2
+    assert worker.run_poll_cycle() is True
+    with Session(db_engine) as session:
+        run = session.get(ScanRun, scan_id)
+        assert run.status == "queued"
+        run.next_attempt_at = None
+        session.commit()
+
+    # Attempt 3 (reaches max_attempts)
+    assert worker.run_poll_cycle() is True
+    with Session(db_engine) as session:
+        run = session.get(ScanRun, scan_id)
+        assert run.status == "failed"
+
+        stages = session.execute(
+            text("SELECT stage, status, error FROM scan_stages WHERE scan_run_id = :id"),
+            {"id": scan_id},
+        ).fetchall()
+
+        statuses = [s.status for s in stages]
+        assert "running" not in statuses
+        assert "pending" not in statuses
+
+        stages_by_name = {s.stage: s for s in stages}
+        assert stages_by_name["discover"].status == "succeeded"
+        assert stages_by_name["probe"].status == "failed"
+        assert stages_by_name["portscan"].status == "skipped"
+        assert stages_by_name["inspect"].status == "skipped"
+        assert stages_by_name["score"].status == "skipped"
+
+
+def test_terminal_invariant_poison_pill_lease_recovery(client: TestClient, db_engine):
+    """Terminal invariant: poison pill recovery fails running stages and skips pending stages."""
+    resp = client.post("/domains", json={"name": "terminal-poison-pill.com", "authorized": True})
+    domain_id = resp.json()["id"]
+
+    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_id = scan_resp.json()["id"]
+
+    # Simulate expired lease with attempts >= max_attempts while probe is running
+    with db_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE scan_runs
+                SET status = 'running',
+                    attempts = 3,
+                    max_attempts = 3,
+                    lease_expires_at = now() - INTERVAL '1 minute'
+                WHERE id = :id
+                """
+            ),
+            {"id": scan_id},
+        )
+        conn.execute(
+            text(
+                "UPDATE scan_stages SET status = 'succeeded' "
+                "WHERE scan_run_id = :id AND stage = 'discover'"
+            ),
+            {"id": scan_id},
+        )
+        conn.execute(
+            text(
+                "UPDATE scan_stages SET status = 'running', started_at = now() "
+                "WHERE scan_run_id = :id AND stage = 'probe'"
+            ),
+            {"id": scan_id},
+        )
+
+    worker = ASMWorker(engine=db_engine, runner=MockScannerRunner())
+    worker.reclaim_stale_leases_and_poison_pills()
+
+    with Session(db_engine) as session:
+        run = session.get(ScanRun, scan_id)
+        assert run.status == "failed"
+        assert "maximum retry attempts" in (run.error or "")
+
+        stages = session.execute(
+            text("SELECT stage, status, error FROM scan_stages WHERE scan_run_id = :id"),
+            {"id": scan_id},
+        ).fetchall()
+
+        statuses = [s.status for s in stages]
+        assert "running" not in statuses
+        assert "pending" not in statuses
+
+        stages_by_name = {s.stage: s for s in stages}
+        assert stages_by_name["discover"].status == "succeeded"
+        assert stages_by_name["probe"].status == "failed"
+        assert "maximum retry attempts" in (stages_by_name["probe"].error or "")
+        assert stages_by_name["portscan"].status == "skipped"
+        assert stages_by_name["inspect"].status == "skipped"
+        assert stages_by_name["score"].status == "skipped"
+
+
+def test_terminal_invariant_security_gate(client: TestClient, db_engine):
+    """Terminal invariant: on security gate rejection, no stage remains 'running' or 'pending'."""
+    resp = client.post("/domains", json={"name": "terminal-sec-gate.com", "authorized": True})
+    domain_id = resp.json()["id"]
+
+    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_id = scan_resp.json()["id"]
+
+    # Revoke authorization before worker claims
+    with db_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE domains SET authorized = false WHERE id = :id"),
+            {"id": domain_id},
+        )
+
+    worker = ASMWorker(engine=db_engine, runner=MockScannerRunner())
+    assert worker.run_poll_cycle() is True
+
+    with Session(db_engine) as session:
+        run = session.get(ScanRun, scan_id)
+        assert run.status == "failed"
+        assert "authorization is revoked" in (run.error or "")
+
+        stages = session.execute(
+            text("SELECT stage, status, error FROM scan_stages WHERE scan_run_id = :id"),
+            {"id": scan_id},
+        ).fetchall()
+
+        statuses = [s.status for s in stages]
+        assert "running" not in statuses
+        assert "pending" not in statuses
+
+        for s in stages:
+            assert s.status in ("failed", "skipped")
+
+
+

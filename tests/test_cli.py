@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from asm.cli import main
-from asm.discovery import CrtshError
+from asm.discovery import CertSpotterError, CrtshError
 from asm.models import HostProbeResult, HostProbeStatus, SubdomainResult, UrlProbeResult
 
 
@@ -65,13 +65,51 @@ class TestDiscoverCLIExecution:
 
     def test_discover_crtsh_error_exit_code_2(self, capsys):
         """Verify crt.sh failure exits with code 2 and writes to stderr without traceback."""
-        with patch("asm.cli.fetch_crtsh_data", side_effect=CrtshError("crt.sh timed out")):
+        with (
+            patch("asm.cli.fetch_crtsh_data", side_effect=CrtshError("crt.sh timed out")),
+            patch(
+                "asm.discovery.fetch_certspotter_data",
+                side_effect=CertSpotterError("certspotter rate limit"),
+            ),
+        ):
             exit_code = main(["discover", "example.com"])
             assert exit_code == 2
 
             captured = capsys.readouterr()
-            assert "Error: crt.sh timed out" in captured.err
+            assert "Error:" in captured.err
+            assert "crt.sh timed out" in captured.err
             assert "Traceback" not in captured.err
+
+    def test_discover_fallback_to_certspotter_success(self, tmp_path: Path, capsys):
+        """Verify crt.sh failure falls back to Cert Spotter and records source and reason."""
+        with (
+            patch("asm.cli.fetch_crtsh_data", side_effect=CrtshError("crt.sh 502 Bad Gateway")),
+            patch(
+                "asm.discovery.fetch_certspotter_data",
+                return_value=([{"dns_names": ["fallback.example.com"]}], False),
+            ),
+            patch("asm.cli.resolve_subdomains_concurrently") as mock_resolve,
+        ):
+            mock_resolve.return_value = [
+                SubdomainResult(
+                    subdomain="fallback.example.com",
+                    resolved=True,
+                    ip_addresses=["1.1.1.1"],
+                )
+            ]
+            exit_code = main(["discover", "example.com", "--output", str(tmp_path)])
+            assert exit_code == 0
+
+            files = list(tmp_path.glob("example.com_*.json"))
+            assert len(files) == 1
+            with files[0].open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            assert data["source"] == "certspotter"
+            assert data["fallback_reason"] == "crt.sh 502 Bad Gateway"
+            assert data["truncated"] is False
+            captured = capsys.readouterr()
+            assert "Source:              certspotter" in captured.out
 
     def test_discover_zero_subdomains_found(self, tmp_path: Path, capsys):
         """Verify handling when crt.sh returns empty results."""

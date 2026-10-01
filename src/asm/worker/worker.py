@@ -8,7 +8,6 @@ import signal
 import socket
 import threading
 import time
-import unicodedata
 import uuid
 from typing import Any
 
@@ -16,6 +15,7 @@ from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from asm.db.models import Domain, ScanResult
+from asm.scan_common import sanitize_error_text
 from asm.worker.exceptions import (
     EXPECTED_SCANNER_ERRORS,
     LostLeaseError,
@@ -26,18 +26,6 @@ from asm.worker.runner import DirectScannerRunner, IScannerRunner
 logger = logging.getLogger("asm.worker")
 
 ALL_STAGES = ("discover", "probe", "portscan", "inspect", "score")
-
-
-def sanitize_error_text(error: str | None, max_length: int = 300) -> str | None:
-    """Sanitize error text by stripping control characters and truncating to max_length."""
-    if error is None:
-        return None
-    cleaned = "".join(
-        ch
-        for ch in error
-        if not (ord(ch) < 32 or ord(ch) == 127 or unicodedata.category(ch).startswith("C"))
-    )
-    return cleaned[:max_length]
 
 
 class HeartbeatThread(threading.Thread):
@@ -185,7 +173,7 @@ class ASMWorker:
         """Run SQL lease recovery and poison pill termination."""
         with self.session_factory() as session:
             # Poison pill termination: attempts >= max_attempts with expired lease
-            session.execute(
+            poisoned_runs = session.execute(
                 text(
                     """
                     UPDATE scan_runs
@@ -200,9 +188,38 @@ class ASMWorker:
                     WHERE status = 'running'
                       AND lease_expires_at < now()
                       AND attempts >= max_attempts
+                    RETURNING id, error
                     """
                 )
-            )
+            ).fetchall()
+
+            for p_run in poisoned_runs:
+                session.execute(
+                    text(
+                        """
+                        UPDATE scan_stages
+                        SET status = 'failed',
+                            finished_at = now(),
+                            error = :error
+                        WHERE scan_run_id = :id AND status = 'running'
+                        """
+                    ),
+                    {"id": p_run.id, "error": p_run.error},
+                )
+                session.execute(
+                    text(
+                        """
+                        UPDATE scan_stages
+                        SET status = 'skipped',
+                            started_at = coalesce(started_at, now()),
+                            finished_at = now(),
+                            duration_ms = 0,
+                            error = 'Skipped: maximum retry attempts exceeded (lease expired)'
+                        WHERE scan_run_id = :id AND status = 'pending'
+                        """
+                    ),
+                    {"id": p_run.id},
+                )
 
             # Stale lease recovery: attempts < max_attempts with expired lease
             # Backoff is computed dynamically per-row in SQL from its own attempts count:
@@ -701,6 +718,39 @@ class ASMWorker:
             )
             if res.rowcount == 0:
                 raise LostLeaseError(f"Failed to set final status for scan_run_id={scan_run_id}")
+
+            # Terminal-state invariant:
+            # any stage still 'running' -> 'failed' with the run's error
+            session.execute(
+                text(
+                    """
+                    UPDATE scan_stages
+                    SET status = 'failed',
+                        finished_at = now(),
+                        error = :error
+                    WHERE scan_run_id = :id AND status = 'running'
+                    """
+                ),
+                {"id": scan_run_id, "error": sanitized_error or "Scan run terminated"},
+            )
+            # any 'pending' stage -> 'skipped' with a reason
+            skip_reason = sanitized_error or (
+                "Scan run succeeded" if status == "succeeded" else "Skipped: scan run terminated"
+            )
+            session.execute(
+                text(
+                    """
+                    UPDATE scan_stages
+                    SET status = 'skipped',
+                        started_at = coalesce(started_at, now()),
+                        finished_at = now(),
+                        duration_ms = 0,
+                        error = :reason
+                    WHERE scan_run_id = :id AND status = 'pending'
+                    """
+                ),
+                {"id": scan_run_id, "reason": skip_reason},
+            )
             session.commit()
 
     def _handle_unexpected_worker_exception(
@@ -747,7 +797,7 @@ class ASMWorker:
                     sanitized_error = sanitize_error_text(
                         f"Max retry attempts exceeded: {error_msg}"
                     )
-                    session.execute(
+                    res = session.execute(
                         text(
                             """
                             UPDATE scan_runs
@@ -766,6 +816,36 @@ class ASMWorker:
                             "error": sanitized_error,
                         },
                     )
+                    if res.rowcount > 0:
+                        # Terminal-state invariant:
+                        # any stage still 'running' -> 'failed' with the run's error
+                        session.execute(
+                            text(
+                                """
+                                UPDATE scan_stages
+                                SET status = 'failed',
+                                    finished_at = now(),
+                                    error = :error
+                                WHERE scan_run_id = :id AND status = 'running'
+                                """
+                            ),
+                            {"id": scan_run_id, "error": sanitized_error},
+                        )
+                        # any 'pending' stage -> 'skipped' with a reason
+                        session.execute(
+                            text(
+                                """
+                                UPDATE scan_stages
+                                SET status = 'skipped',
+                                    started_at = coalesce(started_at, now()),
+                                    finished_at = now(),
+                                    duration_ms = 0,
+                                    error = 'Skipped: maximum retry attempts exceeded'
+                                WHERE scan_run_id = :id AND status = 'pending'
+                                """
+                            ),
+                            {"id": scan_run_id},
+                        )
                 session.commit()
         except Exception as exc:
             logger.error("Failed to update status on unexpected exception: %s", exc)

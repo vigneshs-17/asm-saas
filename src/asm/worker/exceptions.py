@@ -1,6 +1,6 @@
 """Exceptions and error classification for ASM SaaS worker."""
 
-from asm.discovery import CrtshError
+from asm.discovery import DiscoveryError
 from asm.scan_common import ReportValidationError
 from asm.validators import DomainValidationError
 
@@ -25,7 +25,7 @@ class LostLeaseError(Exception):
 # stage dependency rules apply, and the overall job is NOT retried.
 # Any exception NOT in this tuple is treated as an unexpected worker exception.
 EXPECTED_SCANNER_ERRORS: tuple[type[Exception], ...] = (
-    CrtshError,
+    DiscoveryError,
     DomainValidationError,
     ReportValidationError,
     SecurityGateError,

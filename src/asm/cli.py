@@ -10,7 +10,11 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from asm.discovery import CrtshError, fetch_crtsh_data, parse_subdomains
+from asm.discovery import (
+    DiscoveryError,
+    discover_subdomains,
+    fetch_crtsh_data,
+)
 from asm.headers_inspect import run_inspection
 from asm.models import (
     DiscoveryReport,
@@ -227,17 +231,18 @@ def handle_discover(domain_arg: str, output_dir_arg: str) -> int:
     scan_start_dt = datetime.now(UTC)
     scan_started_utc = scan_start_dt.isoformat()
 
-    print(f"[*] Discovering subdomains for '{domain}' via crt.sh...")
+    print(f"[*] Discovering subdomains for '{domain}'...")
 
-    # 2. Query Certificate Transparency logs
+    # 2. Query Certificate Transparency logs with fallback
     try:
-        raw_entries = fetch_crtsh_data(domain)
-    except CrtshError as exc:
+        subdomains, source, fallback_reason, truncated = discover_subdomains(
+            domain,
+            crtsh_fetcher=fetch_crtsh_data,
+        )
+    except DiscoveryError as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 2
 
-    # 3. Parse and sanitize subdomains
-    subdomains = parse_subdomains(raw_entries, domain)
     total_found = len(subdomains)
 
     results: list[SubdomainResult] = []
@@ -247,7 +252,7 @@ def handle_discover(domain_arg: str, output_dir_arg: str) -> int:
         unresolved_count = 0
     else:
         print(f"[*] Found {total_found} unique subdomains. Resolving DNS records...")
-        # 4. Resolve DNS records concurrently
+        # 3. Resolve DNS records concurrently
         results = resolve_subdomains_concurrently(subdomains)
         resolved_count = sum(1 for r in results if r.resolved)
         unresolved_count = total_found - resolved_count
@@ -256,7 +261,7 @@ def handle_discover(domain_arg: str, output_dir_arg: str) -> int:
     scan_finished_utc = scan_finish_dt.isoformat()
     elapsed_seconds = round(time.monotonic() - start_mono, 2)
 
-    # 5. Build report
+    # 4. Build report
     counts = {
         "total_discovered": total_found,
         "resolved": resolved_count,
@@ -266,12 +271,14 @@ def handle_discover(domain_arg: str, output_dir_arg: str) -> int:
         domain=domain,
         scan_started_utc=scan_started_utc,
         scan_finished_utc=scan_finished_utc,
-        source="crt.sh",
+        source=source,
+        fallback_reason=fallback_reason,
+        truncated=truncated,
         counts=counts,
         results=results,
     )
 
-    # 6. Save report to JSON file
+    # 5. Save report to JSON file
     output_dir = Path(output_dir_arg)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -282,9 +289,10 @@ def handle_discover(domain_arg: str, output_dir_arg: str) -> int:
     with report_file.open("w", encoding="utf-8") as f:
         json.dump(report.to_dict(), f, indent=2)
 
-    # 7. Print summary to user
+    # 6. Print summary to user
     print("\n=== Discovery Summary ===")
     print(f"Domain:              {domain}")
+    print(f"Source:              {source}")
     print(f"Subdomains Found:    {total_found}")
     print(f"Resolved (Active):   {resolved_count}")
     print(f"Unresolved:          {unresolved_count}")

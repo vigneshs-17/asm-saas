@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from asm.discovery import fetch_crtsh_data, parse_subdomains
+from asm.discovery import discover_subdomains
 from asm.headers_inspect import run_inspection
 from asm.models import (
     DiscoveryReport,
@@ -69,8 +69,7 @@ class DirectScannerRunner:
         scan_start_dt = datetime.now(UTC)
         scan_started_utc = scan_start_dt.isoformat()
 
-        raw_entries = fetch_crtsh_data(validated_domain)
-        subdomains = parse_subdomains(raw_entries, validated_domain)
+        subdomains, source, fallback_reason, truncated = discover_subdomains(validated_domain)
         total_found = len(subdomains)
 
         results: list[SubdomainResult] = []
@@ -94,7 +93,9 @@ class DirectScannerRunner:
             domain=validated_domain,
             scan_started_utc=scan_started_utc,
             scan_finished_utc=scan_finished_utc,
-            source="crt.sh",
+            source=source,
+            fallback_reason=fallback_reason,
+            truncated=truncated,
             counts=counts,
             results=results,
         )
@@ -228,7 +229,9 @@ class DirectScannerRunner:
             )
 
         results_data = probe_report.get("results", [])
-        inspect_report = run_inspection(results_data, domain, source_report="probe_report")
+        inspect_report = run_inspection(
+            results_data, domain, source_report_name="probe_report"
+        )
         return inspect_report.to_dict()
 
     def run_score(

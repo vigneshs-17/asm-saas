@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,18 @@ import dns.resolver
 from asm.validators import DomainValidationError, validate_domain
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_error_text(error: str | None, max_length: int = 300) -> str | None:
+    """Sanitize error text by stripping control characters and truncating to max_length."""
+    if error is None:
+        return None
+    cleaned = "".join(
+        ch
+        for ch in error
+        if not (ord(ch) < 32 or ord(ch) == 127 or unicodedata.category(ch).startswith("C"))
+    )
+    return cleaned[:max_length]
 
 
 class ReportValidationError(Exception):
