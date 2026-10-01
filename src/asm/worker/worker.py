@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import signal
 import socket
 import threading
@@ -12,10 +13,12 @@ import time
 import uuid
 from typing import Any
 
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from asm.db.models import Domain, ScanResult
+from asm.db.scans import enqueue_scan
 from asm.scan_common import sanitize_error_text
 from asm.worker.exceptions import (
     EXPECTED_SCANNER_ERRORS,
@@ -147,8 +150,16 @@ class ASMWorker:
         logger.info("Worker %s shut down gracefully.", self.worker_id)
 
     def run_poll_cycle(self) -> bool:
-        """Execute one complete polling cycle: recovery, poison pills, and claiming."""
+        """Execute one complete polling cycle: recovery, poison pills, scheduling, and claiming."""
         self.reclaim_stale_leases_and_poison_pills()
+
+        # Step: Schedule due scans (before claiming jobs)
+        try:
+            self.schedule_due_scans()
+        except Exception:
+            logger.exception(
+                "Unexpected error in worker schedule_due_scans; continuing to job claiming"
+            )
 
         if self.shutdown_requested.is_set():
             return False
@@ -169,6 +180,89 @@ class ASMWorker:
 
         self.execute_scan_run(scan_run_id, domain_id, claim_token, attempts, max_attempts)
         return True
+
+    def schedule_due_scans(self, batch_limit: int = 10) -> int:
+        """Find authorized domains due for scheduled scanning, queue jobs, and advance schedules.
+
+        Runs up to batch_limit iterations. Each iteration is an isolated short transaction
+        locking one due domain with FOR UPDATE SKIP LOCKED.
+
+        Returns:
+            Number of due domains processed.
+        """
+        processed_count = 0
+
+        for _ in range(batch_limit):
+            with self.session_factory() as session:
+                # 1. Select next due domain
+                stmt = (
+                    select(Domain)
+                    .where(
+                        Domain.authorized.is_(True),
+                        Domain.scan_interval_hours.is_not(None),
+                        Domain.next_scan_at <= func.now(),
+                    )
+                    .order_by(Domain.next_scan_at.asc())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                domain = session.scalar(stmt)
+                if not domain:
+                    break
+
+                # 2. Enqueue scan_run and stages using a nested transaction (savepoint)
+                active_scan_exists = False
+                try:
+                    with session.begin_nested():
+                        enqueue_scan(session, domain.id, trigger="scheduled")
+                except IntegrityError as err:
+                    # Treat ONLY a violation of uq_scan_runs_active_domain as active scan exists
+                    err_str = str(err)
+                    diag = getattr(getattr(err, "orig", None), "diag", None)
+                    constraint_name = getattr(diag, "constraint_name", None)
+                    if (
+                        constraint_name == "uq_scan_runs_active_domain"
+                        or "uq_scan_runs_active_domain" in err_str
+                    ):
+                        active_scan_exists = True
+                        logger.info(
+                            "Domain %s (id=%d) already has an active scan; skipping duplicate",
+                            domain.name,
+                            domain.id,
+                        )
+                    else:
+                        logger.error(
+                            "Non-active-scan IntegrityError scheduling domain %s (id=%d): %s",
+                            domain.name,
+                            domain.id,
+                            err,
+                        )
+                        raise
+
+                # 3. Always advance next_scan_at = now() + interval + random jitter
+                jitter_seconds = random.randint(0, 300)
+                interval_hours = domain.scan_interval_hours
+                advance_stmt = (
+                    update(Domain)
+                    .where(Domain.id == domain.id)
+                    .values(
+                        next_scan_at=func.now()
+                        + text("interval '1 hour' * :h").bindparams(h=interval_hours)
+                        + text("interval '1 second' * :s").bindparams(s=jitter_seconds)
+                    )
+                )
+                session.execute(advance_stmt)
+                session.commit()
+
+                processed_count += 1
+                if not active_scan_exists:
+                    logger.info(
+                        "Enqueued scheduled scan for domain %s (id=%d)",
+                        domain.name,
+                        domain.id,
+                    )
+
+        return processed_count
 
     def reclaim_stale_leases_and_poison_pills(self) -> None:
         """Run SQL lease recovery and poison pill termination."""

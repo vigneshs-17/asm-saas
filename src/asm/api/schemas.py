@@ -36,9 +36,22 @@ class DomainRead(BaseModel):
     name: str
     authorized: bool
     authorization_note: str | None = None
+    scan_interval_hours: int | None = None
+    next_scan_at: datetime | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DomainScheduleUpdate(BaseModel):
+    """Request payload for updating a domain's scan schedule."""
+
+    interval_hours: int | None = Field(
+        default=None,
+        ge=6,
+        le=720,
+        description="Scan interval in hours (6 to 720), or null to disable schedule.",
+    )
 
 
 class ScanStageRead(BaseModel):
@@ -60,6 +73,7 @@ class ScanRunRead(BaseModel):
     id: int
     domain_id: int
     status: str
+    trigger: str = "manual"
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None

@@ -234,6 +234,26 @@ Retrieve only the changes detected in a single scan run (404 if scan not found):
 curl -i http://127.0.0.1:8000/scans/2/changes
 ```
 
+#### Configure Recurring Scan Schedule for a Domain
+Enable, update, or disable automated recurring scanning for an authorized domain (allowed range: 6 to 720 hours):
+```bash
+# Enable 24-hour recurring scans (enabling from null sets next_scan_at to now, eligible immediately)
+curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
+  -H "Content-Type: application/json" \
+  -d '{"interval_hours": 24}'
+
+# Update existing interval to 48 hours (sets next_scan_at = now + 48h, does not trigger immediate scan)
+curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
+  -H "Content-Type: application/json" \
+  -d '{"interval_hours": 48}'
+
+# Disable recurring scans (reverts domain to manual scans only)
+curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
+  -H "Content-Type: application/json" \
+  -d '{"interval_hours": null}'
+```
+
+
 ### 6. Local Database Testing Setup & Migrations
 
 #### How the Test Suite Creates the Database Schema
@@ -479,6 +499,28 @@ Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
    Subdomain removals (`REMOVED_SUBDOMAIN`) are evaluated **only** when both baseline and new scans used the same Certificate Transparency source (e.g. `crt.sh` vs `certspotter`) and neither report was truncated (`truncated: false`). If sources differ or either was truncated, removal detection is safely skipped with a descriptive `skip_reason`.
 6. **Atomic & Resilient Finalization**:
    Change detection runs in memory prior to the final worker transaction. If detection encounters an unexpected error, the scan run still marks `succeeded`, recording the error in `scan_runs.change_detection`. Changes and the final status update are inserted atomically in the same database transaction with a unique constraint preventing duplicate change entries: `(scan_run_id, change_type, asset, detail)`.
+
+---
+
+## Scheduled Scans Engine (v2.4a)
+
+`asm` supports opt-in recurring scans per domain, allowing continuous automated monitoring without requiring external task schedulers (such as Celery Beat or cron daemons).
+
+### Key Architectural Invariants
+1. **Database-Backed Worker Scheduling**:
+   The worker polling loop executes `schedule_due_scans()` at the start of each cycle before claiming queued jobs. It selects due domains (`authorized = true AND scan_interval_hours IS NOT NULL AND next_scan_at <= now()`) using `FOR UPDATE SKIP LOCKED`. This allows multiple workers to run concurrently without coordination or duplicated scan jobs.
+2. **One Short Transaction Per Domain**:
+   Each due domain is locked, evaluated, and updated within its own dedicated short transaction, minimizing lock contention and preventing failures in one domain from affecting others.
+3. **Shared Enqueue Function**:
+   Both `POST /domains/{id}/scans` and the worker scheduler call the shared `enqueue_scan()` function to insert the `scan_run` and its 5 `pending` stage tracking rows.
+4. **Active Scan Duplicate Suppression**:
+   If an active scan (`status IN ('queued', 'running')`) already exists for a domain, the database constraint `uq_scan_runs_active_domain` blocks insertion. The scheduler safely absorbs this constraint violation and advances `next_scan_at` without creating a duplicate job.
+5. **No Backfill Guarantee**:
+   Following server or worker downtime, `next_scan_at` is always calculated from the current database clock (`now() + interval + jitter`), never from missed historical timestamps. A domain receives exactly **one** catch-up scan rather than multiple stacked scans.
+6. **Desynchronization Jitter**:
+   A small random jitter (0 to 300 seconds) is added to `next_scan_at` to disperse execution times across the hour and prevent thundering herds on shared network and database infrastructure.
+7. **Explicit Trigger Provenance**:
+   Every `scan_run` records its origin in the `trigger` column: `"manual"` for user-initiated scans via the API, and `"scheduled"` for automated recurring scans.
 
 ---
 

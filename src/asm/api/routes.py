@@ -7,7 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,12 +15,14 @@ from asm.api.schemas import (
     ActiveScanConflict,
     DomainCreate,
     DomainRead,
+    DomainScheduleUpdate,
     HealthResponse,
     ScanChangeRead,
     ScanRunDetail,
     ScanRunRead,
 )
-from asm.db.models import Domain, ScanChange, ScanResult, ScanRun, ScanStage
+from asm.db.models import Domain, ScanChange, ScanResult, ScanRun
+from asm.db.scans import enqueue_scan
 from asm.db.session import get_db
 from asm.validators import DomainValidationError, normalize_domain, validate_domain
 
@@ -181,16 +183,9 @@ def queue_scan(
             return existing_idempotent
 
     # (d) Otherwise insert -> 202, or 409 if the active-scan index blocks it
-    scan_run = ScanRun(
-        domain_id=id,
-        status="queued",
-        idempotency_key=idempotency_key,
-        attempts=0,
-        max_attempts=3,
-    )
-    db.add(scan_run)
     try:
-        db.flush()
+        scan_run = enqueue_scan(db, id, trigger="manual", idempotency_key=idempotency_key)
+        db.commit()
     except IntegrityError:
         db.rollback()
         # Re-check idempotency key in case of race
@@ -206,33 +201,6 @@ def queue_scan(
                 return existing_idempotent
 
         # Active scan conflict
-        active_id = db.scalar(
-            select(ScanRun.id).where(
-                ScanRun.domain_id == id,
-                ScanRun.status.in_(["queued", "running"]),
-            )
-        )
-        return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT,
-            content={
-                "detail": "An active scan run is already in progress for this domain.",
-                "active_scan_id": active_id or 0,
-            },
-        )
-
-    # Initialize all 5 stage tracking rows
-    for stage_name in ("discover", "probe", "portscan", "inspect", "score"):
-        stage = ScanStage(
-            scan_run_id=scan_run.id,
-            stage=stage_name,
-            status="pending",
-        )
-        db.add(stage)
-
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
         active_id = db.scalar(
             select(ScanRun.id).where(
                 ScanRun.domain_id == id,
@@ -409,4 +377,56 @@ def get_scan_changes(id: int, db: DbSession) -> Sequence[ScanChange]:
 
     stmt = select(ScanChange).where(ScanChange.scan_run_id == id).order_by(ScanChange.id.asc())
     return db.scalars(stmt).all()
+
+
+@router.put(
+    "/domains/{id}/schedule",
+    response_model=DomainRead,
+    summary="Configure recurring scan schedule for a domain",
+    responses={
+        200: {"description": "Schedule updated successfully"},
+        404: {"description": "Domain not found"},
+        422: {"description": "Validation error or domain not authorized"},
+    },
+)
+def update_domain_schedule(
+    id: int,
+    payload: DomainScheduleUpdate,
+    db: DbSession,
+) -> Domain:
+    """Configure or disable automated periodic scanning for an authorized domain."""
+    domain = db.get(Domain, id)
+    if not domain:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain with ID {id} not found.",
+        )
+
+    if payload.interval_hours is None:
+        # Disable schedule
+        domain.scan_interval_hours = None
+        domain.next_scan_at = None
+    else:
+        # Must be authorized to enable schedule
+        if not domain.authorized:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Domain '{domain.name}' is not authorized for scanning.",
+            )
+
+        if domain.scan_interval_hours is None:
+            # Enabling from null: sets next_scan_at = now()
+            domain.scan_interval_hours = payload.interval_hours
+            domain.next_scan_at = func.now()
+        else:
+            # Changing an existing interval: sets next_scan_at = now() + new interval
+            domain.scan_interval_hours = payload.interval_hours
+            domain.next_scan_at = func.now() + text("interval '1 hour' * :h").bindparams(
+                h=payload.interval_hours
+            )
+
+    db.commit()
+    db.refresh(domain)
+    return domain
+
 

@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -34,12 +35,28 @@ class Domain(Base):
     """Registered domain monitored by the ASM platform."""
 
     __tablename__ = "domains"
+    __table_args__ = (
+        CheckConstraint(
+            "scan_interval_hours IS NULL OR "
+            "(scan_interval_hours >= 6 AND scan_interval_hours <= 720)",
+            name="ck_domains_scan_interval_hours",
+        ),
+        Index(
+            "ix_domains_schedule_due",
+            "next_scan_at",
+            postgresql_where=text("authorized = true AND scan_interval_hours IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
     # Fail-safe default is False; explicit authorization is strictly required
     authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     authorization_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scan_interval_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    next_scan_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,
@@ -92,6 +109,9 @@ class ScanRun(Base):
     )
     # Status lifecycle: queued -> running -> succeeded / failed
     status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    trigger: Mapped[str] = mapped_column(
+        String(20), default="manual", server_default="manual", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,

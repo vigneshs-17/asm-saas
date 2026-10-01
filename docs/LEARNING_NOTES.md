@@ -922,6 +922,70 @@ In network reconnaissance, an observation failure is not evidence of absence. Wh
 - **Idempotency & Deduplication:**
   The `scan_changes` table enforces a database-level unique constraint on `(scan_run_id, change_type, asset, detail)`. Even in the event of worker retries, identical change records cannot be duplicated.
 
+---
+
+# Part 8: v2.4a — Scheduled Scans & Database-Backed Polling
+
+## 1. Plain-English Code Walkthrough
+
+### Motivation & Architecture
+- **The Operational Need:** Security monitoring cannot rely on manual API triggers alone. Attack surfaces change continuously as cloud resources spin up, certificates expire, and firewall rules drift. Monitored domains need automated recurring scans (e.g. daily or weekly) with zero human intervention.
+- **Why Postgres-Backed Scheduling Instead of Celery Beat or Cron:**
+  - *Single Point of Failure (SPOF) Elimination:* Systems like Celery Beat or systemd cron run as a single coordinator process. If the scheduler daemon dies, all scheduling stops across the entire fleet.
+  - *No New Infrastructure Dependencies:* Adding Redis, RabbitMQ, or Celery introduces operational complexity, broker clustering, monitoring requirements, and separate failure modes.
+  - *Database Clock Authority:* By using PostgreSQL's database clock (`func.now()`), the system avoids NTP synchronization drift between distributed worker hosts.
+  - *Seamless High-Availability Concurrency:* Using `FOR UPDATE SKIP LOCKED` allows any number of worker instances to poll the same `domains` table simultaneously. Each due domain is claimed and processed by exactly one worker without distributed lock managers (DLMs) or lock contention.
+
+### De-synchronization Jitter
+- **The "Thundering Herd" Problem:**
+  When users configure recurring scans, human behavior tends toward round intervals (e.g. 24 hours, starting at 00:00:00 UTC). Without jitter, hundreds or thousands of domains would become due at the exact same second. This would trigger database connection pool exhaustion, sudden outbound network spikes, and severe rate-limiting or firewall bans from Certificate Transparency providers and target hosts.
+- **The Solution:**
+  The worker adds a random jitter (0 to 300 seconds / 5 minutes) when advancing `next_scan_at`:
+  `next_scan_at = now() + (interval_hours * interval '1 hour') + (random_jitter * interval '1 second')`.
+  This naturally scatters scan executions evenly across a temporal window, smoothing out infrastructure utilization.
+
+### The "No Backfill" Guarantee
+- **The Outage Stampede Hazard:**
+  Suppose an enterprise ASM platform experiences an unscheduled 7-day outage for maintenance or database migration. If a domain is configured for 6-hour scans, 28 scheduled execution intervals elapsed during the downtime.
+  - In a naive scheduling model (like Airflow or cron with catch-up enabled), the scheduler would attempt to run all 28 missed scans back-to-back.
+  - For a platform monitoring 10,000 domains, this would generate 280,000 redundant scan jobs, hopelessly jamming the job queue for weeks.
+- **The ASM SaaS Design:**
+  Attack Surface Management is stateful and real-time: a security team cares about what the attack surface looks like *right now*, not what it looked like on Tuesday during an outage. By setting `next_scan_at = now() + interval + jitter`, the domain receives exactly **one** catch-up scan upon worker recovery, and its schedule is immediately reset to the future.
+
+### Shared Enqueue & Trigger Provenance
+- `src/asm/db/scans.py` encapsulates `enqueue_scan(session, domain_id, trigger, idempotency_key=None)`. Both the user-facing REST API (`POST /domains/{id}/scans`) and the automated worker scheduler call this exact same function.
+- The `trigger` column on `scan_runs` explicitly records whether the scan was initiated as `"manual"` or `"scheduled"`, providing clear audit provenance for reporting, billing, and change tracking.
+
+---
+
+## 2. Three Step 2.4a Cybersecurity Interview Questions & Answers
+
+### Question 1: Why is database-backed polling with `FOR UPDATE SKIP LOCKED` preferred over centralized schedulers (like Celery Beat or cron) for multi-worker security scanning platforms?
+**Answer:**
+- **Elimination of Single Point of Failure (SPOF):** Centralized schedulers like Celery Beat or systemd timers require a dedicated leader instance. If that leader process crashes, runs out of memory, or partitions from the network, the entire recurring scan pipeline halts silently until human intervention. With PostgreSQL-backed polling, the scheduler logic runs inside every worker process before job claiming. As long as at least one worker is alive, scheduled scans continue executing.
+- **High Concurrency Without Coordination:** Traditional database row locks (`FOR UPDATE`) cause concurrent workers to block and wait on locked rows, leading to thread starvation and deadlocks. `FOR UPDATE SKIP LOCKED` instructs PostgreSQL to immediately skip rows currently locked by other transactions. Workers seamlessly acquire disjoint sets of due domains with zero locking latency.
+- **Clock Authority & Consensus:** In distributed worker clusters, individual host clocks can drift. By anchoring due-domain selection and schedule advancement to the database clock (`now()`), the entire system maintains a unified, consensus-driven time reference.
+
+---
+
+### Question 2: Why must scheduled attack surface scans enforce a strict "no backfill" policy after system outages, and what operational hazards arise if backfilling is permitted?
+**Answer:**
+- **Reconnaissance is State-Observation, Not Batch Processing:** In data accounting or financial processing, missed transactions must be processed sequentially to maintain balance integrity. In cybersecurity reconnaissance, however, the target is the external environment. Running 20 backfilled port scans for yesterday cannot reconstruct what ports were open yesterday; it merely scans today's infrastructure 20 redundant times.
+- **Queue Starvation & Denial of Service:** If a scanner cluster goes offline for 48 hours, backfilling would multiply the queue backlog by orders of magnitude (e.g. 8 missed scans per domain for a 6-hour interval). Upon restart, workers would be swamped executing historical catch-up scans, starving on-demand manual scans requested by incident response teams.
+- **Third-Party Rate-Limit Exhaustion:** Sudden bursts of redundant backfilled scans would overwhelm rate limits on critical passive intelligence sources (such as `crt.sh` and Cert Spotter) and trigger IPS blocks from corporate firewalls. The "no backfill" invariant ensures that downtime results in exactly one baseline catch-up scan before returning to normal cadence.
+
+---
+
+### Question 3: How does adding randomized jitter to recurring scan cadences protect both the scanning infrastructure and target organizations?
+**Answer:**
+- **Mitigating Thundering Herds on Scanner Infrastructure:**
+  When recurring jobs are configured on fixed intervals (e.g. "every 24 hours"), they naturally align to round clock boundaries (00:00 UTC). Without jitter, all scheduled jobs trigger at the exact same second, causing extreme CPU spikes, database connection pool exhaustion, and worker queue contention. Random jitter (e.g. 0–300 seconds) spreads the execution distribution across a smooth bell curve.
+- **Preventing Target Rate-Limiting & WAF Blocking:**
+  Target organizations deploy Web Application Firewalls (WAFs), Intrusion Detection Systems (IDS), and DDoS mitigation appliances that detect volumetric bursts. If a scanner sends thousands of HTTP probes or TCP SYN packets at precisely the top of the hour, security appliances flag the traffic as an aggressive automated attack and ban the scanner's IP addresses. Jitter provides natural traffic dispersion that mimics normal operational patterns.
+- **Preventing External Provider Bans:**
+  Free passive reconnaissance services like Certificate Transparency logs enforce strict queries-per-minute rate limits. Jitter prevents multiple worker nodes from exhausting provider quotas simultaneously.
+
+
 
 
 
