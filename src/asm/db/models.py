@@ -36,6 +36,7 @@ class Domain(Base):
 
     __tablename__ = "domains"
     __table_args__ = (
+        UniqueConstraint("org_id", "name", name="uq_domains_org_id_name"),
         CheckConstraint(
             "scan_interval_hours IS NULL OR "
             "(scan_interval_hours >= 6 AND scan_interval_hours <= 720)",
@@ -60,7 +61,13 @@ class Domain(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    org_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     # Fail-safe default is False; explicit authorization is strictly required
     authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     authorization_note: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -78,6 +85,7 @@ class Domain(Base):
     )
 
     # Relationships
+    organization: Mapped["Organization"] = relationship(back_populates="domains")
     scan_runs: Mapped[list["ScanRun"]] = relationship(
         back_populates="domain",
         cascade="all, delete-orphan",
@@ -373,6 +381,7 @@ class Organization(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    system_kind: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,
@@ -381,6 +390,9 @@ class Organization(Base):
 
     # Relationships
     memberships: Mapped[list["Membership"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan"
+    )
+    domains: Mapped[list["Domain"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
 

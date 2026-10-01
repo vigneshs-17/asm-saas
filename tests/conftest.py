@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from asm.api.deps import get_current_user
 from asm.api.main import app
-from asm.db.models import Base, User
+from asm.db.models import Base, Membership, Organization, User
 from asm.db.session import get_db
 
 
@@ -152,6 +152,48 @@ def lifecycle_client(clean_db, db_engine) -> Generator[TestClient, None, None]:
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def test_org(db_session: Session) -> Organization:
+    """Provide a real test organization with real owner membership for test_user."""
+    test_user_id = UUID("00000000-0000-0000-0000-000000000001")
+    test_user = db_session.get(User, test_user_id)
+    if not test_user:
+        test_user = User(id=test_user_id, email="testuser@example.com")
+        db_session.add(test_user)
+        db_session.flush()
+
+    org = Organization(name="Default Test Org")
+    db_session.add(org)
+    db_session.flush()
+
+    membership = Membership(org_id=org.id, user_id=test_user.id, role="owner")
+    db_session.add(membership)
+    db_session.flush()
+    return org
+
+
+@pytest.fixture
+def lifecycle_org(clean_db, db_engine) -> Organization:
+    """Provide a real organization for worker/lifecycle tests where test_user is owner."""
+    test_user_id = UUID("00000000-0000-0000-0000-000000000001")
+    with Session(db_engine) as session:
+        user = session.get(User, test_user_id)
+        if not user:
+            user = User(id=test_user_id, email="testuser@example.com")
+            session.add(user)
+            session.commit()
+
+        org = Organization(name="Lifecycle Test Org")
+        session.add(org)
+        session.flush()
+
+        membership = Membership(org_id=org.id, user_id=user.id, role="owner")
+        session.add(membership)
+        session.commit()
+        session.refresh(org)
+        return org
 
 
 

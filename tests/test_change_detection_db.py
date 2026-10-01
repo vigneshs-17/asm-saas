@@ -10,17 +10,27 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from asm.db.models import Domain, ScanChange, ScanRun, ScanStage
+from asm.db.models import Domain, Organization, ScanChange, ScanRun, ScanStage
 from asm.worker.worker import ASMWorker
 
 pytestmark = pytest.mark.db
+
+
+def _ensure_org(session: Session) -> Organization:
+    org = session.query(Organization).first()
+    if not org:
+        org = Organization(name="Change Detection Test Org")
+        session.add(org)
+        session.flush()
+    return org
 
 
 def create_domain_and_queue_scan(session: Session, domain_name: str) -> tuple[int, int]:
     """Helper to register a domain, queue a scan run, and create its 5 pending stages."""
     domain = session.query(Domain).filter_by(name=domain_name).first()
     if not domain:
-        domain = Domain(name=domain_name, authorized=True)
+        org = _ensure_org(session)
+        domain = Domain(org_id=org.id, name=domain_name, authorized=True)
         session.add(domain)
         session.flush()
 
@@ -405,7 +415,8 @@ def test_detection_exception_does_not_fail_scan(clean_db, db_engine):
 def test_baseline_query_ignores_later_scans(clean_db, db_engine):
     """Baseline query uses id < :current_id strictly, ignoring any scans with id > current."""
     with Session(db_engine) as session:
-        domain = Domain(name="order-check.example.com", authorized=True)
+        org = _ensure_org(session)
+        domain = Domain(org_id=org.id, name="order-check.example.com", authorized=True)
         session.add(domain)
         session.flush()
 
@@ -461,7 +472,8 @@ def test_baseline_query_ignores_later_scans(clean_db, db_engine):
 def test_unique_constraint_enforcement_on_scan_changes(clean_db, db_engine):
     """Insert of duplicate (scan_run_id, change_type, asset, detail) raises IntegrityError."""
     with Session(db_engine) as session:
-        domain = Domain(name="unique-test.example.com", authorized=True)
+        org = _ensure_org(session)
+        domain = Domain(org_id=org.id, name="unique-test.example.com", authorized=True)
         session.add(domain)
         session.commit()
 
@@ -507,7 +519,8 @@ def test_unique_constraint_enforcement_on_scan_changes(clean_db, db_engine):
 def test_cascade_delete_on_scan_changes(clean_db, db_engine):
     """Deleting a ScanRun automatically deletes associated ScanChange records."""
     with Session(db_engine) as session:
-        domain = Domain(name="cascade-test.example.com", authorized=True)
+        org = _ensure_org(session)
+        domain = Domain(org_id=org.id, name="cascade-test.example.com", authorized=True)
         session.add(domain)
         session.commit()
 

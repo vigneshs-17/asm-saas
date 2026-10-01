@@ -18,7 +18,7 @@ from asm.auth.token import (
     verify_access_token,
 )
 from asm.auth.upsert import upsert_user
-from asm.db.models import Membership, Organization, User
+from asm.db.models import Domain, Membership, Organization, ScanRun, User
 from asm.db.session import get_db
 
 DbSession = Annotated[Session, Depends(get_db)]
@@ -153,13 +153,13 @@ def require_org_role(minimum_role: str):
         raise ValueError(f"Unknown minimum role: {minimum_role}")
 
     def dependency(
-        id: int,
+        org_id: int,
         current_user: CurrentUser,
         db: DbSession,
     ) -> tuple[Organization, Membership]:
         membership = db.execute(
             select(Membership).where(
-                Membership.org_id == id,
+                Membership.org_id == org_id,
                 Membership.user_id == current_user.id,
             )
         ).scalar_one_or_none()
@@ -171,7 +171,7 @@ def require_org_role(minimum_role: str):
                 detail="Organization not found",
             )
 
-        org = db.get(Organization, id)
+        org = db.get(Organization, org_id)
         if org is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -187,3 +187,49 @@ def require_org_role(minimum_role: str):
         return org, membership
 
     return dependency
+
+
+def get_domain_for_org(db: Session, org_id: int, domain_id: int) -> Domain:
+    """Retrieve domain by ID scoped to organization.
+
+    CRITICAL SECURITY CHOKE POINT:
+    Filters strictly by (Domain.id == domain_id AND Domain.org_id == org_id)
+    directly in the SQL query. Returns HTTP 404 if the domain does not exist
+    OR belongs to another organization, preventing cross-tenant existence disclosure.
+    """
+    stmt = select(Domain).where(
+        Domain.id == domain_id,
+        Domain.org_id == org_id,
+    )
+    domain = db.execute(stmt).scalar_one_or_none()
+    if domain is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain with ID {domain_id} not found.",
+        )
+    return domain
+
+
+def get_scan_for_org(db: Session, org_id: int, scan_id: int) -> ScanRun:
+    """Retrieve scan run by ID scoped to organization via domain join.
+
+    CRITICAL SECURITY CHOKE POINT:
+    Filters strictly by (ScanRun.id == scan_id AND Domain.org_id == org_id)
+    directly in SQL via a JOIN to Domain. Returns HTTP 404 if the scan does not exist
+    OR belongs to a domain in another organization, preventing cross-tenant existence disclosure.
+    """
+    stmt = (
+        select(ScanRun)
+        .join(Domain, ScanRun.domain_id == Domain.id)
+        .where(
+            ScanRun.id == scan_id,
+            Domain.org_id == org_id,
+        )
+    )
+    scan_run = db.execute(stmt).scalar_one_or_none()
+    if scan_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan run with ID {scan_id} not found.",
+        )
+    return scan_run

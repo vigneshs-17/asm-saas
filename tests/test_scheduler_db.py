@@ -11,9 +11,18 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from asm.db.models import Domain, ScanRun, ScanStage
+from asm.db.models import Domain, Organization, ScanRun, ScanStage
 from asm.db.scans import enqueue_scan
 from asm.worker.worker import ASMWorker
+
+
+def _ensure_org(session) -> Organization:
+    org = session.query(Organization).first()
+    if not org:
+        org = Organization(name="Scheduler DB Test Org")
+        session.add(org)
+        session.flush()
+    return org
 
 
 @pytest.mark.db
@@ -27,6 +36,7 @@ def test_scheduler_enqueues_due_domain_with_scheduled_trigger(
     with session_factory() as session:
         t_due = datetime.now(UTC) - timedelta(minutes=5)
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="due-domain.com",
             authorized=True,
             scan_interval_hours=24,
@@ -79,6 +89,7 @@ def test_scheduler_concurrent_workers_produce_exactly_one_scan(
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="concurrent-sched.com",
             authorized=True,
             scan_interval_hours=12,
@@ -118,6 +129,7 @@ def test_scheduler_active_scan_skips_duplicate_and_advances_schedule(
     with session_factory() as session:
         t_due = datetime.now(UTC) - timedelta(minutes=10)
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="active-scan-sched.com",
             authorized=True,
             scan_interval_hours=24,
@@ -157,8 +169,10 @@ def test_scheduler_skips_unauthorized_and_null_interval_domains(
     session_factory = sessionmaker(bind=db_engine)
     t_past = datetime.now(UTC) - timedelta(hours=1)
     with session_factory() as session:
+        org_id = _ensure_org(session).id
         # 1. Unauthorized domain with interval and past next_scan_at
         d_unauth = Domain(
+            org_id=org_id,
             name="unauth-due.com",
             authorized=False,
             scan_interval_hours=24,
@@ -166,6 +180,7 @@ def test_scheduler_skips_unauthorized_and_null_interval_domains(
         )
         # 2. Authorized domain with null interval and past next_scan_at
         d_null = Domain(
+            org_id=org_id,
             name="null-interval.com",
             authorized=True,
             scan_interval_hours=None,
@@ -190,6 +205,7 @@ def test_scheduler_no_backfill_after_downtime(db_engine, clean_db: None) -> None
     t_10_days_ago = datetime.now(UTC) - timedelta(days=10)
     with session_factory() as session:
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="downtime-domain.com",
             authorized=True,
             scan_interval_hours=24,
@@ -226,6 +242,7 @@ def test_scheduler_reraises_non_active_scan_integrity_error(
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="foreign-key-err.com",
             authorized=True,
             scan_interval_hours=24,
@@ -254,7 +271,11 @@ def test_scheduler_exception_does_not_stop_job_claiming(
     """An unexpected exception during schedule_due_scans does not stop job claiming."""
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="claim-resilient.com", authorized=True)
+        domain = Domain(
+            org_id=_ensure_org(session).id,
+            name="claim-resilient.com",
+            authorized=True,
+        )
         session.add(domain)
         session.flush()
 

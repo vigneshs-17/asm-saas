@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from asm.api.main import app
-from asm.db.models import Domain, ScanRun, ScanStage
+from asm.db.models import Domain, Organization, ScanRun, ScanStage
 from asm.worker.worker import ASMWorker
 
 pytestmark = pytest.mark.db
@@ -18,8 +18,12 @@ def test_concurrent_workers_skip_locked(clean_db, db_engine):
     """Verify that multiple concurrent workers claiming with SKIP LOCKED never double-claim."""
     # 1. Setup: 2 domains, each with 1 queued scan run
     with Session(db_engine) as session:
-        domain1 = Domain(name="skip-locked-1.com", authorized=True)
-        domain2 = Domain(name="skip-locked-2.com", authorized=True)
+        org = Organization(name="Concurrency Test Org")
+        session.add(org)
+        session.flush()
+
+        domain1 = Domain(org_id=org.id, name="skip-locked-1.com", authorized=True)
+        domain2 = Domain(org_id=org.id, name="skip-locked-2.com", authorized=True)
         session.add_all([domain1, domain2])
         session.commit()
 
@@ -58,11 +62,17 @@ def test_concurrent_workers_skip_locked(clean_db, db_engine):
     assert len(none_jobs) == 1
 
 
-def test_concurrent_posts_single_active_scan(lifecycle_client: TestClient, db_engine):
+def test_concurrent_posts_single_active_scan(
+    lifecycle_client: TestClient, db_engine, lifecycle_org: Organization
+):
     """Verify that concurrent POSTs for the same domain result in 1 active run and 409 conflict."""
     # 1. Create domain
     with Session(db_engine) as session:
-        domain = Domain(name="active-scan-race.com", authorized=True)
+        domain = Domain(
+            org_id=lifecycle_org.id,
+            name="active-scan-race.com",
+            authorized=True,
+        )
         session.add(domain)
         session.commit()
         domain_id = domain.id
@@ -70,7 +80,7 @@ def test_concurrent_posts_single_active_scan(lifecycle_client: TestClient, db_en
     # 2. Send 2 concurrent POSTs across separate threads
     def _send_post():
         with TestClient(app) as test_client:
-            return test_client.post(f"/domains/{domain_id}/scans")
+            return test_client.post(f"/orgs/{lifecycle_org.id}/domains/{domain_id}/scans")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         f1 = executor.submit(_send_post)
@@ -88,11 +98,17 @@ def test_concurrent_posts_single_active_scan(lifecycle_client: TestClient, db_en
     assert conflict_json["active_scan_id"] > 0
 
 
-def test_idempotent_post_while_running(lifecycle_client: TestClient, db_engine):
+def test_idempotent_post_while_running(
+    lifecycle_client: TestClient, db_engine, lifecycle_org: Organization
+):
     """Verify that an Idempotency-Key matching an active run returns 200 with that run, not 409."""
     # 1. Create domain
     with Session(db_engine) as session:
-        domain = Domain(name="idemp-running.com", authorized=True)
+        domain = Domain(
+            org_id=lifecycle_org.id,
+            name="idemp-running.com",
+            authorized=True,
+        )
         session.add(domain)
         session.commit()
         domain_id = domain.id
@@ -101,7 +117,7 @@ def test_idempotent_post_while_running(lifecycle_client: TestClient, db_engine):
 
     # 2. First POST with Idempotency-Key
     resp1 = client.post(
-        f"/domains/{domain_id}/scans",
+        f"/orgs/{lifecycle_org.id}/domains/{domain_id}/scans",
         headers={"Idempotency-Key": "unique-token-999"},
     )
     assert resp1.status_code == 202
@@ -115,7 +131,7 @@ def test_idempotent_post_while_running(lifecycle_client: TestClient, db_engine):
 
     # 4. Duplicate POST with same Idempotency-Key while scan is running
     resp2 = client.post(
-        f"/domains/{domain_id}/scans",
+        f"/orgs/{lifecycle_org.id}/domains/{domain_id}/scans",
         headers={"Idempotency-Key": "unique-token-999"},
     )
     assert resp2.status_code == 200

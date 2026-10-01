@@ -109,8 +109,8 @@ def test_unauthenticated_request_rejected(auth_api_client):
     """Protected endpoints reject requests without token with 401 and WWW-Authenticate."""
     client, _ = auth_api_client
 
-    # 1. /domains
-    res1 = client.get("/domains")
+    # 1. /orgs/{org_id}/domains
+    res1 = client.get("/orgs/1/domains")
     assert res1.status_code == 401
     assert "Bearer" in res1.headers.get("WWW-Authenticate", "")
 
@@ -217,7 +217,7 @@ def test_unconfigured_auth_fails_closed(api_ec_key_pair, db_session: Session, ca
 
                 # 5. Domains route also returns 503
                 resp_domains = client.get(
-                    "/domains",
+                    "/orgs/1/domains",
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 assert resp_domains.status_code == 503

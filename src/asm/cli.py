@@ -207,6 +207,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable verbose debug logging",
     )
 
+    # Subcommand: admin
+    admin_parser = subparsers.add_parser(
+        "admin",
+        help="Administrative operations",
+    )
+    admin_subparsers = admin_parser.add_subparsers(dest="admin_command", required=True)
+    admin_move = admin_subparsers.add_parser(
+        "move-domain",
+        help="Move a quarantined domain from legacy quarantine to a target organization",
+    )
+    admin_move.add_argument(
+        "--domain-id",
+        type=int,
+        required=True,
+        help="ID of the domain to move",
+    )
+    admin_move.add_argument(
+        "--target-org-id",
+        type=int,
+        required=True,
+        help="ID of the target customer organization",
+    )
+
     return parser
 
 
@@ -790,6 +813,14 @@ def main(argv: list[str] | None = None) -> int:
             inspect_path=args.inspect,
             output_dir_arg=args.output_dir,
         )
+    if args.command == "admin":
+        from asm.admin import move_domain
+        from asm.db.session import get_session_factory
+
+        factory = get_session_factory()
+        with factory() as session:
+            if args.admin_command == "move-domain":
+                return move_domain(session, args.domain_id, args.target_org_id)
 
     return 0
 

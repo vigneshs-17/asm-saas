@@ -1,4 +1,4 @@
-"""REST API routes for ASM SaaS."""
+"""REST API routes for ASM SaaS (multi-tenant scoped)."""
 
 import logging
 from collections.abc import Sequence
@@ -10,7 +10,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from asm.api.deps import DbSession, get_current_user
+from asm.api.deps import (
+    DbSession,
+    get_current_user,
+    get_domain_for_org,
+    get_scan_for_org,
+    require_org_role,
+)
 from asm.api.schemas import (
     ActiveScanConflict,
     AlertNotificationRead,
@@ -23,14 +29,22 @@ from asm.api.schemas import (
     ScanRunDetail,
     ScanRunRead,
 )
-from asm.db.models import AlertNotification, Domain, ScanChange, ScanResult, ScanRun
+from asm.db.models import (
+    AlertNotification,
+    Domain,
+    Membership,
+    Organization,
+    ScanChange,
+    ScanResult,
+    ScanRun,
+)
 from asm.db.scans import enqueue_scan
 from asm.validators import DomainValidationError, normalize_domain, validate_domain
 
 logger = logging.getLogger(__name__)
 
 public_router = APIRouter()
-router = APIRouter(dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/orgs/{org_id}", dependencies=[Depends(get_current_user)])
 
 
 @public_router.get(
@@ -59,15 +73,22 @@ def health_check(db: DbSession) -> HealthResponse:
     "/domains",
     response_model=DomainRead,
     status_code=status.HTTP_201_CREATED,
-    summary="Register a new domain for scanning",
+    summary="Register a new domain for scanning within an organization",
     responses={
         201: {"description": "Domain registered successfully"},
-        409: {"description": "Domain already exists"},
+        403: {"description": "Insufficient organization permissions (admin required)"},
+        404: {"description": "Organization not found (or non-member)"},
+        409: {"description": "Domain already exists in this organization"},
         422: {"description": "Validation error or authorization missing"},
     },
 )
-def create_domain(payload: DomainCreate, db: DbSession) -> Domain:
-    """Register a new domain, enforcing syntax validation and authorization gates."""
+def create_domain(
+    org_id: int,
+    payload: DomainCreate,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
+    db: DbSession,
+) -> Domain:
+    """Register a new domain within an organization, enforcing per-org uniqueness."""
     if not payload.authorized:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -84,7 +105,12 @@ def create_domain(payload: DomainCreate, db: DbSession) -> Domain:
 
     normalized = normalize_domain(validated_name)
 
-    existing = db.scalar(select(Domain).where(Domain.name == normalized))
+    existing = db.scalar(
+        select(Domain).where(
+            Domain.org_id == org_id,
+            Domain.name == normalized,
+        )
+    )
     if existing:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -92,6 +118,7 @@ def create_domain(payload: DomainCreate, db: DbSession) -> Domain:
         )
 
     domain = Domain(
+        org_id=org_id,
         name=normalized,
         authorized=True,
         authorization_note=payload.authorization_note,
@@ -105,35 +132,44 @@ def create_domain(payload: DomainCreate, db: DbSession) -> Domain:
 @router.get(
     "/domains",
     response_model=list[DomainRead],
-    summary="List all registered domains",
+    summary="List all registered domains in an organization",
+    responses={
+        200: {"description": "List of organization domains returned"},
+        404: {"description": "Organization not found (or non-member)"},
+    },
 )
-def list_domains(db: DbSession) -> Sequence[Domain]:
-    """Retrieve all monitored domains ordered by ID."""
-    return db.scalars(select(Domain).order_by(Domain.id.asc())).all()
+def list_domains(
+    org_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+) -> Sequence[Domain]:
+    """Retrieve all monitored domains for this organization ordered by ID."""
+    return db.scalars(
+        select(Domain).where(Domain.org_id == org_id).order_by(Domain.id.asc())
+    ).all()
 
 
 @router.get(
-    "/domains/{id}",
+    "/domains/{domain_id}",
     response_model=DomainRead,
-    summary="Get domain details by ID",
+    summary="Get domain details by ID within an organization",
     responses={
         200: {"description": "Domain details returned"},
-        404: {"description": "Domain ID not found"},
+        404: {"description": "Organization or Domain ID not found"},
     },
 )
-def get_domain(id: int, db: DbSession) -> Domain:
-    """Retrieve details for a single domain by primary key ID."""
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
-    return domain
+def get_domain(
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+) -> Domain:
+    """Retrieve details for a single domain by ID scoped to organization."""
+    return get_domain_for_org(db, org_id, domain_id)
 
 
 @router.post(
-    "/domains/{id}/scans",
+    "/domains/{domain_id}/scans",
     response_model=ScanRunRead,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Queue a multi-stage scan run for a domain",
@@ -143,38 +179,33 @@ def get_domain(id: int, db: DbSession) -> Domain:
             "model": ScanRunRead,
         },
         202: {"description": "Scan run queued successfully", "model": ScanRunRead},
-        404: {"description": "Domain ID not found"},
+        403: {"description": "Insufficient organization permissions (admin required)"},
+        404: {"description": "Organization or Domain ID not found"},
         409: {"description": "Active scan already in progress", "model": ActiveScanConflict},
         422: {"description": "Domain is not authorized for scanning"},
     },
 )
 def queue_scan(
-    id: int,
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
     db: DbSession,
     response: Response,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Any:
     """Queue a scan run for an authorized domain with atomic idempotency and concurrency guards."""
-    # (a) 404 if no domain
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
+    domain = get_domain_for_org(db, org_id, domain_id)
 
-    # (b) Reject if not authorized
     if not domain.authorized:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Domain '{domain.name}' is not authorized for active scanning.",
         )
 
-    # (c) Idempotency-Key matches an existing run for this domain -> 200 with that run
     if idempotency_key:
         existing_idempotent = db.scalar(
             select(ScanRun).where(
-                ScanRun.domain_id == id,
+                ScanRun.domain_id == domain.id,
                 ScanRun.idempotency_key == idempotency_key,
             )
         )
@@ -182,17 +213,15 @@ def queue_scan(
             response.status_code = status.HTTP_200_OK
             return existing_idempotent
 
-    # (d) Otherwise insert -> 202, or 409 if the active-scan index blocks it
     try:
-        scan_run = enqueue_scan(db, id, trigger="manual", idempotency_key=idempotency_key)
+        scan_run = enqueue_scan(db, domain.id, trigger="manual", idempotency_key=idempotency_key)
         db.commit()
     except IntegrityError:
         db.rollback()
-        # Re-check idempotency key in case of race
         if idempotency_key:
             existing_idempotent = db.scalar(
                 select(ScanRun).where(
-                    ScanRun.domain_id == id,
+                    ScanRun.domain_id == domain.id,
                     ScanRun.idempotency_key == idempotency_key,
                 )
             )
@@ -200,10 +229,9 @@ def queue_scan(
                 response.status_code = status.HTTP_200_OK
                 return existing_idempotent
 
-        # Active scan conflict
         active_id = db.scalar(
             select(ScanRun.id).where(
-                ScanRun.domain_id == id,
+                ScanRun.domain_id == domain.id,
                 ScanRun.status.in_(["queued", "running"]),
             )
         )
@@ -220,50 +248,27 @@ def queue_scan(
 
 
 @router.get(
-    "/scans/{scan_id}",
-    response_model=ScanRunDetail,
-    summary="Get scan run details and stage progress",
-    responses={
-        200: {"description": "Scan run details returned"},
-        404: {"description": "Scan run ID not found"},
-    },
-)
-def get_scan(scan_id: int, db: DbSession) -> ScanRun:
-    """Retrieve execution status, retry count, and per-stage progress for a scan run."""
-    scan = db.get(ScanRun, scan_id)
-    if not scan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Scan run with ID {scan_id} not found.",
-        )
-    return scan
-
-
-@router.get(
-    "/domains/{id}/scans",
+    "/domains/{domain_id}/scans",
     response_model=list[ScanRunRead],
     summary="List historical scan runs for a domain",
     responses={
         200: {"description": "List of scan runs returned"},
-        404: {"description": "Domain ID not found"},
+        404: {"description": "Organization or Domain ID not found"},
     },
 )
 def list_domain_scans(
-    id: int,
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
     db: DbSession,
     status_filter: Annotated[str | None, Query(alias="status")] = None,
     limit: int = 20,
     offset: int = 0,
 ) -> Sequence[ScanRun]:
     """Retrieve historical scan runs for a domain with optional status filtering and pagination."""
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
+    domain = get_domain_for_org(db, org_id, domain_id)
 
-    query = select(ScanRun).where(ScanRun.domain_id == id)
+    query = select(ScanRun).where(ScanRun.domain_id == domain.id)
     if status_filter:
         query = query.where(ScanRun.status == status_filter)
     query = query.order_by(ScanRun.id.desc()).offset(offset).limit(min(limit, 100))
@@ -271,25 +276,74 @@ def list_domain_scans(
 
 
 @router.get(
+    "/scans",
+    response_model=list[ScanRunRead],
+    summary="List all historical scan runs across all domains in an organization",
+    responses={
+        200: {"description": "List of organization scan runs returned"},
+        404: {"description": "Organization not found (or non-member)"},
+    },
+)
+def list_org_scans(
+    org_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> Sequence[ScanRun]:
+    """Retrieve all historical scan runs across all domains in this organization."""
+    query = (
+        select(ScanRun)
+        .join(Domain, ScanRun.domain_id == Domain.id)
+        .where(Domain.org_id == org_id)
+    )
+    if status_filter:
+        query = query.where(ScanRun.status == status_filter)
+    query = query.order_by(ScanRun.id.desc()).offset(offset).limit(min(limit, 100))
+    return db.scalars(query).all()
+
+
+@router.get(
+    "/scans/{scan_id}",
+    response_model=ScanRunDetail,
+    summary="Get scan run details and stage progress",
+    responses={
+        200: {"description": "Scan run details returned"},
+        404: {"description": "Organization or Scan run ID not found"},
+    },
+)
+def get_scan(
+    org_id: int,
+    scan_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+) -> ScanRun:
+    """Retrieve execution status, retry count, and per-stage progress for a scan run."""
+    return get_scan_for_org(db, org_id, scan_id)
+
+
+@router.get(
     "/scans/{scan_id}/results/{stage}",
     summary="Get raw JSON artifact report for a specific pipeline stage",
     responses={
         200: {"description": "Stage artifact report returned"},
-        404: {"description": "Scan run or stage result not found"},
+        404: {"description": "Organization, scan run, or stage result not found"},
     },
 )
-def get_scan_stage_result(scan_id: int, stage: str, db: DbSession) -> dict[str, Any]:
+def get_scan_stage_result(
+    org_id: int,
+    scan_id: int,
+    stage: str,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+) -> dict[str, Any]:
     """Retrieve the JSONB artifact report produced by a specific pipeline stage."""
-    scan = db.get(ScanRun, scan_id)
-    if not scan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Scan run with ID {scan_id} not found.",
-        )
+    scan = get_scan_for_org(db, org_id, scan_id)
 
     res = db.scalar(
         select(ScanResult).where(
-            ScanResult.scan_run_id == scan_id,
+            ScanResult.scan_run_id == scan.id,
             ScanResult.stage == stage,
         )
     )
@@ -302,16 +356,39 @@ def get_scan_stage_result(scan_id: int, stage: str, db: DbSession) -> dict[str, 
 
 
 @router.get(
-    "/domains/{id}/changes",
+    "/scans/{scan_id}/changes",
+    response_model=list[ScanChangeRead],
+    summary="List attack surface changes detected in a scan run",
+    responses={
+        200: {"description": "List of scan changes returned"},
+        404: {"description": "Organization or Scan run ID not found"},
+    },
+)
+def get_scan_changes(
+    org_id: int,
+    scan_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+) -> Sequence[ScanChange]:
+    """Retrieve attack surface changes detected specifically in a scan run."""
+    scan = get_scan_for_org(db, org_id, scan_id)
+    stmt = select(ScanChange).where(ScanChange.scan_run_id == scan.id).order_by(ScanChange.id.asc())
+    return db.scalars(stmt).all()
+
+
+@router.get(
+    "/domains/{domain_id}/changes",
     response_model=list[ScanChangeRead],
     summary="List attack surface changes detected for a domain",
     responses={
         200: {"description": "List of detected changes returned"},
-        404: {"description": "Domain ID not found"},
+        404: {"description": "Organization or Domain ID not found"},
     },
 )
 def list_domain_changes(
-    id: int,
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
     db: DbSession,
     change_type: Annotated[str | None, Query(description="Filter by change_type")] = None,
     severity: Annotated[str | None, Query(description="Filter by severity")] = None,
@@ -324,14 +401,9 @@ def list_domain_changes(
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> Sequence[ScanChange]:
     """Retrieve historical attack surface changes for a domain, newest first."""
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
+    domain = get_domain_for_org(db, org_id, domain_id)
 
-    stmt = select(ScanChange).where(ScanChange.domain_id == id)
+    stmt = select(ScanChange).where(ScanChange.domain_id == domain.id)
     if change_type:
         stmt = stmt.where(ScanChange.change_type == change_type)
     if severity:
@@ -339,7 +411,6 @@ def list_domain_changes(
     if category:
         stmt = stmt.where(ScanChange.category == category)
     if since:
-        # Robustly handle unencoded '+' decoded as ' ' in query strings
         try:
             since_dt = datetime.fromisoformat(since.replace(" ", "+"))
         except ValueError as err:
@@ -357,57 +428,31 @@ def list_domain_changes(
     return db.scalars(stmt).all()
 
 
-@router.get(
-    "/scans/{id}/changes",
-    response_model=list[ScanChangeRead],
-    summary="List attack surface changes detected in a scan run",
-    responses={
-        200: {"description": "List of scan changes returned"},
-        404: {"description": "Scan run ID not found"},
-    },
-)
-def get_scan_changes(id: int, db: DbSession) -> Sequence[ScanChange]:
-    """Retrieve attack surface changes detected specifically in a scan run."""
-    scan = db.get(ScanRun, id)
-    if not scan:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Scan run with ID {id} not found.",
-        )
-
-    stmt = select(ScanChange).where(ScanChange.scan_run_id == id).order_by(ScanChange.id.asc())
-    return db.scalars(stmt).all()
-
-
 @router.put(
-    "/domains/{id}/schedule",
+    "/domains/{domain_id}/schedule",
     response_model=DomainRead,
     summary="Configure recurring scan schedule for a domain",
     responses={
         200: {"description": "Schedule updated successfully"},
-        404: {"description": "Domain not found"},
+        403: {"description": "Insufficient organization permissions (admin required)"},
+        404: {"description": "Organization or Domain not found"},
         422: {"description": "Validation error or domain not authorized"},
     },
 )
 def update_domain_schedule(
-    id: int,
+    org_id: int,
+    domain_id: int,
     payload: DomainScheduleUpdate,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
     db: DbSession,
 ) -> Domain:
     """Configure or disable automated periodic scanning for an authorized domain."""
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
+    domain = get_domain_for_org(db, org_id, domain_id)
 
     if payload.interval_hours is None:
-        # Disable schedule
         domain.scan_interval_hours = None
         domain.next_scan_at = None
     else:
-        # Must be authorized to enable schedule
         if not domain.authorized:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -415,11 +460,9 @@ def update_domain_schedule(
             )
 
         if domain.scan_interval_hours is None:
-            # Enabling from null: sets next_scan_at = now()
             domain.scan_interval_hours = payload.interval_hours
             domain.next_scan_at = func.now()
         else:
-            # Changing an existing interval: sets next_scan_at = now() + new interval
             domain.scan_interval_hours = payload.interval_hours
             domain.next_scan_at = func.now() + text("interval '1 hour' * :h").bindparams(
                 h=payload.interval_hours
@@ -431,27 +474,25 @@ def update_domain_schedule(
 
 
 @router.put(
-    "/domains/{id}/alerts",
+    "/domains/{domain_id}/alerts",
     response_model=DomainRead,
     summary="Configure attack surface change email alerts for a domain",
     responses={
         200: {"description": "Alert settings updated successfully"},
-        404: {"description": "Domain not found"},
+        403: {"description": "Insufficient organization permissions (admin required)"},
+        404: {"description": "Organization or Domain not found"},
         422: {"description": "Domain not authorized or validation error"},
     },
 )
 def update_domain_alerts(
-    id: int,
+    org_id: int,
+    domain_id: int,
     payload: DomainAlertsUpdate,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
     db: DbSession,
 ) -> Domain:
     """Configure or disable automated email alerts for detected attack surface exposures."""
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
+    domain = get_domain_for_org(db, org_id, domain_id)
 
     if not domain.authorized:
         raise HTTPException(
@@ -469,30 +510,27 @@ def update_domain_alerts(
 
 
 @router.get(
-    "/domains/{id}/alert-notifications",
+    "/domains/{domain_id}/alert-notifications",
     response_model=list[AlertNotificationRead],
     summary="List alert notifications for a domain",
     responses={
         200: {"description": "List of alert notifications returned"},
-        404: {"description": "Domain not found"},
+        404: {"description": "Organization or Domain not found"},
     },
 )
 def list_domain_alert_notifications(
-    id: int,
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
     db: DbSession,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
     status_filter: Annotated[str | None, Query(alias="status")] = None,
 ) -> Sequence[AlertNotification]:
     """Retrieve historical alert notifications for a domain with optional status filtering."""
-    domain = db.get(Domain, id)
-    if not domain:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Domain with ID {id} not found.",
-        )
+    domain = get_domain_for_org(db, org_id, domain_id)
 
-    query = select(AlertNotification).where(AlertNotification.domain_id == id)
+    query = select(AlertNotification).where(AlertNotification.domain_id == domain.id)
     if status_filter:
         query = query.where(AlertNotification.status == status_filter)
     query = (
@@ -501,5 +539,3 @@ def list_domain_alert_notifications(
         .limit(limit)
     )
     return db.scalars(query).all()
-
-

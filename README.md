@@ -147,11 +147,8 @@ On startup:
 2. `migrate`: Executes `alembic upgrade head` in a one-shot container to establish all tables (`domains`, `scan_runs`, `scan_results`).
 3. `api`: Starts `uvicorn` serving the FastAPI application once migrations succeed.
 
-> [!WARNING]
-> **No Authentication / Localhost Only:**
-> The API currently has no authentication layer. In `docker-compose.yml`, port 8000 is bound **strictly to loopback `127.0.0.1:8000`** (not `0.0.0.0`) to prevent unauthorized network access.
-
 ### 3. Verify Health
+The `/health` endpoint is public and requires no authentication:
 ```bash
 curl -i http://127.0.0.1:8000/health
 ```
@@ -160,161 +157,33 @@ Response:
 {"status":"ok","database":"connected"}
 ```
 
-### 4. Register Monitored Domains
-Register a target domain (requires `"authorized": true` in the request body):
-```bash
-curl -i -X POST http://127.0.0.1:8000/domains \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "example.com",
-    "authorized": true,
-    "authorization_note": "Target owner written authorization"
-  }'
-```
-Response:
-```json
-{
-  "id": 1,
-  "name": "example.com",
-  "authorized": true,
-  "authorization_note": "Target owner written authorization",
-  "created_at": "2026-09-29T18:00:00Z"
-}
-```
+---
 
-List registered domains:
-```bash
-curl -i http://127.0.0.1:8000/domains
-```
+### 4. Authentication, Organizations & Tenant Isolation (v3.1a, v3.1b)
 
-### 5. Asynchronous Scan Jobs & Worker (v2.2)
+All application API endpoints (except `/health`) require authentication via a valid Supabase JWT access token in the `Authorization: Bearer <token>` header, and are strictly scoped by organization under `/orgs/{org_id}/...`.
 
-In v2.2, long-running scans run asynchronously via background workers claiming jobs from PostgreSQL using `FOR UPDATE SKIP LOCKED`.
+#### Role-Based Access Control (RBAC) Matrix
 
-#### Start the Worker Service
-```bash
-docker compose up -d worker
-```
-Or run the worker process locally:
-```bash
-python -m asm.worker
-```
-
-#### Queue a Scan
-Queue a multi-stage scan for an authorized domain (returns `202 Accepted` immediately):
-```bash
-curl -i -X POST http://127.0.0.1:8000/domains/1/scans \
-  -H "Idempotency-Key: optional-uuid-token"
-```
-
-#### Check Scan Status and Stage Progress
-Retrieve real-time execution status and duration for all 5 pipeline stages:
-```bash
-curl -i http://127.0.0.1:8000/scans/1
-```
-
-#### Fetch Stage Artifact Reports
-Retrieve the raw JSON report produced by any completed stage (`discover`, `probe`, `portscan`, `inspect`, `score`):
-```bash
-curl -i http://127.0.0.1:8000/scans/1/results/score
-```
-
-#### List Domain Historical Scans
-```bash
-curl -i "http://127.0.0.1:8000/domains/1/scans?status=succeeded&limit=10"
-```
-
-#### List Attack Surface Changes for a Domain
-Query historical attack surface changes detected for a domain, ordered newest-first:
-```bash
-# All changes (default limit: 50, offset: 0)
-curl -i http://127.0.0.1:8000/domains/1/changes
-
-# Filtered by severity, category, change_type, or timestamp
-curl -i "http://127.0.0.1:8000/domains/1/changes?severity=CRITICAL"
-curl -i "http://127.0.0.1:8000/domains/1/changes?category=exposure&since=2026-10-01T00:00:00Z"
-curl -i "http://127.0.0.1:8000/domains/1/changes?change_type=PORT_NEWLY_OPEN&limit=10"
-```
-
-#### List Attack Surface Changes for a Specific Scan Run
-Retrieve only the changes detected in a single scan run (404 if scan not found):
-```bash
-curl -i http://127.0.0.1:8000/scans/2/changes
-```
-
-#### Configure Recurring Scan Schedule for a Domain
-Enable, update, or disable automated recurring scanning for an authorized domain (allowed range: 6 to 720 hours):
-```bash
-# Enable 24-hour recurring scans (enabling from null sets next_scan_at to now, eligible immediately)
-curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
-  -H "Content-Type: application/json" \
-  -d '{"interval_hours": 24}'
-
-# Update existing interval to 48 hours (sets next_scan_at = now + 48h, does not trigger immediate scan)
-curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
-  -H "Content-Type: application/json" \
-  -d '{"interval_hours": 48}'
-
-# Disable recurring scans (reverts domain to manual scans only)
-curl -i -X PUT http://127.0.0.1:8000/domains/1/schedule \
-  -H "Content-Type: application/json" \
-  -d '{"interval_hours": null}'
-```
-
-#### Configure Domain Email Alerts
-Configure automated plain-text email alerts for detected attack surface exposures (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`):
-```bash
-# Enable email alerts (1 to 5 recipient emails, default threshold: MEDIUM)
-curl -i -X PUT http://127.0.0.1:8000/domains/1/alerts \
-  -H "Content-Type: application/json" \
-  -d '{
-    "alerts_enabled": true,
-    "alert_emails": ["security@example.com", "ops@example.com"],
-    "alert_min_severity": "HIGH"
-  }'
-
-# Disable email alerts
-curl -i -X PUT http://127.0.0.1:8000/domains/1/alerts \
-  -H "Content-Type: application/json" \
-  -d '{
-    "alerts_enabled": false,
-    "alert_emails": []
-  }'
-```
-
-#### List Alert Notifications for a Domain
-Query the history and delivery status of outbox alert notifications:
-```bash
-# List all notifications (newest first, includes plain-text email body)
-curl -i http://127.0.0.1:8000/domains/1/alert-notifications
-
-# Filter by delivery status (pending / sent / failed)
-curl -i "http://127.0.0.1:8000/domains/1/alert-notifications?status=pending&limit=10"
-```
-
-### 6. Authentication, Organizations & Role-Based Access Control (v3.1a)
-
-In v3.1a, all API endpoints (except `/health`) require authentication via a valid Supabase JWT access token.
-*(Note: Multi-tenant scoping of domains, scans, changes, and alerts to specific organizations is scheduled for Phase v3.1b).*
-
-#### Identity Provider Architecture & Supabase Project Settings
-- **Supabase Owns Identity**: The backend never handles user passwords and provides no login/registration endpoints. Supabase Auth manages sign-in, password resets, and email verification.
-- **Mandatory Supabase Setting**: In your Supabase project under **Authentication -> Providers -> Email**, you **must ensure "Confirm email" is enabled**. Because organization invitations and member appointments lookup users by email, trusting an unconfirmed email address would allow attackers to claim memberships by registering with arbitrary victim emails.
-- **Zero-Secret Verification**: The backend validates tokens using public keys retrieved via JWKS from `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`. No API secret or service role key is stored on the server.
-- **Algorithm-Confusion Defense**: Only asymmetric algorithms `ES256` and `RS256` are allowed. Symmetric algorithms (`HS256`) and unsigned tokens (`none`) are rejected. Anonymous tokens (`is_anonymous: true`) are strictly rejected.
-
-#### How to Obtain a Test Token from Supabase
-You can obtain a valid JWT access token from your Supabase project using `curl` against the Supabase GoTrue Auth API:
-```bash
-curl -X POST 'https://<your-project-ref>.supabase.co/auth/v1/token?grant_type=password' \
-  -H 'apikey: <your-anon-key>' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "email": "user@example.com",
-    "password": "your-password"
-  }'
-```
-Extract `access_token` from the JSON response and pass it in the `Authorization: Bearer <token>` header on all requests.
+| Endpoint | Method | Min Role | Description |
+|---|---|---|---|
+| `/orgs/{org_id}/domains` | POST | `admin` | Register a new monitored domain |
+| `/orgs/{org_id}/domains` | GET | `viewer` | List all domains belonging to this organization |
+| `/orgs/{org_id}/domains/{domain_id}` | GET | `viewer` | Get domain details and schedule configuration |
+| `/orgs/{org_id}/domains/{domain_id}/scans` | POST | `admin` | Queue a reconnaissance scan for an authorized domain |
+| `/orgs/{org_id}/domains/{domain_id}/scans` | GET | `viewer` | List historical scans for a domain |
+| `/orgs/{org_id}/scans` | GET | `viewer` | List all scans across the entire organization |
+| `/orgs/{org_id}/scans/{scan_id}` | GET | `viewer` | Check scan status and pipeline stage progress |
+| `/orgs/{org_id}/scans/{scan_id}/results/{stage}` | GET | `viewer` | Download raw stage JSON report |
+| `/orgs/{org_id}/scans/{scan_id}/changes` | GET | `viewer` | List changes detected by a specific scan run |
+| `/orgs/{org_id}/domains/{domain_id}/changes` | GET | `viewer` | List historical attack surface changes for a domain |
+| `/orgs/{org_id}/domains/{domain_id}/schedule` | PUT | `admin` | Configure automated recurring scan schedule |
+| `/orgs/{org_id}/domains/{domain_id}/alerts` | PUT | `admin` | Configure email alert recipients and minimum severity |
+| `/orgs/{org_id}/domains/{domain_id}/alert-notifications` | GET | `viewer` | List alert delivery history |
+| `/orgs/{org_id}/members` | GET | `viewer` | List members of the organization |
+| `/orgs/{org_id}/members` | POST | `admin` | Add a member by email (`owner` only to appoint owners) |
+| `/orgs/{org_id}/members/{user_id}` | PATCH | `owner` | Update member role (enforces last-owner rule) |
+| `/orgs/{org_id}/members/{user_id}` | DELETE | `owner` / self | Remove member or leave organization |
 
 #### Managing Organizations and Members
 ```bash
@@ -328,26 +197,147 @@ curl -i -X POST http://127.0.0.1:8000/orgs \
 curl -i http://127.0.0.1:8000/orgs \
   -H "Authorization: Bearer <token>"
 
-# 3. List organization members (accessible to viewers, admins, owners)
+# 3. List organization members
 curl -i http://127.0.0.1:8000/orgs/1/members \
   -H "Authorization: Bearer <token>"
 
-# 4. Add a member by email (accessible to admins and owners; user must have signed in once)
+# 4. Add a member by email (user must have logged into the platform at least once)
 curl -i -X POST http://127.0.0.1:8000/orgs/1/members \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"email": "analyst@example.com", "role": "viewer"}'
 
-# 5. Update a member's role (owner only; last owner cannot be demoted)
+# 5. Update a member's role (owner only)
 curl -i -X PATCH http://127.0.0.1:8000/orgs/1/members/<user-uuid> \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"role": "admin"}'
 
-# 6. Remove a member (owner only, or self-removal; last owner cannot be removed)
+# 6. Remove a member (owner only, or self-removal)
 curl -i -X DELETE http://127.0.0.1:8000/orgs/1/members/<user-uuid> \
   -H "Authorization: Bearer <token>"
 ```
+
+---
+
+### 5. Managing Domains & Scans Under an Organization
+
+#### Register Monitored Domains
+Register a target domain within an organization (requires `admin` or `owner` role, and `"authorized": true`):
+```bash
+curl -i -X POST http://127.0.0.1:8000/orgs/1/domains \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "example.com",
+    "authorized": true,
+    "authorization_note": "Target owner written authorization"
+  }'
+```
+Response:
+```json
+{
+  "id": 1,
+  "org_id": 1,
+  "name": "example.com",
+  "authorized": true,
+  "authorization_note": "Target owner written authorization",
+  "created_at": "2026-09-29T18:00:00Z"
+}
+```
+
+List registered domains for an organization:
+```bash
+curl -i http://127.0.0.1:8000/orgs/1/domains \
+  -H "Authorization: Bearer <token>"
+```
+
+#### Queue and Track Asynchronous Scans
+Background workers process scans asynchronously using PostgreSQL `FOR UPDATE SKIP LOCKED`.
+
+```bash
+# Queue a scan for an authorized domain (returns 202 Accepted)
+curl -i -X POST http://127.0.0.1:8000/orgs/1/domains/1/scans \
+  -H "Authorization: Bearer <token>" \
+  -H "Idempotency-Key: optional-uuid-token"
+
+# Check scan status and stage progress
+curl -i http://127.0.0.1:8000/orgs/1/scans/1 \
+  -H "Authorization: Bearer <token>"
+
+# Download raw stage JSON report
+curl -i http://127.0.0.1:8000/orgs/1/scans/1/results/score \
+  -H "Authorization: Bearer <token>"
+
+# List all scans across the organization
+curl -i http://127.0.0.1:8000/orgs/1/scans \
+  -H "Authorization: Bearer <token>"
+
+# List historical scans for a specific domain
+curl -i "http://127.0.0.1:8000/orgs/1/domains/1/scans?status=succeeded&limit=10" \
+  -H "Authorization: Bearer <token>"
+```
+
+#### Attack Surface Changes
+```bash
+# Query changes detected for a domain (newest first)
+curl -i http://127.0.0.1:8000/orgs/1/domains/1/changes \
+  -H "Authorization: Bearer <token>"
+
+# Filtered by severity, category, or type
+curl -i "http://127.0.0.1:8000/orgs/1/domains/1/changes?severity=CRITICAL" \
+  -H "Authorization: Bearer <token>"
+curl -i "http://127.0.0.1:8000/orgs/1/domains/1/changes?change_type=PORT_NEWLY_OPEN&limit=10" \
+  -H "Authorization: Bearer <token>"
+
+# Query changes detected in a single scan run
+curl -i http://127.0.0.1:8000/orgs/1/scans/2/changes \
+  -H "Authorization: Bearer <token>"
+```
+
+#### Recurring Scan Scheduling & Alerts
+```bash
+# Enable 24-hour recurring scans
+curl -i -X PUT http://127.0.0.1:8000/orgs/1/domains/1/schedule \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"interval_hours": 24}'
+
+# Disable recurring scans
+curl -i -X PUT http://127.0.0.1:8000/orgs/1/domains/1/schedule \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"interval_hours": null}'
+
+# Configure email alerts
+curl -i -X PUT http://127.0.0.1:8000/orgs/1/domains/1/alerts \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alerts_enabled": true,
+    "alert_emails": ["security@example.com", "ops@example.com"],
+    "alert_min_severity": "HIGH"
+  }'
+
+# Query alert notification history
+curl -i http://127.0.0.1:8000/orgs/1/domains/1/alert-notifications \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+### 6. Admin CLI: Migrating Quarantine Domains
+
+Migration `0007_tenant_isolation` safely moved pre-existing unscoped domains into an isolated organization with `system_kind = 'legacy_quarantine'` (with zero members, rendering it inaccessible to all normal users).
+
+To move a quarantined domain into a customer organization, administrators use the CLI tool:
+```bash
+python -m asm admin move-domain <domain_id> <target_org_id>
+```
+Security invariants enforced:
+- **Refuses Non-Quarantine Domains:** Exits with code 1 if the domain's current organization is not `system_kind = 'legacy_quarantine'`.
+- **Target Organization Validation:** Exits with code 1 if `target_org_id` does not exist or is itself a quarantine organization.
+- **Per-Org Name Collision Check:** Exits with code 1 if the target organization already monitors that domain name.
 
 
 ### 7. Local Database Testing Setup & Migrations
@@ -608,7 +598,7 @@ Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
 2. **One Short Transaction Per Domain**:
    Each due domain is locked, evaluated, and updated within its own dedicated short transaction, minimizing lock contention and preventing failures in one domain from affecting others.
 3. **Shared Enqueue Function**:
-   Both `POST /domains/{id}/scans` and the worker scheduler call the shared `enqueue_scan()` function to insert the `scan_run` and its 5 `pending` stage tracking rows.
+   Both `POST /orgs/{org_id}/domains/{id}/scans` and the worker scheduler call the shared `enqueue_scan()` function to insert the `scan_run` and its 5 `pending` stage tracking rows.
 4. **Active Scan Duplicate Suppression**:
    If an active scan (`status IN ('queued', 'running')`) already exists for a domain, the database constraint `uq_scan_runs_active_domain` blocks insertion. The scheduler safely absorbs this constraint violation and advances `next_scan_at` without creating a duplicate job.
 5. **No Backfill Guarantee**:

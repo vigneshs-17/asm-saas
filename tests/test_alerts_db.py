@@ -12,10 +12,19 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from asm.db.models import AlertNotification, Domain, ScanRun
+from asm.db.models import AlertNotification, Domain, Organization, ScanRun
 from asm.db.scans import enqueue_scan
 from asm.worker.runner import IScannerRunner
 from asm.worker.worker import ASMWorker
+
+
+def _ensure_org(session) -> Organization:
+    org = session.query(Organization).first()
+    if not org:
+        org = Organization(name="Alerts DB Test Org")
+        session.add(org)
+        session.flush()
+    return org
 
 
 class MockScannerRunner(IScannerRunner):
@@ -61,6 +70,7 @@ def test_outbox_written_atomically_in_fenced_transaction(
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="alert-atomic.com",
             authorized=True,
             alerts_enabled=True,
@@ -167,6 +177,7 @@ def test_no_alert_for_summary_only_or_below_threshold(
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="alert-filter.com",
             authorized=True,
             alerts_enabled=True,
@@ -243,6 +254,7 @@ def test_digest_builder_exception_leaves_run_succeeded_with_alert_error(
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
         domain = Domain(
+            org_id=_ensure_org(session).id,
             name="digest-err.com",
             authorized=True,
             alerts_enabled=True,
@@ -327,7 +339,11 @@ def test_uniqueness_per_recipient(db_engine, clean_db: None) -> None:
     """Duplicate outbox rows for same (scan_run_id, recipient) are rejected by constraint."""
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="uniq-test.com", authorized=True)
+        domain = Domain(
+            org_id=_ensure_org(session).id,
+            name="uniq-test.com",
+            authorized=True,
+        )
         session.add(domain)
         session.flush()
 
@@ -365,7 +381,11 @@ def test_worker_delivery_success_and_retry_backoff(
     """Worker delivers alert, records sent_at, and handles retry backoff up to failed."""
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="delivery-test.com", authorized=True)
+        domain = Domain(
+            org_id=_ensure_org(session).id,
+            name="delivery-test.com",
+            authorized=True,
+        )
         session.add(domain)
         session.flush()
         domain_id = domain.id
@@ -471,7 +491,11 @@ def test_concurrent_workers_deliver_each_row_once(
     """Concurrent workers with FOR UPDATE SKIP LOCKED deliver each alert notification once."""
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="concurrent-delivery.com", authorized=True)
+        domain = Domain(
+            org_id=_ensure_org(session).id,
+            name="concurrent-delivery.com",
+            authorized=True,
+        )
         session.add(domain)
         session.flush()
 
@@ -527,7 +551,11 @@ def test_smtp_host_unset_leaves_rows_pending(db_engine, clean_db: None) -> None:
     """When SMTP_HOST is unset, deliver_pending_alerts returns 0 and leaves rows pending."""
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="unset-smtp.com", authorized=True)
+        domain = Domain(
+            org_id=_ensure_org(session).id,
+            name="unset-smtp.com",
+            authorized=True,
+        )
         session.add(domain)
         session.flush()
 

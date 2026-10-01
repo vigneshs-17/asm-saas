@@ -89,7 +89,7 @@ def list_my_organizations(
 
 
 @router.get(
-    "/{id}/members",
+    "/{org_id}/members",
     response_model=list[OrgMemberRead],
     summary="List organization members",
     responses={
@@ -99,7 +99,7 @@ def list_my_organizations(
     },
 )
 def list_organization_members(
-    id: int,
+    org_id: int,
     auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
     db: DbSession,
 ) -> list[OrgMemberRead]:
@@ -107,7 +107,7 @@ def list_organization_members(
     query = (
         select(Membership.user_id, User.email, Membership.role, Membership.created_at)
         .join(User, Membership.user_id == User.id)
-        .where(Membership.org_id == id)
+        .where(Membership.org_id == org_id)
         .order_by(Membership.created_at.asc())
     )
     rows = db.execute(query).all()
@@ -123,7 +123,7 @@ def list_organization_members(
 
 
 @router.post(
-    "/{id}/members",
+    "/{org_id}/members",
     response_model=OrgMemberRead,
     status_code=status.HTTP_201_CREATED,
     summary="Add a member to an organization",
@@ -136,7 +136,7 @@ def list_organization_members(
     },
 )
 def add_organization_member(
-    id: int,
+    org_id: int,
     payload: OrgMemberAdd,
     auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
     db: DbSession,
@@ -165,7 +165,7 @@ def add_organization_member(
 
     existing = db.execute(
         select(Membership).where(
-            Membership.org_id == id,
+            Membership.org_id == org_id,
             Membership.user_id == target_user.id,
         )
     ).scalar_one_or_none()
@@ -176,7 +176,7 @@ def add_organization_member(
         )
 
     membership = Membership(
-        org_id=id,
+        org_id=org_id,
         user_id=target_user.id,
         role=payload.role,
     )
@@ -184,7 +184,7 @@ def add_organization_member(
     db.commit()
     db.refresh(membership)
 
-    logger.info("Added user %s to org %d with role %s", target_user.id, id, payload.role)
+    logger.info("Added user %s to org %d with role %s", target_user.id, org_id, payload.role)
     return OrgMemberRead(
         user_id=membership.user_id,
         email=target_user.email,
@@ -194,7 +194,7 @@ def add_organization_member(
 
 
 @router.patch(
-    "/{id}/members/{user_id}",
+    "/{org_id}/members/{user_id}",
     response_model=OrgMemberRead,
     summary="Update organization member role",
     responses={
@@ -206,7 +206,7 @@ def add_organization_member(
     },
 )
 def update_member_role(
-    id: int,
+    org_id: int,
     user_id: uuid.UUID,
     payload: OrgMemberUpdate,
     auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("owner"))],
@@ -215,7 +215,7 @@ def update_member_role(
     """Update a member's role. Restricted to owners. Enforces last-owner invariant."""
     target_member = db.execute(
         select(Membership).where(
-            Membership.org_id == id,
+            Membership.org_id == org_id,
             Membership.user_id == user_id,
         )
     ).scalar_one_or_none()
@@ -227,11 +227,12 @@ def update_member_role(
 
     if target_member.role == "owner" and payload.role != "owner":
         # Lock organization row to prevent concurrent last-owner race
-        db.execute(select(Organization).where(Organization.id == id).with_for_update()).scalar_one()
+        lock_stmt = select(Organization).where(Organization.id == org_id).with_for_update()
+        db.execute(lock_stmt).scalar_one()
 
         remaining_owners = db.scalar(
             select(func.count(Membership.id)).where(
-                Membership.org_id == id,
+                Membership.org_id == org_id,
                 Membership.role == "owner",
                 Membership.user_id != user_id,
             )
@@ -256,7 +257,7 @@ def update_member_role(
 
 
 @router.delete(
-    "/{id}/members/{user_id}",
+    "/{org_id}/members/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Remove a member from organization",
     responses={
@@ -268,7 +269,7 @@ def update_member_role(
     },
 )
 def remove_organization_member(
-    id: int,
+    org_id: int,
     user_id: uuid.UUID,
     current_user: CurrentUser,
     db: DbSession,
@@ -281,7 +282,7 @@ def remove_organization_member(
     """
     caller_membership = db.execute(
         select(Membership).where(
-            Membership.org_id == id,
+            Membership.org_id == org_id,
             Membership.user_id == current_user.id,
         )
     ).scalar_one_or_none()
@@ -300,7 +301,7 @@ def remove_organization_member(
 
     target_member = db.execute(
         select(Membership).where(
-            Membership.org_id == id,
+            Membership.org_id == org_id,
             Membership.user_id == user_id,
         )
     ).scalar_one_or_none()
@@ -312,11 +313,12 @@ def remove_organization_member(
 
     if target_member.role == "owner":
         # Lock organization row to prevent concurrent last-owner race
-        db.execute(select(Organization).where(Organization.id == id).with_for_update()).scalar_one()
+        lock_stmt = select(Organization).where(Organization.id == org_id).with_for_update()
+        db.execute(lock_stmt).scalar_one()
 
         remaining_owners = db.scalar(
             select(func.count(Membership.id)).where(
-                Membership.org_id == id,
+                Membership.org_id == org_id,
                 Membership.role == "owner",
                 Membership.user_id != user_id,
             )
@@ -329,5 +331,5 @@ def remove_organization_member(
 
     db.delete(target_member)
     db.commit()
-    logger.info("Removed user %s from org %d", user_id, id)
+    logger.info("Removed user %s from org %d", user_id, org_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

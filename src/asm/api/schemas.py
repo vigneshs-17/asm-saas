@@ -34,6 +34,7 @@ class DomainRead(BaseModel):
     """Response schema for a monitored domain record."""
 
     id: int
+    org_id: int
     name: str
     authorized: bool
     authorization_note: str | None = None

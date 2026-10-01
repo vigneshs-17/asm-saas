@@ -6,54 +6,17 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
-from asm.api.main import app
-from asm.db.models import AlertNotification, Domain
-
-
-@pytest.fixture
-def client(db_engine):
-    """FastAPI TestClient configured with test database."""
-    from uuid import UUID
-
-    from asm.api.deps import get_current_user
-    from asm.db.models import User
-    from asm.db.session import get_db
-
-    session_factory = sessionmaker(bind=db_engine)
-    test_user_id = UUID("00000000-0000-0000-0000-000000000001")
-
-    def override_get_db():
-        with session_factory() as session:
-            yield session
-
-    def override_get_current_user():
-        with session_factory() as session:
-            user = session.get(User, test_user_id)
-            if not user:
-                try:
-                    user = User(id=test_user_id, email="testuser@example.com")
-                    session.add(user)
-                    session.commit()
-                except Exception:
-                    session.rollback()
-                    user = session.get(User, test_user_id)
-            return user
-
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = override_get_current_user
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
-
+from asm.db.models import AlertNotification, Domain, Organization
 
 
 @pytest.mark.db
 def test_alerts_endpoints_404_on_unknown_domain(
-    client: TestClient, db_engine, clean_db: None
+    lifecycle_client: TestClient, lifecycle_org: Organization
 ) -> None:
     """Alerts endpoints must return 404 for non-existent domains."""
+    client = lifecycle_client
     res = client.put(
-        "/domains/99999/alerts",
+        f"/orgs/{lifecycle_org.id}/domains/99999/alerts",
         json={
             "alerts_enabled": True,
             "alert_emails": ["ops@example.com"],
@@ -62,24 +25,25 @@ def test_alerts_endpoints_404_on_unknown_domain(
     )
     assert res.status_code == 404
 
-    res = client.get("/domains/99999/alert-notifications")
+    res = client.get(f"/orgs/{lifecycle_org.id}/domains/99999/alert-notifications")
     assert res.status_code == 404
 
 
 @pytest.mark.db
 def test_alerts_endpoint_422_on_unauthorized_domain(
-    client: TestClient, db_engine, clean_db: None
+    lifecycle_client: TestClient, lifecycle_org: Organization, db_engine
 ) -> None:
     """Configuring alerts on an unauthorized domain must return 422."""
+    client = lifecycle_client
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="unauth-alerts.com", authorized=False)
+        domain = Domain(org_id=lifecycle_org.id, name="unauth-alerts.com", authorized=False)
         session.add(domain)
         session.commit()
         domain_id = domain.id
 
     res = client.put(
-        f"/domains/{domain_id}/alerts",
+        f"/orgs/{lifecycle_org.id}/domains/{domain_id}/alerts",
         json={
             "alerts_enabled": True,
             "alert_emails": ["ops@example.com"],
@@ -91,18 +55,21 @@ def test_alerts_endpoint_422_on_unauthorized_domain(
 
 
 @pytest.mark.db
-def test_alerts_configure_and_disable(client: TestClient, db_engine, clean_db: None) -> None:
+def test_alerts_configure_and_disable(
+    lifecycle_client: TestClient, lifecycle_org: Organization, db_engine
+) -> None:
     """Configuring alerts, updating min severity, and disabling with empty list succeeds."""
+    client = lifecycle_client
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(name="auth-alerts.com", authorized=True)
+        domain = Domain(org_id=lifecycle_org.id, name="auth-alerts.com", authorized=True)
         session.add(domain)
         session.commit()
         domain_id = domain.id
 
     # 1. Enable alerts with 2 emails and HIGH threshold
     res = client.put(
-        f"/domains/{domain_id}/alerts",
+        f"/orgs/{lifecycle_org.id}/domains/{domain_id}/alerts",
         json={
             "alerts_enabled": True,
             "alert_emails": ["sec@example.com", "ops@example.com"],
@@ -117,7 +84,7 @@ def test_alerts_configure_and_disable(client: TestClient, db_engine, clean_db: N
 
     # 2. Disable alerts with empty email list
     res = client.put(
-        f"/domains/{domain_id}/alerts",
+        f"/orgs/{lifecycle_org.id}/domains/{domain_id}/alerts",
         json={
             "alerts_enabled": False,
             "alert_emails": [],
@@ -132,14 +99,15 @@ def test_alerts_configure_and_disable(client: TestClient, db_engine, clean_db: N
 
 @pytest.mark.db
 def test_list_alert_notifications_paginated_and_body(
-    client: TestClient, db_engine, clean_db: None
+    lifecycle_client: TestClient, lifecycle_org: Organization, db_engine
 ) -> None:
     """Listing alert notifications returns entries newest first with full body."""
+    client = lifecycle_client
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
         from asm.db.scans import enqueue_scan
 
-        domain = Domain(name="history-alerts.com", authorized=True)
+        domain = Domain(org_id=lifecycle_org.id, name="history-alerts.com", authorized=True)
         session.add(domain)
         session.flush()
 
@@ -166,7 +134,7 @@ def test_list_alert_notifications_paginated_and_body(
         session.commit()
         domain_id = domain.id
 
-    res = client.get(f"/domains/{domain_id}/alert-notifications")
+    res = client.get(f"/orgs/{lifecycle_org.id}/domains/{domain_id}/alert-notifications")
     assert res.status_code == 200
     notifications = res.json()
     assert len(notifications) == 2
@@ -175,7 +143,9 @@ def test_list_alert_notifications_paginated_and_body(
     assert notifications[1]["body"] in ("Full Body 1 text", "Full Body 2 text")
 
     # Filter by status
-    res = client.get(f"/domains/{domain_id}/alert-notifications?status=pending")
+    res = client.get(
+        f"/orgs/{lifecycle_org.id}/domains/{domain_id}/alert-notifications?status=pending"
+    )
     assert res.status_code == 200
     pending = res.json()
     assert len(pending) == 1

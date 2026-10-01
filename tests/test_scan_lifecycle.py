@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from asm.db.models import ScanRun, ScanStage
+from asm.db.models import Organization, ScanRun, ScanStage
 from asm.discovery import CrtshError
 from asm.worker.exceptions import LostLeaseError, SecurityGateError
 from asm.worker.worker import ASMWorker
@@ -20,6 +20,12 @@ pytestmark = pytest.mark.db
 def client(lifecycle_client: TestClient) -> TestClient:
     """Fixture providing TestClient backed by real clean db session."""
     return lifecycle_client
+
+
+@pytest.fixture
+def org(lifecycle_org: Organization) -> Organization:
+    """Fixture providing real organization where test_user is owner."""
+    return lifecycle_org
 
 
 
@@ -145,15 +151,17 @@ class MockScannerRunner:
         }
 
 
-def test_scan_lifecycle_full_success(client: TestClient, db_engine):
+def test_scan_lifecycle_full_success(client: TestClient, org: Organization, db_engine):
     """Test standard happy-path: all 5 stages transition to succeeded and results are saved."""
     # 1. Register domain
-    resp = client.post("/domains", json={"name": "lifecycle-success.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "lifecycle-success.com", "authorized": True}
+    )
     assert resp.status_code == 201
     domain_id = resp.json()["id"]
 
     # 2. Queue scan run
-    post_resp = client.post(f"/domains/{domain_id}/scans")
+    post_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     assert post_resp.status_code == 202
     scan_id = post_resp.json()["id"]
     assert post_resp.json()["status"] == "queued"
@@ -164,7 +172,7 @@ def test_scan_lifecycle_full_success(client: TestClient, db_engine):
     assert claimed is True
 
     # 4. Verify run status & stages
-    get_resp = client.get(f"/scans/{scan_id}")
+    get_resp = client.get(f"/orgs/{org.id}/scans/{scan_id}")
     assert get_resp.status_code == 200
     data = get_resp.json()
     assert data["status"] == "succeeded"
@@ -177,24 +185,26 @@ def test_scan_lifecycle_full_success(client: TestClient, db_engine):
 
     # 5. Verify results endpoint for each stage
     for stage_name in ("discover", "probe", "portscan", "inspect", "score"):
-        res_resp = client.get(f"/scans/{scan_id}/results/{stage_name}")
+        res_resp = client.get(f"/orgs/{org.id}/scans/{scan_id}/results/{stage_name}")
         assert res_resp.status_code == 200
         assert res_resp.json()["domain"] == "lifecycle-success.com"
 
 
-def test_discover_failure_skips_downstream(client: TestClient, db_engine):
+def test_discover_failure_skips_downstream(client: TestClient, org: Organization, db_engine):
     """Test discover stage failure: downstream stages are skipped and job fails cleanly."""
-    resp = client.post("/domains", json={"name": "discover-fail.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "discover-fail.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     runner = MockScannerRunner(discover_error=CrtshError("Connection to crt.sh timed out"))
     worker = ASMWorker(engine=db_engine, runner=runner)
     assert worker.run_poll_cycle() is True
 
-    get_resp = client.get(f"/scans/{scan_id}")
+    get_resp = client.get(f"/orgs/{org.id}/scans/{scan_id}")
     data = get_resp.json()
     assert data["status"] == "failed"
     assert data["attempts"] == 1
@@ -208,19 +218,21 @@ def test_discover_failure_skips_downstream(client: TestClient, db_engine):
         assert stages_by_name[stage_name]["duration_ms"] == 0
 
 
-def test_portscan_failure_partial_visibility(client: TestClient, db_engine):
+def test_portscan_failure_partial_visibility(client: TestClient, org: Organization, db_engine):
     """Test portscan failure: inspect and score run; run marked failed with partial reports."""
-    resp = client.post("/domains", json={"name": "portscan-fail.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "portscan-fail.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     runner = MockScannerRunner(portscan_error=CrtshError("Simulated portscan socket exhaustion"))
     worker = ASMWorker(engine=db_engine, runner=runner)
     assert worker.run_poll_cycle() is True
 
-    get_resp = client.get(f"/scans/{scan_id}")
+    get_resp = client.get(f"/orgs/{org.id}/scans/{scan_id}")
     data = get_resp.json()
     assert data["status"] == "failed"
 
@@ -232,20 +244,22 @@ def test_portscan_failure_partial_visibility(client: TestClient, db_engine):
     assert stages_by_name["score"]["status"] == "succeeded"
 
     # Succeeded stage results exist
-    assert client.get(f"/scans/{scan_id}/results/discover").status_code == 200
-    assert client.get(f"/scans/{scan_id}/results/probe").status_code == 200
-    assert client.get(f"/scans/{scan_id}/results/inspect").status_code == 200
-    assert client.get(f"/scans/{scan_id}/results/score").status_code == 200
+    assert client.get(f"/orgs/{org.id}/scans/{scan_id}/results/discover").status_code == 200
+    assert client.get(f"/orgs/{org.id}/scans/{scan_id}/results/probe").status_code == 200
+    assert client.get(f"/orgs/{org.id}/scans/{scan_id}/results/inspect").status_code == 200
+    assert client.get(f"/orgs/{org.id}/scans/{scan_id}/results/score").status_code == 200
     # Failed stage has no result
-    assert client.get(f"/scans/{scan_id}/results/portscan").status_code == 404
+    assert client.get(f"/orgs/{org.id}/scans/{scan_id}/results/portscan").status_code == 404
 
 
-def test_zombie_worker_writes_rejected(client: TestClient, db_engine):
+def test_zombie_worker_writes_rejected(client: TestClient, org: Organization, db_engine):
     """Test zombie worker protection: worker with reclaimed lease is rejected on writes."""
-    resp = client.post("/domains", json={"name": "zombie-test.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "zombie-test.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     worker1 = ASMWorker(engine=db_engine, runner=MockScannerRunner(), worker_id="worker-1")
@@ -277,12 +291,16 @@ def test_zombie_worker_writes_rejected(client: TestClient, db_engine):
         worker1._save_stage_success(scan_id, token1, "probe", {"report": 123}, 100)
 
 
-def test_unexpected_exception_requeued_and_poison_pill(client: TestClient, db_engine):
+def test_unexpected_exception_requeued_and_poison_pill(
+    client: TestClient, org: Organization, db_engine
+):
     """Test unexpected exception requeue with backoff and eventual poison pill termination."""
-    resp = client.post("/domains", json={"name": "unexpected-exc.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "unexpected-exc.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     runner = MockScannerRunner(discover_error=RuntimeError("Unexpected kernel socket error"))
@@ -320,12 +338,16 @@ def test_unexpected_exception_requeued_and_poison_pill(client: TestClient, db_en
         assert "Max retry attempts exceeded" in (run.error or "")
 
 
-def test_resume_resets_running_stage_to_pending(client: TestClient, db_engine):
+def test_resume_resets_running_stage_to_pending(
+    client: TestClient, org: Organization, db_engine
+):
     """Test resume after crash resets a stage stuck in 'running' back to 'pending'."""
-    resp = client.post("/domains", json={"name": "resume-test.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "resume-test.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     # Simulate crashed prior attempt: discover succeeded, probe stuck in 'running'
@@ -373,12 +395,14 @@ def test_resume_resets_running_stage_to_pending(client: TestClient, db_engine):
         assert run.error is None  # Error cleared on claim!
 
 
-def test_sigterm_graceful_release(client: TestClient, db_engine):
+def test_sigterm_graceful_release(client: TestClient, org: Organization, db_engine):
     """Test worker graceful release on SIGTERM between stages without consuming an attempt."""
-    resp = client.post("/domains", json={"name": "sigterm-test.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "sigterm-test.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    client.post(f"/domains/{domain_id}/scans")
+    client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
 
     worker = ASMWorker(engine=db_engine, runner=MockScannerRunner())
     claimed = worker.claim_next_job()
@@ -399,18 +423,22 @@ def test_sigterm_graceful_release(client: TestClient, db_engine):
         assert run.attempts == 0
 
 
-def test_authorization_gate_api_and_worker(client: TestClient, db_engine):
+def test_authorization_gate_api_and_worker(client: TestClient, org: Organization, db_engine):
     """Test double authorization gate: API blocks unauthorized domains; worker halts if revoked."""
     # 1. API blocks unauthorized domain (must be true)
-    resp = client.post("/domains", json={"name": "unauthorized-api.com", "authorized": False})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "unauthorized-api.com", "authorized": False}
+    )
     assert resp.status_code == 422
 
     # 2. Register authorized domain
-    resp = client.post("/domains", json={"name": "auth-revoked.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "auth-revoked.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
     # 3. Queue scan
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     # 4. Revoke authorization in DB before worker executes active stages
@@ -424,17 +452,21 @@ def test_authorization_gate_api_and_worker(client: TestClient, db_engine):
     worker = ASMWorker(engine=db_engine, runner=MockScannerRunner())
     assert worker.run_poll_cycle() is True
 
-    get_resp = client.get(f"/scans/{scan_id}")
+    get_resp = client.get(f"/orgs/{org.id}/scans/{scan_id}")
     data = get_resp.json()
     assert data["status"] == "failed"
     assert "revoked" in (data["error"] or "").lower()
 
 
-def test_worker_writes_no_local_files(client: TestClient, db_engine, tmp_path):
+def test_worker_writes_no_local_files(
+    client: TestClient, org: Organization, db_engine, tmp_path
+):
     """Verify that running a scan via DirectScannerRunner writes 0 files to output/."""
-    resp = client.post("/domains", json={"name": "no-local-files.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "no-local-files.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
-    client.post(f"/domains/{domain_id}/scans")
+    client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
 
     output_dir = tmp_path / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -448,39 +480,43 @@ def test_worker_writes_no_local_files(client: TestClient, db_engine, tmp_path):
     assert len(files) == 0
 
 
-def test_api_queue_scan_errors(client: TestClient):
+def test_api_queue_scan_errors(client: TestClient, org: Organization):
     """Test 404 for missing domain and 422 for unauthorized domain."""
     # 404 if domain does not exist
-    resp = client.post("/domains/99999/scans")
+    resp = client.post(f"/orgs/{org.id}/domains/99999/scans")
     assert resp.status_code == 404
 
     # 422 if domain is unauthorized
     create_resp = client.post(
-        "/domains",
+        f"/orgs/{org.id}/domains",
         json={"name": "unauthorized-target.com", "authorized": True},
     )
     domain_id = create_resp.json()["id"]
 
     # Temporarily set authorized to False
-    client.post(f"/domains/{domain_id}/scans")  # works when authorized
+    client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")  # works when authorized
 
 
-def test_api_get_scan_and_results_not_found(client: TestClient):
+def test_api_get_scan_and_results_not_found(client: TestClient, org: Organization):
     """Test 404 responses for nonexistent scan ID or result stage."""
-    resp = client.get("/scans/99999")
+    resp = client.get(f"/orgs/{org.id}/scans/99999")
     assert resp.status_code == 404
 
-    resp = client.get("/scans/99999/results/discover")
+    resp = client.get(f"/orgs/{org.id}/scans/99999/results/discover")
     assert resp.status_code == 404
 
 
-def test_api_list_domain_scans_pagination_and_filter(client: TestClient, db_engine):
-    """Test GET /domains/{id}/scans with limit, offset, and status filter."""
-    resp = client.post("/domains", json={"name": "list-scans.com", "authorized": True})
+def test_api_list_domain_scans_pagination_and_filter(
+    client: TestClient, org: Organization, db_engine
+):
+    """Test GET /orgs/{org_id}/domains/{id}/scans with limit, offset, and status filter."""
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "list-scans.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
     # Queue 1st scan
-    r1 = client.post(f"/domains/{domain_id}/scans")
+    r1 = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     s1_id = r1.json()["id"]
 
     # Run worker to finish 1st scan
@@ -488,11 +524,11 @@ def test_api_list_domain_scans_pagination_and_filter(client: TestClient, db_engi
     worker.run_poll_cycle()
 
     # Queue 2nd scan
-    r2 = client.post(f"/domains/{domain_id}/scans")
+    r2 = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     s2_id = r2.json()["id"]
 
     # List all
-    list_resp = client.get(f"/domains/{domain_id}/scans")
+    list_resp = client.get(f"/orgs/{org.id}/domains/{domain_id}/scans")
     assert list_resp.status_code == 200
     scans = list_resp.json()
     assert len(scans) == 2
@@ -500,27 +536,33 @@ def test_api_list_domain_scans_pagination_and_filter(client: TestClient, db_engi
     assert scans[1]["id"] == s1_id
 
     # Filter by status=succeeded
-    filtered = client.get(f"/domains/{domain_id}/scans?status=succeeded").json()
+    filtered = client.get(f"/orgs/{org.id}/domains/{domain_id}/scans?status=succeeded").json()
     assert len(filtered) == 1
     assert filtered[0]["id"] == s1_id
 
     # Pagination: limit=1
-    paginated = client.get(f"/domains/{domain_id}/scans?limit=1&offset=0").json()
+    paginated = client.get(
+        f"/orgs/{org.id}/domains/{domain_id}/scans?limit=1&offset=0"
+    ).json()
     assert len(paginated) == 1
     assert paginated[0]["id"] == s2_id
 
     # 404 on nonexistent domain
-    assert client.get("/domains/99999/scans").status_code == 404
+    assert client.get(f"/orgs/{org.id}/domains/99999/scans").status_code == 404
 
 
-def test_worker_sanitizes_remote_error_in_db(client: TestClient, db_engine):
+def test_worker_sanitizes_remote_error_in_db(
+    client: TestClient, org: Organization, db_engine
+):
     """Verify remote error HTML/control chars are stripped and truncated to 300 in DB."""
     from asm.discovery import CrtshError
 
-    resp = client.post("/domains", json={"name": "remote-err.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "remote-err.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     raw_remote_error = (
@@ -564,12 +606,14 @@ def test_worker_sanitizes_remote_error_in_db(client: TestClient, db_engine):
         assert "\x1b" not in disc_stage.error
 
 
-def test_terminal_invariant_stage_failure(client: TestClient, db_engine):
+def test_terminal_invariant_stage_failure(client: TestClient, org: Organization, db_engine):
     """Terminal invariant: on stage failure, no stage remains 'running' or 'pending'."""
-    resp = client.post("/domains", json={"name": "terminal-stage-fail.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "terminal-stage-fail.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     runner = MockScannerRunner(discover_error=CrtshError("crt.sh connection timed out"))
@@ -595,12 +639,16 @@ def test_terminal_invariant_stage_failure(client: TestClient, db_engine):
             assert stages_by_name[st].status == "skipped"
 
 
-def test_terminal_invariant_unexpected_exception_max_attempts(client: TestClient, db_engine):
+def test_terminal_invariant_unexpected_exception_max_attempts(
+    client: TestClient, org: Organization, db_engine
+):
     """Terminal invariant: on unexpected exc at max_attempts, no stage is 'running' or 'pending'."""
-    resp = client.post("/domains", json={"name": "terminal-unexp-fail.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "terminal-unexp-fail.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     runner = MockScannerRunner(probe_error=RuntimeError("Simulated unhandled runner crash"))
@@ -645,12 +693,16 @@ def test_terminal_invariant_unexpected_exception_max_attempts(client: TestClient
         assert stages_by_name["score"].status == "skipped"
 
 
-def test_terminal_invariant_poison_pill_lease_recovery(client: TestClient, db_engine):
+def test_terminal_invariant_poison_pill_lease_recovery(
+    client: TestClient, org: Organization, db_engine
+):
     """Terminal invariant: poison pill recovery fails running stages and skips pending stages."""
-    resp = client.post("/domains", json={"name": "terminal-poison-pill.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "terminal-poison-pill.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     # Simulate expired lease with attempts >= max_attempts while probe is running
@@ -709,12 +761,14 @@ def test_terminal_invariant_poison_pill_lease_recovery(client: TestClient, db_en
         assert stages_by_name["score"].status == "skipped"
 
 
-def test_terminal_invariant_security_gate(client: TestClient, db_engine):
+def test_terminal_invariant_security_gate(client: TestClient, org: Organization, db_engine):
     """Terminal invariant: on security gate rejection, no stage remains 'running' or 'pending'."""
-    resp = client.post("/domains", json={"name": "terminal-sec-gate.com", "authorized": True})
+    resp = client.post(
+        f"/orgs/{org.id}/domains", json={"name": "terminal-sec-gate.com", "authorized": True}
+    )
     domain_id = resp.json()["id"]
 
-    scan_resp = client.post(f"/domains/{domain_id}/scans")
+    scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
     # Revoke authorization before worker claims

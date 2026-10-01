@@ -1227,6 +1227,140 @@ In network reconnaissance, an observation failure is not evidence of absence. Wh
   PostgreSQL locks the parent organization row. Transaction A acquires the lock, counts owners, and demotes Bob. Transaction B is blocked at the database engine level until Transaction A commits.
   When Transaction B unblocks, it reads the updated state under the lock, sees that only 1 owner remains, and is aborted with `422 Unprocessable Entity`.
 
+---
+
+# Part 7: v3.1b — Multi-Tenant Isolation, Scoping Choke Points & Invariants
+
+## 1. Plain-English Code Walkthrough
+
+### Insecure Direct Object References (IDOR) & Attack Vectors
+In a multi-tenant application, multiple customers (organizations) share the same underlying database and compute infrastructure. Without rigorous isolation, an attacker can access, modify, or delete another tenant's confidential reconnaissance data simply by manipulating IDs.
+- **IDOR Vector 1 (Cross-Tenant Path Traversal):**
+  An authenticated user of Org B tries to access Org A's endpoint path directly:
+  `GET /orgs/<Org_A_ID>/domains` or `GET /orgs/<Org_A_ID>/scans/<Scan_A_ID>`.
+  *Defense:* Handled at the HTTP perimeter by `require_org_role`. The dependency extracts `org_id` from the URL path and queries `memberships` for `(org_id, current_user.id)`. If no active membership exists, the request is immediately aborted with `404 Not Found`.
+- **IDOR Vector 2 (ID Swapping / Parameter Pollution):**
+  An attacker belonging to Org B requests an endpoint under Org B's valid path, but substitutes an object ID that belongs to Org A:
+  `GET /orgs/<Org_B_ID>/scans/<Scan_A_ID>` or `PUT /orgs/<Org_B_ID>/domains/<Domain_A_ID>/schedule`.
+  *Defense:* Handled at the database query choke points (`get_domain_for_org` and `get_scan_for_org`). The SQL query itself enforces tenant scoping (`WHERE id = :id AND org_id = :org_id`). If the resource belongs to another organization, 0 rows match, and the helper raises `404 Not Found`.
+
+### The Single Choke Point Architectural Pattern
+Relying on individual route handlers to manually inspect and compare tenant IDs is fragile and prone to developer omissions. ASM SaaS centralizes all resource retrieval through dedicated scoping helpers in `src/asm/api/deps.py`:
+- `get_domain_for_org(db, org_id, domain_id) -> Domain`:
+  ```sql
+  SELECT * FROM domains
+  WHERE id = :domain_id AND org_id = :org_id;
+  ```
+- `get_scan_for_org(db, org_id, scan_id) -> ScanRun`:
+  ```sql
+  SELECT scan_runs.* FROM scan_runs
+  JOIN domains ON domains.id = scan_runs.domain_id
+  WHERE scan_runs.id = :scan_id AND domains.org_id = :org_id;
+  ```
+Because filtering occurs directly in the database engine query:
+1. Data belonging to other tenants is never transferred from PostgreSQL to application memory.
+2. If an object does not exist or belongs to another tenant, the result is identical: `404 Not Found`.
+
+### Why Child Tables Do Not Get a Separate `org_id`
+Child entities (`scan_runs`, `scan_stages`, `scan_results`, `scan_changes`, `alert_notifications`) are scoped strictly through foreign keys to `domains` (`domain_id`).
+- **Normalized Data Integrity (3NF):** A scan, change, or alert notification cannot logically exist independently of a domain. Adding `org_id` to child tables creates data denormalization.
+- **Elimination of Conflicting Tenant IDs:** If `scan_runs` had both `domain_id` and `org_id`, it would be possible for bugs or race conditions to create a record where `scan_runs.org_id != domains.org_id`, introducing catastrophic data leakage and authorization ambiguity.
+- **Relational Cascades:** Cascading foreign keys (`ON DELETE CASCADE`) from `organizations -> domains -> scan_runs -> stages/results/changes/alerts` guarantee that removing a domain or organization cleanly and atomically wipes all associated child telemetry.
+
+### Per-Organization Domain Uniqueness vs. Global Uniqueness
+- In single-tenant systems, domain names are typically enforced globally (`UNIQUE(name)`).
+- In a multi-tenant ASM platform, global uniqueness introduces a critical information disclosure vulnerability:
+  If Org A monitors `internal-target.corp` and Org B attempts to add `internal-target.corp`, a global unique constraint would reject Org B's request with `409 Conflict`. Org B would learn that another competitor or organization on the platform is actively targeting or monitoring `internal-target.corp`!
+- **Solution:** The global unique index was dropped and replaced by a composite unique constraint:
+  `UNIQUE (org_id, name)`.
+  Multiple organizations can independently monitor the same domain without learning about each other's reconnaissance targets. Duplicate registrations within the *same* organization are still prevented with `409 Conflict`.
+
+### The 404 Anti-Enumeration Principle
+Whenever a resource is missing or belongs to a foreign organization, the API consistently returns `404 Not Found`.
+If the API returned `403 Forbidden` for existing foreign resources and `404 Not Found` for nonexistent resources:
+An attacker could enumerate resource IDs (`1, 2, 3...`) to distinguish which IDs correspond to real customers on the platform, violating multi-tenant confidentiality. Returning `404` for both states ensures foreign resources are indistinguishable from non-existent resources.
+
+### Safe Migration & Legacy Quarantine Pattern
+When introducing mandatory multi-tenancy (`domains.org_id NOT NULL`) to an existing database with pre-existing domains:
+1. **Never Identify by Name:** User input can create organizations named "Legacy" or "Quarantine". Migration logic must never rely on string names (`name = 'Legacy'`).
+2. **Deterministic System Metadata:** Added `organizations.system_kind` (nullable string, indexed). The migration script creates a quarantine organization with `system_kind = 'legacy_quarantine'`, zero members, and reassigns all legacy domains to it.
+3. **Fail-Closed API:** The `POST /orgs` endpoint rejects any client attempt to set `system_kind`.
+4. **Controlled Migration CLI (`move-domain`):** Administrators can move domains out of quarantine into customer organizations via `asm admin move-domain <domain_id> <target_org_id>`, with strict validation: refuses any source org where `system_kind != 'legacy_quarantine'`, refuses nonexistent targets, and prevents name collisions in the target organization.
+
+---
+
+## 2. Five Step 3.1b Cybersecurity Interview Questions & Answers
+
+### Question 1: What is an Insecure Direct Object Reference (IDOR), how do the two primary vectors (path manipulation vs. ID parameter swapping) differ, and how does SQL-level filtering eliminate them?
+**Answer:**
+- **Definition:**
+  An Insecure Direct Object Reference (IDOR) is an access control vulnerability (OWASP Top 10 Broken Access Control) that occurs when an application uses client-supplied input to directly access an underlying database object without validating whether the authenticated user has authorization to access that specific object.
+- **The Two Primary Vectors:**
+  1. *Vector 1 (Path Manipulation / Cross-Tenant Traversal):* An attacker alters the organization identifier in the URL path (e.g. changing `/orgs/1/domains` to `/orgs/2/domains`). If the application verifies that the user is logged in but fails to verify their membership in Organization 2, the attacker gains access to Organization 2's data.
+  2. *Vector 2 (Parameter Swapping / ID Inversion):* An attacker uses their own legitimate organization path (where they are an authorized member), but requests a resource ID belonging to another organization (e.g. `GET /orgs/1/domains/99`, where domain 99 belongs to Organization 2). If the application checks only that the user belongs to Organization 1 and separately queries `Domain.get(99)` without binding the two, cross-tenant data is leaked.
+- **SQL-Level Elimination:**
+  Eliminating IDOR requires binding the organization identity and the resource identity into the same atomic database query:
+  `SELECT * FROM domains WHERE id = :domain_id AND org_id = :org_id;`
+  By filtering in SQL, the database engine enforces isolation before records ever leave the storage layer. If a user queries a foreign ID under their organization, the query returns zero rows, completely neutralizing ID parameter swapping.
+
+---
+
+### Question 2: Why should domain uniqueness in a multi-tenant ASM platform be scoped per-organization `(org_id, name)` rather than globally across the database? What threat vector does global uniqueness expose?
+**Answer:**
+- **The Information Leakage Vector (Tenant Cross-Reconnaissance):**
+  If `domains.name` is enforced with a global unique constraint, only one tenant can register any given domain name.
+  Suppose Organization A (a sensitive financial institution or defense contractor) is monitoring `stealth-acquisition-target.com` or `internal-sub.corp`.
+  When Organization B (a competitor or malicious actor) attempts to register `stealth-acquisition-target.com`, the API would return `409 Conflict: Domain already registered`.
+  This response leaks critical business and operational intelligence: it proves to Organization B that another customer on the platform is actively monitoring or targeting that specific domain. Attackers could feed lists of high-profile domains, competitors, or target companies into the API to map out which assets other tenants are investigating.
+- **The Defense:**
+  By dropping the global unique constraint and replacing it with a composite unique constraint `UNIQUE (org_id, name)`:
+  1. Organization A and Organization B can both independently register and scan `example.com`.
+  2. Neither organization is aware that the other is monitoring the same asset.
+  3. Scans, stage reports, change detections, and alert digests remain strictly isolated within each tenant's boundary.
+  4. Duplicate registrations within the same organization are still prevented with `409 Conflict`.
+
+---
+
+### Question 3: Explain the Anti-Enumeration Principle in multi-tenant authorization: why must the API return HTTP 404 rather than HTTP 403 when an authenticated user attempts to access an object belonging to a foreign tenant?
+**Answer:**
+- **Status Code Semantics:**
+  - `403 Forbidden`: *"I know who you are, I found the resource you asked for, but you do not have permission to access it."*
+  - `404 Not Found`: *"The requested resource does not exist."*
+- **The Enumeration Attack:**
+  If an API returns `403 Forbidden` when User B requests Resource A (which belongs to Tenant A) and returns `404 Not Found` when requesting Resource C (which does not exist):
+  An attacker can write a sequential loop probing IDs `1..100,000`. Every ID that yields `403` confirms the presence of an active customer resource in another tenant's account. This reveals:
+  1. The total volume and ID distribution of resources across all tenants.
+  2. The rate of new resource creation on the platform.
+  3. Specific resource identifiers that can be targeted in subsequent exploit attempts or social engineering.
+- **The Anti-Enumeration Principle:**
+  In multi-tenant security architecture, a resource that does not belong to the caller's authorized context **must appear not to exist at all**. Returning `404 Not Found` for both non-existent resources and unauthorized foreign resources preserves strict confidentiality and prevents resource existence leakage.
+
+---
+
+### Question 4: In relational database multi-tenancy, why is child-table scoping through foreign keys (normal form) preferred over adding `org_id` to every child table? What risks does denormalizing `org_id` introduce?
+**Answer:**
+- **Relational Consistency and 3NF:**
+  In a well-designed schema, child records (`scan_runs`, `scan_stages`, `scan_results`, `scan_changes`, `alert_notifications`) represent telemetry and workflow state belonging to a parent `domain`. They have no meaning without their domain. Normalization dictates that each fact is stored in one place.
+- **The Risks of Denormalizing `org_id` Across Child Tables:**
+  1. *Conflicting Tenant Attribution:* If `scan_runs` has both `domain_id` and `org_id`, a software defect, race condition, or faulty migration could write a row where `scan_runs.org_id = 2` while `domains.org_id = 1`. This split-brain attribution creates severe security vulnerabilities: which tenant owns the scan? Does a user of Org 2 see Org 1's scan results?
+  2. *Redundant Storage & Index Overhead:* Duplicating `org_id` on high-volume tables (e.g. millions of `scan_results` or `scan_changes` rows) significantly inflates storage consumption, cache footprint, and index maintenance costs.
+  3. *Update Anomalies:* If an admin moves a domain to another organization (e.g. during an acquisition or quarantine recovery), an engine with denormalized `org_id` must update millions of child rows across 6 tables within an expensive transaction, risking lock timeouts and partial updates. With normalized foreign keys, updating `domains.org_id` instantly and atomically re-scopes all child records.
+- **Implementation:**
+  Child entities are scoped securely via `JOIN domains ON domains.id = scan_runs.domain_id WHERE domains.org_id = :org_id`.
+
+---
+
+### Question 5: When performing database migrations with zero-downtime requirements and historical unassigned data, how does the "Quarantine Tenant" pattern with deterministic system flags (`system_kind`) prevent data leakage and race conditions?
+**Answer:**
+- **The Problem of Legacy Data During Breaking Multi-Tenant Migrations:**
+  When migrating a single-tenant database to multi-tenancy, `domains.org_id` must transition from nullable to `NOT NULL`. If existing domains are assigned to a newly created regular customer organization, or if a default organization is assigned members, historical customer data might become instantly visible to arbitrary users.
+- **The Quarantine Tenant Pattern:**
+  1. *Zero-Member Isolation:* The migration creates a designated "Legacy Quarantine" organization that has **zero memberships**. Because no user belongs to it, no API request can ever access, view, or scan its domains.
+  2. *Deterministic Identification via `system_kind`:* Rather than identifying the quarantine tenant by a mutable or user-controlled string (such as `name = 'Legacy'`, which a customer could have legitimately registered), the organization schema includes a dedicated `system_kind` column. The migration sets `system_kind = 'legacy_quarantine'`.
+  3. *Client-Proof Immutability:* API endpoint schemas (`OrgCreate`) omit `system_kind`, preventing users from creating or manipulating system-designated organizations.
+  4. *Controlled Administrative Triage:* A dedicated administrative CLI tool (`asm admin move-domain`) validates that a domain's current owner is strictly `system_kind = 'legacy_quarantine'` before allowing it to be safely reassigned to an active customer organization. This prevents operators from accidentally moving active customer domains between tenants.
+
+
 
 
 
