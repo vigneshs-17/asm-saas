@@ -16,9 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Asynchronous Scan Worker & Job Queue (v2.2)
 - **Database-Backed Job Queue**: Asynchronous worker claiming jobs via PostgreSQL `FOR UPDATE SKIP LOCKED` without external message broker dependencies.
-- **Fenced Execution**: Cryptographic `claim_token` UUID validation per stage to prevent zombie worker overwrites.
+- **Fenced Execution**: Fencing token (`claim_token` UUID) validation per stage to prevent zombie worker overwrites.
 - **Crash Recovery & Heartbeats**: Lease-based worker recovery with exponential backoff and randomized SQL jitter.
-- **Terminal State Invariants**: Atomic guarantee that cancelling or failing a scan transitions any remaining stages cleanly to `failed` or `skipped`.
+- **Terminal State Invariants**: Atomic guarantee that failing a scan transitions any remaining stages cleanly to `failed` or `skipped`.
 - **Containerized Architecture**: Multi-stage, non-root Docker Compose setup for API, worker, and database services.
 
 #### Certificate Transparency Fallback (v2.2.1)
@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Transactional Outbox Email Alerts (v2.4b)
 - **Transactional Outbox Pattern**: Atomic insertion of `alert_notifications` within the same transaction that commits detected changes and marks a scan succeeded, eliminating dual-write risks.
 - **In-Memory Fault Isolation**: Alert formatting runs prior to transaction; formatting errors are captured in `change_detection["alert_error"]` without failing the scan run.
-- **Worker Outbox Delivery**: Dedicated polling (`deliver_pending_alerts`) using `FOR UPDATE SKIP LOCKED`, holding the row lock during SMTP transmission with a 10s socket timeout to eliminate duplicate sends.
+- **Worker Outbox Delivery**: Dedicated polling (`deliver_pending_alerts`) using `FOR UPDATE SKIP LOCKED`, holding the row lock during SMTP transmission with a 10s socket timeout to prevent concurrent duplicate sends; delivery is at-least-once.
 - **CRLF Injection Defense & Sanitization**: Headers sanitized of `\r` and `\n`; email addresses validated via Pydantic `EmailStr`; plain-text digests with finding truncation.
 - **Exponential Backoff**: Failed delivery attempts retried via SQL `next_attempt_at = now() + make_interval(secs => :s)` up to 5 attempts.
 - **Alert Settings & History API**: `PUT /domains/{id}/alerts` for threshold configuration and `GET /domains/{id}/alert-notifications` for delivery audit logs.
@@ -65,15 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Phase 2: Active Host Probing (`asm probe`)**:
   - Mandatory `--authorized` confirmation gate.
   - SSRF protections blocking private, loopback, link-local, and reserved IP ranges.
-  - Dual-stack HTTP/HTTPS web availability probing with in-scope redirect following (max 5) and 64 KB response streaming cap.
+  - HTTPS first, then HTTP, on ports 80/443 web availability probing with in-scope redirect following (max 5) and 64 KB response streaming cap.
 - **Phase 3: TCP Port Scanning (`asm portscan`)**:
   - Asynchronous TCP connect scan over 16 common service ports (`21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 6379, 8080, 8443`).
   - Polite pacing and concurrency limits (max 10 ports per host, max 5 hosts concurrently).
   - Passive and polite banner grabbing with 256-character truncation.
 - **Phase 4: TLS & Header Inspection (`asm inspect`)**:
   - TLS certificate validation (expiration, hostname mismatch, self-signed/untrusted, deprecated protocols).
-  - Security header evaluation (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, info disclosure).
+  - Security header evaluation across six monitored headers (`Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy`) and information-disclosure headers (`Server`, `X-Powered-By`, `X-AspNet-Version`).
 - **Phase 5: Heuristic Risk Scoring (`asm score`)**:
-  - Evidence-based risk scoring algorithm (0-100 score, `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` risk bands).
-  - Transparent score contributors and actionable mitigation recommendations.
+  - Severity-tier triage (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`); host band = worst finding, points only as a tiebreaker; explicitly not CVSS; every finding carries host, port, source and evidence.
 - **CLI Interface**: Single unified command-line entry point with JSON report export.
