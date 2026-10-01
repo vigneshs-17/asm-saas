@@ -6,6 +6,14 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 
 ---
 
+## Project Status
+
+- **v1 CLI**: Done. 5-stage scanner (`discover`, `probe`, `portscan`, `inspect`, `score`).
+- **v2.0.0 Service**: Done. API + database, job queue with crash recovery, Cert Spotter fallback, change detection, scheduled scans, and email alerts. See [CHANGELOG.md](CHANGELOG.md).
+- **Next: v3**: Accounts, organisations, and tenant isolation.
+
+---
+
 ## What It Does
 
 `asm` operates in structured reconnaissance phases:
