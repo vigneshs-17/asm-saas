@@ -2,21 +2,32 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from asm.api.deps import get_current_auth_settings
 from asm.api.routes import public_router, router
 from asm.api.routes_orgs import router as orgs_router
+from asm.api.routes_ui import build_csp_header, ui_router
 
 logger = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: validate auth configuration at startup."""
     settings = get_current_auth_settings()
+    if settings.supabase_publishable_key.startswith("sb_secret_"):
+        raise RuntimeError(
+            "CRITICAL SECURITY MISCONFIGURATION: SUPABASE_PUBLISHABLE_KEY "
+            "contains a secret service key ('sb_secret_...'). "
+            "Only the public publishable/anon key may be configured."
+        )
     if not settings.is_configured:
         logger.warning(
             "SUPABASE_URL is not set! Authentication is not configured. "
@@ -32,6 +43,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.middleware("http")
+async def add_security_headers_middleware(request: Request, call_next):
+    """Enforce strict CSP and security headers on /app, /ui/*, and /static/* responses."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/app") or path.startswith("/ui") or path.startswith("/static"):
+        settings = get_current_auth_settings()
+        if "Content-Security-Policy" not in response.headers:
+            response.headers["Content-Security-Policy"] = build_csp_header(settings.supabase_url)
+        if "X-Content-Type-Options" not in response.headers:
+            response.headers["X-Content-Type-Options"] = "nosniff"
+        if "Referrer-Policy" not in response.headers:
+            response.headers["Referrer-Policy"] = "no-referrer"
+        if path.startswith("/ui"):
+            response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+app.include_router(ui_router)
 app.include_router(public_router)
 app.include_router(router)
 app.include_router(orgs_router)

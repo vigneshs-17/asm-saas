@@ -1,0 +1,322 @@
+/* Concept: A crisp radar-inspired visual hierarchy where calm navigational slate and sea-glass paper frame high-visibility alert markers for exposed assets. */
+
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/static/fonts/IBMPlexSans-Regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/static/fonts/IBMPlexSans-SemiBold.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/static/fonts/IBMPlexMono-Regular.woff2') format('woff2');
+}
+
+:root {
+  --color-abyssal-ink: #141c2b;
+  --color-sea-glass: #f4f6f8;
+  --color-signal-white: #ffffff;
+  --color-cobalt-beacon: #1d5bbf;
+  --color-cobalt-beacon-hover: #164696;
+  --color-tungsten-warning: #c25700;
+  --color-tungsten-bg: #fff8f0;
+  --color-active-veridian: #0d7d55;
+  --color-active-bg: #f0faf5;
+  --color-border-subtle: #d8dee6;
+  --color-muted-text: #4a5568;
+
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'IBM Plex Mono', SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--color-abyssal-ink);
+  background-color: var(--color-sea-glass);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Header & Top Navigation */
+.app-header {
+  background-color: var(--color-signal-white);
+  border-bottom: 1px solid var(--color-border-subtle);
+  padding: 0.85rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.brand-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--color-abyssal-ink);
+  text-decoration: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.brand-badge {
+  background-color: var(--color-abyssal-ink);
+  color: var(--color-signal-white);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+  letter-spacing: 0.05em;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+/* Layout Containers */
+.app-main {
+  flex: 1;
+  max-width: 960px;
+  width: 100%;
+  margin: 2rem auto;
+  padding: 0 1.5rem;
+}
+
+.surface-panel {
+  background-color: var(--color-signal-white);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+  padding: 1.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.surface-panel-header {
+  margin-bottom: 1.25rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.panel-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--color-abyssal-ink);
+  margin-bottom: 0.25rem;
+}
+
+.panel-subtitle {
+  color: var(--color-muted-text);
+  font-size: 0.9rem;
+}
+
+/* Forms & Inputs */
+.form-group {
+  margin-bottom: 1.25rem;
+}
+
+.form-label {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--color-abyssal-ink);
+  margin-bottom: 0.35rem;
+}
+
+.form-input, .form-select {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  color: var(--color-abyssal-ink);
+  background-color: var(--color-signal-white);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+}
+
+.form-input:focus, .form-select:focus {
+  outline: none;
+  border-color: var(--color-cobalt-beacon);
+  box-shadow: 0 0 0 2px rgba(29, 91, 191, 0.15);
+}
+
+.form-inline {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-end;
+}
+
+.form-inline .form-group {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.6rem 1rem;
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background-color 0.15s ease;
+}
+
+.btn-primary {
+  background-color: var(--color-cobalt-beacon);
+  color: var(--color-signal-white);
+}
+
+.btn-primary:hover {
+  background-color: var(--color-cobalt-beacon-hover);
+}
+
+.btn-secondary {
+  background-color: var(--color-signal-white);
+  color: var(--color-abyssal-ink);
+  border-color: var(--color-border-subtle);
+}
+
+.btn-secondary:hover {
+  background-color: var(--color-sea-glass);
+}
+
+.btn-sm {
+  padding: 0.35rem 0.65rem;
+  font-size: 0.8rem;
+}
+
+/* Data Table */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.data-table th {
+  padding: 0.75rem 1rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-muted-text);
+  border-bottom: 1px solid var(--color-border-subtle);
+  background-color: var(--color-sea-glass);
+}
+
+.data-table td {
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.data-table tr:last-child td {
+  border-bottom: none;
+}
+
+/* Status Badges */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 3px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.status-verified {
+  background-color: var(--color-active-bg);
+  color: var(--color-active-veridian);
+  border-color: rgba(13, 125, 85, 0.3);
+}
+
+.status-pending, .status-lapsed {
+  background-color: var(--color-tungsten-bg);
+  color: var(--color-tungsten-warning);
+  border-color: rgba(194, 87, 0, 0.3);
+}
+
+/* Code & DNS Inspection Blocks */
+.code-block {
+  font-family: var(--font-mono);
+  background-color: var(--color-sea-glass);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+  font-size: 0.875rem;
+  word-break: break-all;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.code-value {
+  flex: 1;
+}
+
+/* Alert Boxes & Results */
+.alert-box {
+  padding: 0.85rem 1rem;
+  border-radius: 4px;
+  font-size: 0.9rem;
+  margin-top: 1rem;
+  border: 1px solid var(--color-border-subtle);
+}
+
+.alert-info {
+  background-color: var(--color-sea-glass);
+  color: var(--color-abyssal-ink);
+}
+
+.alert-error {
+  background-color: #fdf2f2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+
+.alert-success {
+  background-color: var(--color-active-bg);
+  color: var(--color-active-veridian);
+  border-color: rgba(13, 125, 85, 0.3);
+}
+
+/* Utilities */
+.hidden {
+  display: none !important;
+}
+
+.action-row {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.text-muted {
+  color: var(--color-muted-text);
+  font-size: 0.875rem;
+}

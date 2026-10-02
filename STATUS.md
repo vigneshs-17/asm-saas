@@ -12,12 +12,20 @@
 - v3.1b Tenant Isolation: Foreign keys, strict organization-scoped queries, anti-enumeration (404 on cross-tenant), legacy quarantine migration.
 - v3.2 Domain Verification: Proof of DNS control via DNS TXT (`_asm-verify.<domain>`), continuous re-verification, scan gating, break-glass operator overrides with expiry.
 - v3.3 Audit Log: Append-only audit_events table, trigger against app tampering, 15 structured actions, and organization audit API.
+- v3.4a Dashboard Shell & Verification UI: Server-rendered dashboard (FastAPI + Jinja2 + HTMX), Supabase browser authentication, organization switcher, domains inventory, and DNS TXT verification UI.
 
 ## In Progress
 - None.
 
 ## Next
-- v3.4: Dashboard.
+- v3.4b: Scans, results, and changes UI.
+
+## Skills Plan
+- **Installed**: Docker (x4: `docker-build-strategies`, `docker-compose-patterns`, `docker-destructive-guardrails`, `docker-project-foundations`), `arena`, `frontend-design`, `webapp-testing`, `security-and-hardening`.
+- **Later (each only when its phase starts)**:
+  - `greensock/gsap-skills`: v3.5 landing page.
+  - `coreyhaines31/marketingskills` or `claude-seo`: only if launching publicly.
+  - `remotion-dev/skills`: demo video.
 
 ## Known Limitations
 - DNS lookup during manual check runs while holding the domain database row lock (bounded about 5s).

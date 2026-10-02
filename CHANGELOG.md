@@ -47,6 +47,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Organization Audit API**: `GET /orgs/{org_id}/audit-events` restricted to `admin` and `owner` roles (viewer 403, non-member 404) with `domain_id` and `action` filters and keyset cursor pagination (`limit` capped at 100, `before_id` cursor, ordered by `id DESC`).
 - **Transactional Atomicity**: Single helper `record_event(session, ...)` adds events to the caller's session without committing or flushing, guaranteeing that failed or rolled-back operations never leave orphan audit records.
 
+#### Dashboard Shell & Domain Verification UI (v3.4a)
+- **FastAPI + Jinja2 + HTMX Architecture**: Lightweight server-rendered dashboard without node or npm build dependencies, adding runtime dependency `jinja2>=3.1.4` and bundling templates and static assets in Python package data.
+- **Client Application Shell (`GET /app`)**: Public application shell container delivering Supabase project URL and publishable key via HTML body `data-*` attributes with zero inline scripts or styles.
+- **Supabase Browser Authentication**: Direct client-side sign-in with `@supabase/supabase-js` UMD bundle storing session in `sessionStorage` (memory module variable updated via `onAuthStateChange`). User passwords go directly to Supabase and never touch application server memory.
+- **Synchronous HTMX Token Propagation**: Synchronous `htmx:configRequest` event listener injecting `Authorization: Bearer <token>` into all outbound HTMX fragment requests, with automatic single-retry token refresh on HTTP 401.
+- **Read-Only HTML Fragment Routes**:
+  - `GET /ui/empty-org`: Onboarding view for users without an organization.
+  - `GET /ui/orgs/{org_id}/domains`: Organization domain inventory with sentence-case status badges and role-gated domain addition form.
+  - `GET /ui/orgs/{org_id}/domains/{domain_id}`: DNS TXT proof-of-control verification details with record copy buttons, immediate verification check, and token rotation.
+- **Zero Duplicate Write Logic**: All write operations in the browser dispatch asynchronous `fetch()` requests directly to existing JSON API endpoints (`POST /orgs`, `POST /orgs/{org_id}/domains`, `POST .../verification/check`, `POST .../verification/rotate`) and refresh views with `htmx.ajax()`.
+- **Strict Content Security Policy & Headers**: HTTP security headers middleware on `/app`, `/ui/*`, and `/static/*` enforcing `default-src 'self'`, `script-src 'self'`, `style-src 'self'`, `font-src 'self'`, `img-src 'self' data:`, `connect-src 'self' <SUPABASE_URL>`, `frame-ancestors 'none'`, `base-uri 'self'`, `form-action 'self'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on all `/ui/*` endpoints.
+- **HTMX Inline Style Injection Prevention**: Configured `<meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false, "allowScriptTags": false}'>` in `<head>` preventing HTMX from injecting inline indicator `<style>` tags blocked by CSP.
+- **XSS & DOM Hardening**: Jinja autoescaping enabled on all templates, `htmx.config.allowEval = false`, `htmx.config.allowScriptTags = false`, zero occurrences of `innerHTML` in client code, and dynamic check outcome and error rendering using `textContent` only.
+- **Vendored Static Assets**: Pinned releases for `htmx` (2.0.11), `@supabase/supabase-js` (2.117.2), and self-hosted IBM Plex Sans and Mono font files with SIL Open Font License 1.1, verified and tracked in `src/asm/static/vendor/VENDOR.md`.
+
 ### Changed
 - **BREAKING (API)**: Removed `authorized` and `authorization_note` fields from `DomainCreate` request schema and database models. Client can no longer assert authorization.
 - **BREAKING (Database)**: Migration `0008_domain_verification` resets all existing domains to `verification_status = 'pending'`, pausing automated scheduled scans until DNS verification is completed.

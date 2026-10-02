@@ -14,7 +14,8 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 - **v3.1b Tenant Isolation**: Done. Foreign keys, row-level organization fences, and anti-enumeration defenses.
 - **v3.2 Domain Verification**: Done. Domain ownership proof via DNS TXT, continuous background re-verification, operator overrides, and scan gating.
 - **v3.3 Audit Log & Event Tracking**: Done. Append-only audit events table, trigger against app tampering, 15 structured actions, and organization audit API.
-- **Next: v3.4**: Dashboard.
+- **v3.4a Dashboard Shell & Verification UI**: Done. Server-rendered dashboard (FastAPI + Jinja2 + HTMX), Supabase browser authentication, organization management, domains list, and DNS TXT verification UI.
+- **Next: v3.4b**: Scans, results, and changes UI.
 
 ---
 
@@ -448,7 +449,49 @@ curl -i "http://127.0.0.1:8000/orgs/1/audit-events?domain_id=1&action=verificati
 
 ---
 
-### 7. Admin CLI: Migrating Quarantine Domains
+### 7. Dashboard (v3.4a)
+
+A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templates, and HTMX with zero node/npm build dependencies.
+
+#### How to Run
+1. Set `SUPABASE_PUBLISHABLE_KEY` (public, non-secret client key) in `.env`:
+   ```bash
+   SUPABASE_PUBLISHABLE_KEY=your-supabase-publishable-key
+   ```
+2. Start the API service:
+   ```bash
+   docker compose up -d api
+   ```
+3. Open `http://127.0.0.1:8000/app` in your browser.
+
+#### What Works
+- **Sign-in:** Browser signs in directly via Supabase Auth using `supabase-js`. The user password goes only to Supabase and never touches application server memory.
+- **Organization Switcher:** Switch between active organizations from the top navigation bar.
+- **Create Organization:** New users without an organization are presented with a creation screen to establish their first organization.
+- **Domains List:** View all monitored domains for the selected organization with status badges and verification states.
+- **Add Domain:** Monitored root domain registration form (visible to `admin` and `owner` roles).
+- **Domain Verification Page:** Full DNS TXT proof-of-control inspection view including:
+  - Verification host record name and value with one-click clipboard copy buttons.
+  - "Check now" button displaying real-time check outcome (`match`, `absent`, `unknown`) and detailed failure reason.
+  - "Rotate token" button (with confirmation modal) to generate a fresh token if an existing record is compromised.
+- **Role-Based Views:** Users with the `viewer` role see a read-only interface; write forms and state mutation buttons are omitted from the rendered DOM (and writes remain enforced by the API).
+
+#### Security Design
+- **All Writes Reuse the Existing JSON API:** The dashboard introduces zero new write endpoints and no duplicated business logic. Form submissions and action triggers dispatch `fetch()` requests directly to `/orgs`, `/orgs/{org_id}/domains`, and `/orgs/{org_id}/domains/{domain_id}/verification/*`, then refresh DOM fragments via `htmx.ajax()`.
+- **Bearer Token Authorization:** Every HTMX request and `fetch()` call attaches `Authorization: Bearer <access_token>` synchronously via `htmx:configRequest`. This is inherently immune to Cross-Site Request Forgery (CSRF).
+- **XSS Mitigation Trade-off:** Storing access tokens in browser memory introduces potential XSS exposure if malicious JavaScript executes. This risk is defended through layered controls:
+  - Strict Content Security Policy (CSP) on `/app`, `/ui/*`, and `/static/*`: `default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' <SUPABASE_URL>; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`.
+  - Zero inline `<script>` tags, zero inline `<style>` tags, and zero inline HTML event handlers.
+  - `htmx.config.allowEval = false` and `htmx.config.allowScriptTags = false` configured in JS and via `<meta name="htmx-config">`.
+  - Jinja autoescape enabled on all templates.
+  - API responses rendered dynamically via `textContent` only; zero occurrences of `innerHTML`.
+- **Cache Invalidation:** `Cache-Control: no-store` header is enforced on all `/ui/*` HTML fragment responses to prevent caching sensitive tenant data.
+- **Session Storage:** Tokens are held in module memory and backed by `sessionStorage` (cleared when the browser tab closes, never persisted to `localStorage`).
+- **Vendored Libraries:** HTMX `2.0.11` and Supabase JS `2.117.2` UMD builds are vendored locally with pinned versions, official upstream URLs, and cryptographic SHA-256 checksums documented in `src/asm/static/vendor/VENDOR.md`.
+
+---
+
+### 8. Admin CLI: Migrating Quarantine Domains
 
 Migration `0007_tenant_isolation` safely moved pre-existing unscoped domains into an isolated organization with `system_kind = 'legacy_quarantine'` (with zero members, rendering it inaccessible to all normal users).
 
@@ -462,7 +505,7 @@ Security invariants enforced:
 - **Per-Org Name Collision Check:** Exits with code 1 if the target organization already monitors that domain name.
 
 
-### 8. Local Database Testing Setup & Migrations
+### 9. Local Database Testing Setup & Migrations
 
 #### How the Test Suite Creates the Database Schema
 The pytest integration test suite (`pytest -m db`) creates its database schema programmatically via SQLAlchemy:

@@ -3,7 +3,7 @@
 import sys
 from functools import lru_cache
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +28,22 @@ class Settings(BaseSettings):
         default=None,
         description="Optional PostgreSQL connection string for test suite (must end in _test)",
     )
+    supabase_publishable_key: str = Field(
+        default="",
+        description="Public non-secret Supabase publishable key for browser client authentication",
+    )
+
+    @field_validator("supabase_publishable_key")
+    @classmethod
+    def validate_publishable_key(cls, v: str) -> str:
+        cleaned = v.strip()
+        if cleaned.startswith("sb_secret_"):
+            raise ValueError(
+                "CRITICAL SECURITY MISCONFIGURATION: SUPABASE_PUBLISHABLE_KEY "
+                "contains a secret service key ('sb_secret_...'). "
+                "Only the public publishable/anon key may be configured."
+            )
+        return cleaned
 
 
 @lru_cache
@@ -36,6 +52,12 @@ def get_settings() -> Settings:
     try:
         return Settings()  # type: ignore[call-arg]
     except ValidationError as err:
+        for error in err.errors():
+            if error.get("loc") and error["loc"][0] == "supabase_publishable_key":
+                msg = error.get("msg", "Invalid SUPABASE_PUBLISHABLE_KEY")
+                raise RuntimeError(
+                    f"CRITICAL SECURITY MISCONFIGURATION: {msg}"
+                ) from err
         missing_fields = [
             error["loc"][0]
             for error in err.errors()

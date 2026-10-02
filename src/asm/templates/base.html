@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}ASM SaaS - Attack Surface Management{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false, "allowScriptTags": false}'>
+  <script src="/static/vendor/htmx.min.js" defer></script>
+  <script src="/static/vendor/supabase.min.js" defer></script>
+  <script src="/static/js/app.js" defer></script>
+</head>
+<body data-supabase-url="{{ supabase_url }}" data-supabase-key="{{ supabase_publishable_key }}">
+  {% block body %}{% endblock %}
+</body>
+</html>

@@ -1739,3 +1739,126 @@ The audit log is accessible via `GET /orgs/{org_id}/audit-events`:
      - `target_id`: str(domain_id)
      - `metadata`: `{"from_org_id": source_org_id}`
   Both organizations receive a record of the asset movement without breaching tenant data isolation.
+
+---
+
+# Part 9: Phase v3.4a — Dashboard Shell, Organization Navigation & Domain Verification UI
+
+## 1. Plain-English Code Walkthrough
+
+### `src/asm/api/routes_ui.py`
+- **What it is:** Read-only, server-rendered HTML endpoints for the application shell and dynamic HTMX fragments.
+- **Why it exists:** Provides the web presentation layer for the ASM dashboard without requiring a Node.js runtime, npm build pipeline, or heavy Single Page Application (SPA) framework.
+- **Key Endpoints & Functions:**
+  - `GET /app`: Public application container rendering `templates/app.html`. Injects public Supabase configuration (`SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY`) via HTML `data-*` attributes on `<body>`. Contains no private tenant data and requires no initial server authentication.
+  - `GET /ui/empty-org`: Read-only partial rendering `templates/partials/empty_org.html` for authenticated users with zero organizations. Requires a valid JWT via `get_current_user`.
+  - `GET /ui/orgs/{org_id}/domains`: Read-only partial rendering `templates/partials/domains_list.html`. Protected by the existing tenant choke point `require_org_role("viewer")`. Passes `user_role` into the template so that the "Add domain" form is only rendered for `admin` and `owner` roles.
+  - `GET /ui/orgs/{org_id}/domains/{domain_id}`: Read-only partial rendering `templates/partials/domain_detail.html`. Protected by both `require_org_role("viewer")` and `get_domain_for_org(db, org_id, domain_id)`. Renders DNS TXT verification proof instructions, copy buttons, and action buttons ("Check now", "Rotate token") for `admin`/`owner` roles.
+- **Anti-Enumeration & Cache Controls:**
+  - Unauthenticated requests to `/ui/*` endpoints return HTTP 401 Unauthorized.
+  - Non-members attempting to access foreign organizations or domains receive HTTP 404 Not Found (via `require_org_role` and `get_domain_for_org`), strictly preventing tenant existence enumeration.
+  - All `/ui/*` endpoints emit `Cache-Control: no-store` to prevent caching sensitive tenant HTML in browser history or shared proxy caches.
+
+### `src/asm/templates/`
+- **What it is:** Semantic HTML5 templates rendered with Jinja2 (`autoescape=True`).
+- **Templates Structure:**
+  - `base.html`: The root HTML scaffold. Links self-hosted IBM Plex Sans/Mono fonts and `app.css`. Includes `<meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false, "allowScriptTags": false}'>` in `<head>` to block HTMX from injecting inline `<style>` tags that violate CSP. Defers loading vendored `htmx.min.js`, `supabase.min.js`, and `app.js`. Zero inline scripts or styles.
+  - `app.html`: The application container extending `base.html`. Renders the public sign-in card (`#auth-section`), top navigation bar with organization switcher and sign-out button, and empty `#main-content-area` target for HTMX fragment injection.
+  - `partials/empty_org.html`: Form enabling first-time users to create their first organization via `POST /orgs`.
+  - `partials/domains_list.html`: Table of monitored domains displaying status badges ("Status: pending", "Status: verified", "Status: lapsed") in sentence case, fully readable without relying on color alone.
+  - `partials/domain_detail.html`: Detailed verification inspection view. Contains the live outcome target `<div id="verification-check-result" aria-live="polite"></div>` without hiding classes, allowing instant accessibility announcements and persistent UI rendering across HTMX settle cycles.
+
+### `src/asm/static/js/app.js`
+- **What it is:** Vanilla client-side script managing Supabase authentication, HTMX request headers, and UI state synchronization.
+- **Key Mechanics:**
+  - **Supabase Authentication:** Reads configuration from document body `data-*` attributes and initializes `supabase.createClient()` with `persistSession: true` and `storage: window.sessionStorage`.
+  - **Memory Token Storage:** Maintains `currentAccessToken` in module memory. Synchronizes token state via `supabaseClient.auth.onAuthStateChange()`.
+  - **Token Refresh Separation:** Distinguishes between token refresh and sign-in. On `TOKEN_REFRESHED`, it updates `currentAccessToken` and returns immediately without resetting the UI. Guarded by `isAuthenticated` so `onUserAuthenticated()` executes exactly once per sign-in.
+  - **Synchronous Header Injection:** Listens for `htmx:configRequest` and attaches `Authorization: Bearer <currentAccessToken>` synchronously to every outgoing HTMX request.
+  - **Automated 401 Recovery:** Listens for `htmx:responseError`. Upon encountering an HTTP 401, attempts a single `refreshSession()` call and retries the failed HTMX request. If the refresh fails, it signs the user out cleanly and resets UI state.
+  - **Zero Duplicated Writes:** Write operations intercept DOM submissions and dispatch asynchronous `fetch()` calls to existing JSON REST endpoints (`POST /orgs`, `POST /orgs/{org_id}/domains`, etc.). Once the write succeeds, `htmx.ajax('GET', ...)` swaps the updated HTML fragment.
+  - **Strict XSS Defense:** Zero occurrences of the word `innerHTML`. All dynamic check results, error messages, and validation details are rendered using safe DOM nodes and `textContent` only.
+
+### `src/asm/static/` (Vendored Assets & Fonts)
+- **`vendor/VENDOR.md`:** Records pinned versions, official upstream release URLs, cryptographic SHA-256 hashes, and security advisory audit dates for HTMX 2.0.11 and Supabase JS 2.117.2.
+- **`fonts/`:** Self-hosted WOFF2 font files for IBM Plex Sans (Regular, SemiBold) and IBM Plex Mono (Regular), accompanied by the SIL Open Font License 1.1 (`OFL.txt`). Eliminates external font CDN requests and guarantees CSP compatibility.
+- **`css/app.css`:** Scoped CSS variables based on a 6-color palette derived from operational reconnaissance: Abyssal Ink (`#141c2b`), Sea Glass (`#f4f6f8`), Signal White (`#ffffff`), Cobalt Beacon (`#1d5bbf`), Tungsten Warning (`#c25700`), and Active Veridian (`#0d7d55`). Text contrast ratios exceed WCAG AA 4.5:1.
+
+---
+
+## 2. Five v3.4a Interview Questions & Answers
+
+### Question 1: What is Content Security Policy (CSP), how is it enforced in v3.4a, and why is `default-src 'self'` with zero inline scripts or styles critical for server-rendered web applications?
+**Answer:**
+- **What CSP Is:**
+  Content Security Policy (CSP) is an HTTP response header that restricts the resources (scripts, styles, fonts, images, network connections) the browser is permitted to load and execute for a given origin. It serves as the primary defense-in-depth barrier against Cross-Site Scripting (XSS), data exfiltration, and clickjacking.
+- **Configuration in v3.4a:**
+  The FastAPI security headers middleware applies the following policy on `/app`, `/ui/*`, and `/static/*`:
+  ```http
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' https://<SUPABASE_PROJECT_ID>.supabase.co; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+  ```
+- **Why `default-src 'self'` and Zero Inline Directives Are Critical:**
+  1. *Neutralizing Injected Payloads:* By default, browsers execute `<script>...</script>` tags or `javascript:...` URLs embedded in HTML. Under a strict CSP without `'unsafe-inline'`, any injected `<script>` tag or attribute event handler (`onclick=...`) is blocked from executing by the browser engine.
+  2. *Blocking Unauthorized Network Exfiltration:* `connect-src 'self' <SUPABASE_URL>` restricts network dispatch (`fetch`, `XMLHttpRequest`, `WebSocket`) solely to the application origin and the designated Supabase authentication endpoint. Even if an attacker finds an unexpected script execution vector, they cannot exfiltrate stolen tokens or customer data to an external command-and-control server.
+  3. *Eliminating Clickjacking and Framing:* `frame-ancestors 'none'` prevents the application from being embedded in an `<iframe>` on any third-party domain, defeating UI redressing attacks.
+  4. *HTMX Inline Style Defense:* HTMX by default injects an inline `<style>` element for progress indicators. Because `'unsafe-inline'` is omitted, CSP blocks this injected style. Configuring `<meta name="htmx-config" content='{"includeIndicatorStyles": false, ...}'>` ensures compliance without weakening CSP directives.
+
+---
+
+### Question 2: Why did the v3.4a dashboard adopt Bearer token authentication in the `Authorization` header rather than session cookies, what security trade-off does this make between CSRF and XSS, and how is that trade-off mitigated?
+**Answer:**
+- **The Choice of Bearer Headers:**
+  In v3.4a, every HTMX and fetch request carries `Authorization: Bearer <access_token>`, which is validated on the backend by the existing `get_current_user` dependency.
+- **CSRF Immunity vs. XSS Susceptibility Trade-Off:**
+  - *Cookie-Based Auth (Vulnerable to CSRF by Default):* Browsers automatically attach ambient session cookies to all requests targeting a domain, even requests initiated cross-origin by malicious third-party sites (e.g. via image tags, cross-origin forms, or malicious fetch). Protecting cookies requires SameSite flags, custom headers, and anti-CSRF synchronizer tokens.
+  - *Bearer Token Auth (Immune to CSRF):* Browsers never automatically attach custom `Authorization: Bearer <token>` headers to cross-origin requests. An attacker on `evil.com` cannot force a user's browser to submit authenticated mutations to `/orgs` or `/domains`. Cross-Site Request Forgery is structurally impossible.
+  - *The Trade-Off (XSS Exposure):* Unlike `HttpOnly` cookies, which JavaScript cannot read, Bearer tokens must be accessible to client-side scripts to inject them into headers. If an attacker achieves arbitrary JavaScript execution (XSS), they can read the token from application memory or storage.
+- **Multi-Layered Mitigation of XSS Risk:**
+  To make this trade-off defensible, XSS is defended with defense-in-depth:
+  1. *Zero Inline Scripts or Styles:* Enforced by CSP without `'unsafe-inline'`.
+  2. *Automatic Template Escaping:* Jinja2 runs with autoescape enabled; untrusted domain or organization names are HTML-entity encoded (`<` becomes `&lt;`, `"` becomes `&#34;`).
+  3. *DOM Mutation Hardening:* Client code in `app.js` renders all dynamic content (check outcomes, error messages) using `textContent` only; `innerHTML` is banned from the codebase.
+  4. *Ephemeral Session Storage:* Tokens reside in module memory and are persisted only to `sessionStorage` (which expires when the tab closes and is never shared across browser windows or stored permanently on disk like `localStorage`).
+
+---
+
+### Question 3: Describe the "HTMX Settle" class re-application bug observed in headless Chrome testing. What is HTMX's settle lifecycle, and why was the fix to remove `class="hidden"` from the response template?
+**Answer:**
+- **The Observed Bug:**
+  When a user clicked "Check now" on the domain verification view, `app.js` executed `POST .../verification/check`, received the JSON response, updated the DOM container `#verification-check-result`, and removed the `hidden` class (`classList.remove('hidden')`). However, after ~20ms, the result container reverted to `class="hidden"`, rendering the verification result invisible to the user.
+- **Root Cause: The HTMX Settle Phase:**
+  HTMX processes DOM updates in distinct lifecycle steps:
+  1. *AJAX Fetch:* Retrieves the HTML fragment from the server.
+  2. *Swap:* Replaces the target DOM element with the incoming HTML partial.
+  3. *Settle Phase (~20ms delay):* After the swap, HTMX pauses briefly before "settling" the DOM. During settling, HTMX re-synchronizes element attributes from the swapped fragment to apply CSS transition classes.
+  Because the server template `templates/partials/domain_detail.html` originally defined `<div id="verification-check-result" class="hidden"></div>`, the incoming fragment contained `class="hidden"`. When `loadDomainDetail()` refreshed the DOM, HTMX swapped the fragment, and then its settle phase re-applied `class="hidden"` from the partial template, clobbering the dynamic `.classList.remove('hidden')` mutation executed in JavaScript!
+- **The Fix:**
+  1. *Template Redesign:* Removed `class="hidden"` from the partial template entirely and replaced it with accessibility semantics: `<div id="verification-check-result" aria-live="polite"></div>`.
+  2. *Execution Sequence:* In `app.js`, domain detail is refreshed first via `loadDomainDetail(orgId, domainId)`. Once the HTMX swap and settle promise resolves (`.then()`), the JavaScript renders the check outcome into the freshly swapped `#verification-check-result` container.
+  3. *Clean Accessibility:* When empty, the container takes zero visual space. When populated, screen readers announce the live result via `aria-live="polite"` and the alert box remains visible indefinitely.
+
+---
+
+### Question 4: Why does the dashboard send write operations directly to existing JSON REST endpoints (`POST /orgs`, `POST /orgs/{id}/domains`, etc.) rather than introducing dedicated HTML-returning POST routes?
+**Answer:**
+- **1. Single Source of Truth for Business & Security Logic:**
+  All domain validation, RFC compliance checks, organization limits, DNS cooldowns, and cryptographic token generation live in the existing API route handlers and services. Adding dedicated HTML form-handling POST endpoints would duplicate this logic or create parallel validation code paths that inevitably drift over time.
+- **2. Unbroken Audit Trail & Transactional Integrity:**
+  Phase v3.3 established an append-only audit log recording 15 structured actions. The existing JSON endpoints (`POST /orgs`, `POST .../verification/check`, etc.) already contain tested, transactionally atomic audit logging hooks (`record_event`). Reusing these endpoints guarantees that web actions generate the identical audit events as direct API or CLI actions.
+- **3. Unified Rate Limiting & Row Locking:**
+  Verification checks require database row locks (`SELECT ... FOR UPDATE`) to enforce the 30-second verification cooldown across concurrent requests. Route handlers already encapsulate this lock-and-verify logic.
+- **4. Architectural Simplicity:**
+  The server-rendered UI endpoints (`/ui/*`) remain purely read-only (`GET`). Write operations in `app.js` dispatch standard `fetch()` calls with JSON payloads, handle typed API responses, and then instruct HTMX to refresh the corresponding read-only HTML fragment (`htmx.ajax('GET', ...)`). The frontend is a consumer of the exact same API available to automated CLI tools.
+
+---
+
+### Question 5: Why are third-party JavaScript libraries (HTMX and Supabase JS) vendored locally within the repository instead of loading them from public CDNs, and why are their SHA-256 hashes recorded in `VENDOR.md`?
+**Answer:**
+- **1. Elimination of Third-Party Supply-Chain Risk:**
+  Loading scripts from external CDNs (`<script src="https://cdn.jsdelivr.net/...">`) creates a direct supply-chain dependency. If the CDN provider suffers an account takeover, DNS hijacking, or infrastructure compromise, attackers can serve malicious JavaScript directly into the application, bypassing authentication and capturing customer data. Vendoring code into the repository ensures that all executed code is version-controlled and inspected.
+- **2. Strict Content Security Policy (No External Script Origins):**
+  Using a third-party CDN requires adding its origin to `script-src` in the CSP (`script-src 'self' https://unpkg.com`). This increases attack surface: an attacker who discovers an open redirect or hosting exploit on that CDN can load arbitrary scripts. Keeping dependencies under `/static/vendor/` permits a minimal `script-src 'self'` policy.
+- **3. Deterministic Builds & Air-Gapped / Offline Reliability:**
+  Production containers and CI test runs build reproducible wheels via Docker. If an external CDN experiences an outage or unpublishes a release, external builds and runtime environments break. Vendored assets guarantee that Docker images build and run reliably in isolated or air-gapped network environments without external internet access.
+- **4. Cryptographic Integrity via `VENDOR.md`:**
+  Recording the exact package version, official upstream tarball URL, and cryptographic SHA-256 hash in `src/asm/static/vendor/VENDOR.md` establishes an immutable chain of custody. Any developer, auditor, or automated scanner can verify that the vendored `.js` files match the official upstream releases byte-for-byte without unauthorized modifications or backdoor injections.

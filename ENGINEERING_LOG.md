@@ -49,6 +49,42 @@
 - **Root cause:** Manual retyping and copy-pasting across conversation turns led to drift and unverified claims.
 - **Fix / Prevention:** The repo owner runs tests directly in his terminal before every commit, avoiding synthetic or misaligned test count reporting.
 
+### Entry I: Plan Used Unscoped Write Paths for Domain Verification Endpoints
+- **What happened:** The initial v3.4a implementation plan proposed writing to `/domains/{domain_id}/verification/check` and `/domains/{domain_id}/verification/rotate`.
+- **Root cause:** Author referenced pre-v3.1b unscoped endpoints from memory instead of verifying the current tenant-isolated route signatures introduced in v3.1b.
+- **Fix:** Caught in design review. Updated client fetch calls and plan to use the exact tenant-isolated write paths: `/orgs/{org_id}/domains/{domain_id}/verification/check` and `/orgs/{org_id}/domains/{domain_id}/verification/rotate`.
+- **How to prevent it:** Always inspect the actual OpenAPI route table or router definitions before specifying client API URLs.
+
+### Entry J: Synchronous `htmx:configRequest` vs Asynchronous `supabase.auth.getSession()`
+- **What happened:** Attempting to inject the Bearer auth token into HTMX requests dynamically using `supabase.auth.getSession()` failed because HTMX's `htmx:configRequest` event is strictly synchronous.
+- **Root cause:** Awaiting a promise inside `htmx:configRequest` does not pause the dispatch; the request was dispatched immediately without the `Authorization` header.
+- **Fix:** Stored the current JWT access token in a module-level variable updated synchronously by Supabase's `onAuthStateChange` listener. The `htmx:configRequest` listener reads this variable synchronously.
+- **How to prevent it:** Never attempt asynchronous fetching inside synchronous lifecycle hooks; maintain in-memory state driven by event listeners.
+
+### Entry K: Invisible Check Result Due to HTMX Settle Reapplying Classes
+- **What happened:** After clicking "Check now", the verification outcome was briefly rendered into `#verification-check-result` but immediately disappeared, leaving the container hidden. Found by reproducing in headless Chrome.
+- **Root cause:** HTMX's settle phase runs ~20ms after swapping the HTML partial and reapplies the attributes from the response template. Because the template had `class="hidden"`, HTMX reapplied `class="hidden"` after `app.js` had removed it.
+- **Fix:** Removed `class="hidden"` from the `#verification-check-result` template element in `templates/partials/domain_detail.html` (using `aria-live="polite"` instead), refreshed domain detail first, and populated the container after the swap finished.
+- **How to prevent it:** Do not use CSS hiding classes on dynamically populated target containers within HTMX swapped fragments; rely on empty content and `aria-live="polite"` for live regions.
+
+### Entry L: CSP Blocked HTMX Injected Indicator Inline Style
+- **What happened:** HTMX automatically injected an inline `<style>` tag for `.htmx-indicator` into the document `<head>`, violating the strict `style-src 'self'` Content Security Policy.
+- **Root cause:** HTMX injects default indicator styles unless explicitly disabled via configuration.
+- **Fix:** Added `<meta name="htmx-config" content='{"includeIndicatorStyles": false, "allowEval": false, "allowScriptTags": false}'>` in `<head>` before the HTMX script tag in `base.html`, and set `window.htmx.config.allowEval = false` and `window.htmx.config.allowScriptTags = false` in `app.js`.
+- **How to prevent it:** Check third-party script defaults against strict CSP directives; configure library behavior via meta tags before script execution.
+
+### Entry M: Untested XSS Test Failed on Jinja Quote Escaping
+- **What happened:** An XSS escaping test was written expecting `&lt;script&gt;alert("org-xss")&lt;/script&gt;`, but Jinja autoescape also escapes double quotes (`"` becomes `&#34;`), causing an assertion error. The test had been committed without being run locally.
+- **Root cause:** The builder assumed Jinja only escapes angle brackets and failed to run the newly created test before reporting completion.
+- **Fix:** Updated test assertions to check `assert "<script>" not in resp.text` and `assert "&lt;script&gt;" in resp.text`. Prevention: the builder runs every test it writes; the owner re-runs.
+- **How to prevent it:** The builder must run every test it writes; the repo owner re-runs before every commit.
+
+### Entry N: UI Reset on Supabase Token Refresh
+- **What happened:** Whenever Supabase automatically refreshed the user's session token (`TOKEN_REFRESHED`), the auth state listener re-executed the entire initial sign-in logic, causing jarring UI reloads and disrupting active user interactions.
+- **Root cause:** The `onAuthStateChange` callback treated all session events identically, calling `onUserAuthenticated()` on both `SIGNED_IN` and `TOKEN_REFRESHED`.
+- **Fix:** Handled `TOKEN_REFRESHED` by only updating `currentAccessToken` in module memory and returning early without touching the DOM. Guarded `onUserAuthenticated()` with an `isAuthenticated` flag so it runs only once per sign-in.
+- **How to prevent it:** Distinguish between token lifecycle events (`TOKEN_REFRESHED`) and user session state changes (`SIGNED_IN`, `SIGNED_OUT`).
+
 ---
 
 ## Architectural Decisions
@@ -80,6 +116,22 @@
 ### 7. Plain Composite Indexes: `(org_id, id)` and `(org_id, target_type, target_id)`
 - **Decision:** Created composite B-tree indexes `ix_audit_events_org_id_id` on `(org_id, id)` and `ix_audit_events_org_target` on `(org_id, target_type, target_id)`. PostgreSQL scans this index backwards for ORDER BY id DESC, so no DESC index is needed.
 - **Rejected alternatives:** Standalone single-column indexes on `org_id`, `target_id`, or `created_at`. Rejected because tenant queries always require `org_id` filtering first; composite indexes with `org_id` as the leading column provide optimal index-only/index-scan performance and support cursor pagination (`WHERE org_id = :org_id AND id < :before_id ORDER BY id DESC`).
+
+### 8. Option A (FastAPI + Jinja2 + HTMX) over Next.js
+- **Decision:** Built the v3.4a dashboard as a server-rendered application using FastAPI, Jinja2 templates, and HTMX, with client-side Supabase JS.
+- **Rejected alternatives:** Next.js / React SPA. Rejected because a separate Node.js/TypeScript frontend introduces a second programming language, a second package manager (npm), a complex build step, and a second deployment target, increasing operational complexity and attack surface for a lean security tool.
+
+### 9. Bearer Header vs Cookie Session
+- **Decision:** Authenticated browser requests to both the JSON API and HTMX `/ui/*` endpoints using `Authorization: Bearer <token>` in the header, passed synchronously.
+- **Rejected alternatives:** Session cookies (`Set-Cookie`). Rejected because cookies require CSRF protection tokens, cookie parsing middleware, and dual-auth paths for API and browser clients. Bearer tokens in headers are inherently immune to CSRF. The trade-off is readability via XSS, which is mitigated by strict CSP (`default-src 'self'`, no inline scripts or styles), Jinja autoescaping, and `textContent`-only rendering.
+
+### 10. HTMX 2.x over HTMX 4.0
+- **Decision:** Vendored stable HTMX 2.0.11.
+- **Rejected alternatives:** HTMX 4.0 pre-release / majors. Rejected due to breaking API changes, unstable ecosystem support, and lack of proven production hardening.
+
+### 11. sessionStorage over localStorage
+- **Decision:** Configured Supabase Auth client to persist session tokens in `sessionStorage`.
+- **Rejected alternatives:** `localStorage`. Rejected because `localStorage` persists indefinitely across browser restarts and all tabs, whereas `sessionStorage` is isolated to the tab and cleared upon window close, reducing the window of token exposure.
 
 ---
 

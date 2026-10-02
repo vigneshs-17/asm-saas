@@ -1,0 +1,63 @@
+<section class="surface-panel">
+  <div class="surface-panel-header">
+    <h2 class="panel-title">Domains for {{ org.name }}</h2>
+    <p class="panel-subtitle">Monitored internet-facing root domains.</p>
+  </div>
+
+  {% if user_role in ('admin', 'owner') %}
+  <div class="surface-panel-header">
+    <form id="add-domain-form" class="form-inline" data-org-id="{{ org.id }}">
+      <div class="form-group">
+        <label for="new-domain-name" class="form-label">Add domain</label>
+        <input type="text" id="new-domain-name" name="name" class="form-input" placeholder="e.g. example.com" required maxlength="253">
+      </div>
+      <button type="submit" class="btn btn-primary">Add domain</button>
+    </form>
+  </div>
+  {% endif %}
+
+  {% if domains %}
+  <div class="table-container">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Domain name</th>
+          <th>Verification status</th>
+          <th>Verified at</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for domain in domains %}
+        <tr>
+          <td><strong>{{ domain.name }}</strong></td>
+          <td>
+            {% if domain.verification_status == 'verified' %}
+            <span class="status-badge status-verified">Status: verified</span>
+            {% elif domain.verification_status == 'lapsed' %}
+            <span class="status-badge status-lapsed">Status: lapsed</span>
+            {% else %}
+            <span class="status-badge status-pending">Status: pending</span>
+            {% endif %}
+          </td>
+          <td class="text-muted">
+            {% if domain.verified_at %}
+            {{ domain.verified_at.strftime('%Y-%m-%d %H:%M UTC') }}
+            {% else %}
+            --
+            {% endif %}
+          </td>
+          <td>
+            <button type="button" class="btn btn-secondary btn-sm btn-view-domain" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+              View details
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted">No domains registered yet in this organization.</p>
+  {% endif %}
+</section>

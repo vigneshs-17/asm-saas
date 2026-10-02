@@ -39,6 +39,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_PUBLISHABLE_KEY:-}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-authenticated}
     ports:
       # Bound strictly to 127.0.0.1 (not 0.0.0.0) because there is no authentication yet.

@@ -9,6 +9,7 @@ class AuthSettings:
     """Settings for Supabase JWT verification."""
 
     supabase_url: str = ""
+    supabase_publishable_key: str = ""
     jwt_audience: str = "authenticated"
     jwks_fetch_timeout: float = 5.0
     jwks_min_refresh_interval: float = 10.0
@@ -37,8 +38,16 @@ class AuthSettings:
 def get_auth_settings() -> AuthSettings:
     """Load authentication settings from environment variables."""
     supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_publishable_key = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
+    if supabase_publishable_key.startswith("sb_secret_"):
+        raise RuntimeError(
+            "CRITICAL SECURITY MISCONFIGURATION: SUPABASE_PUBLISHABLE_KEY "
+            "contains a secret service key ('sb_secret_...'). "
+            "Only the public publishable/anon key may be configured."
+        )
     jwt_audience = os.getenv("JWT_AUDIENCE", "authenticated").strip() or "authenticated"
     return AuthSettings(
         supabase_url=supabase_url,
+        supabase_publishable_key=supabase_publishable_key,
         jwt_audience=jwt_audience,
     )
