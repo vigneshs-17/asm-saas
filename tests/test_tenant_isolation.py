@@ -66,8 +66,7 @@ def two_tenants(db_session: Session):
     dom_a = Domain(
         org_id=org_a.id,
         name="alpha-target.com",
-        authorized=True,
-        authorization_note="Alpha scope",
+        verification_status="verified",
         scan_interval_hours=24,
         next_scan_at=datetime.now(UTC),
         alerts_enabled=True,
@@ -78,8 +77,7 @@ def two_tenants(db_session: Session):
     dom_b = Domain(
         org_id=org_b.id,
         name="beta-target.com",
-        authorized=True,
-        authorization_note="Beta scope",
+        verification_status="verified",
         scan_interval_hours=12,
         next_scan_at=datetime.now(UTC),
         alerts_enabled=True,
@@ -181,7 +179,7 @@ def test_idor_matrix_vector_1_cross_tenant_paths(two_tenants, db_session: Sessio
     try:
         # 1. POST /orgs/{org_a}/domains -> 404
         r = client_b.post(
-            f"/orgs/{org_a_id}/domains", json={"name": "hacked.com", "authorized": True}
+            f"/orgs/{org_a_id}/domains", json={"name": "hacked.com"}
         )
         assert r.status_code == 404
 
@@ -347,7 +345,7 @@ def test_role_matrix_viewer_forbidden_on_writes(two_tenants, db_session: Session
         # Write endpoints return 403
         # 1. POST domains
         r1 = viewer_client.post(
-            f"/orgs/{org_b_id}/domains", json={"name": "test.com", "authorized": True}
+            f"/orgs/{org_b_id}/domains", json={"name": "test.com"}
         )
         assert r1.status_code == 403
 
@@ -406,7 +404,7 @@ def test_per_org_domain_uniqueness(two_tenants, db_session: Session):
         # 1. Org A creates shared_name -> 201
         app.dependency_overrides[get_current_user] = lambda: ctx["user_a"]
         res_a1 = client.post(
-            f"/orgs/{org_a_id}/domains", json={"name": shared_name, "authorized": True}
+            f"/orgs/{org_a_id}/domains", json={"name": shared_name}
         )
         assert res_a1.status_code == 201
         dom_a_new_id = res_a1.json()["id"]
@@ -414,7 +412,7 @@ def test_per_org_domain_uniqueness(two_tenants, db_session: Session):
         # 2. Org B creates identical shared_name -> 201 (Per-org uniqueness allows it!)
         app.dependency_overrides[get_current_user] = lambda: ctx["user_b"]
         res_b1 = client.post(
-            f"/orgs/{org_b_id}/domains", json={"name": shared_name, "authorized": True}
+            f"/orgs/{org_b_id}/domains", json={"name": shared_name}
         )
         assert res_b1.status_code == 201
         dom_b_new_id = res_b1.json()["id"]
@@ -423,7 +421,7 @@ def test_per_org_domain_uniqueness(two_tenants, db_session: Session):
         # 3. Org A tries to create shared_name again -> 409 Conflict
         app.dependency_overrides[get_current_user] = lambda: ctx["user_a"]
         res_a2 = client.post(
-            f"/orgs/{org_a_id}/domains", json={"name": shared_name, "authorized": True}
+            f"/orgs/{org_a_id}/domains", json={"name": shared_name}
         )
         assert res_a2.status_code == 409
         assert f"Domain '{shared_name}' already exists" in res_a2.json()["detail"]
@@ -431,7 +429,7 @@ def test_per_org_domain_uniqueness(two_tenants, db_session: Session):
         # 4. Org B tries to create shared_name again -> 409 Conflict
         app.dependency_overrides[get_current_user] = lambda: ctx["user_b"]
         res_b2 = client.post(
-            f"/orgs/{org_b_id}/domains", json={"name": shared_name, "authorized": True}
+            f"/orgs/{org_b_id}/domains", json={"name": shared_name}
         )
         assert res_b2.status_code == 409
     finally:
@@ -455,7 +453,7 @@ def test_legacy_quarantine_isolation_and_move_domain(db_session: Session):
     legacy_dom = Domain(
         org_id=quarantine_org.id,
         name="legacy-unassigned.com",
-        authorized=True,
+        verification_status="verified",
     )
     db_session.add(legacy_dom)
     db_session.commit()
@@ -495,7 +493,7 @@ def test_move_domain_refuses_non_quarantine_source(db_session: Session):
     db_session.add_all([org_1, org_2])
     db_session.flush()
 
-    dom = Domain(org_id=org_1.id, name="customer1-domain.com", authorized=True)
+    dom = Domain(org_id=org_1.id, name="customer1-domain.com", verification_status="verified")
     db_session.add(dom)
     db_session.commit()
 
@@ -515,9 +513,11 @@ def test_move_domain_failure_modes(db_session: Session):
     db_session.add_all([quarantine_org, target_org])
     db_session.flush()
 
-    dom = Domain(org_id=quarantine_org.id, name="collide.com", authorized=True)
+    dom = Domain(org_id=quarantine_org.id, name="collide.com", verification_status="verified")
     # Existing domain with same name in target org
-    existing_target_dom = Domain(org_id=target_org.id, name="collide.com", authorized=True)
+    existing_target_dom = Domain(
+        org_id=target_org.id, name="collide.com", verification_status="verified"
+    )
     db_session.add_all([dom, existing_target_dom])
     db_session.commit()
 

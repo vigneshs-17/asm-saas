@@ -20,14 +20,29 @@ class DomainCreate(BaseModel):
     """Request payload for creating a new monitored domain."""
 
     name: str = Field(..., description="Target domain name (e.g. example.com)")
-    authorized: bool = Field(
-        ...,
-        description="Explicit authorization confirmation (must be true)",
-    )
-    authorization_note: str | None = Field(
-        default=None,
-        description="Optional documentation or scope reference regarding authorization",
-    )
+
+
+class DomainVerificationRead(BaseModel):
+    """Response schema for domain ownership verification status and instructions."""
+
+    domain_id: int
+    domain_name: str
+    status: Literal["pending", "verified", "lapsed"]
+    method: Literal["dns_txt", "operator"]
+    token: str
+    record_name: str
+    record_type: str = "TXT"
+    record_value: str
+    verified_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    consecutive_misses: int = 0
+    verification_reason: str | None = None
+    verification_expires_at: datetime | None = None
+    is_verified: bool = False
+    check_outcome: Literal["match", "absent", "unknown"] | None = None
+    check_detail: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DomainRead(BaseModel):
@@ -36,14 +51,24 @@ class DomainRead(BaseModel):
     id: int
     org_id: int
     name: str
-    authorized: bool
-    authorization_note: str | None = None
+    verification_status: str
+    verification_token: str
+    verification_method: str
+    verified_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    consecutive_misses: int = 0
+    verification_reason: str | None = None
+    verification_expires_at: datetime | None = None
     scan_interval_hours: int | None = None
     next_scan_at: datetime | None = None
     alerts_enabled: bool = False
     alert_emails: list[str] = Field(default_factory=list)
     alert_min_severity: str = "MEDIUM"
     created_at: datetime
+    verification_record_name: str
+    verification_record_type: str = "TXT"
+    verification_record_value: str
+    is_verified: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -98,7 +123,7 @@ class AlertNotificationRead(BaseModel):
 
     id: int
     domain_id: int
-    scan_run_id: int
+    scan_run_id: int | None = None
     recipient: str
     subject: str
     body: str

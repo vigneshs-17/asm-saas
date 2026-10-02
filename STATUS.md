@@ -1,0 +1,23 @@
+# Status
+
+## Test Suite
+- unit 262 passed, 111 skipped; db 112 passed (2026-10-02)
+
+## Done
+- v1 CLI: 5-stage reconnaissance scanner core (`discover`, `probe`, `portscan`, `inspect`, `score`).
+- v2.0.0 Service: FastAPI REST API, PostgreSQL persistence, PostgreSQL-backed background job queue (FOR UPDATE SKIP LOCKED), CT Cert Spotter fallback.
+- v2.3 Change Detection: Finding-based differential engine with severity-aware transitions.
+- v2.4 Scheduling & Alerts: Periodic scheduler (`FOR UPDATE SKIP LOCKED`) and transactional outbox email alerts.
+- v3.1a User Auth & Organizations: Supabase JWT auth, JIT user provisioning, organizations RBAC (`owner`, `admin`, `viewer`).
+- v3.1b Tenant Isolation: Foreign keys, strict organization-scoped queries, anti-enumeration (404 on cross-tenant), legacy quarantine migration.
+- v3.2 Domain Verification: Proof of DNS control via DNS TXT (`_asm-verify.<domain>`), continuous re-verification, scan gating, break-glass operator overrides with expiry.
+
+## In Progress
+- None (v3.2 domain verification implementation and defect remediation completed and verified).
+
+## Next
+- v3.3: Audit logs and event tracking table.
+
+## Known Limitations
+- DNS lookup during manual check runs while holding the domain database row lock (bounded about 5s).
+- Integration test suite requires PostgreSQL (SQLite is unsupported for DB tests).

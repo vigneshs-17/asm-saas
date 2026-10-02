@@ -11,6 +11,7 @@ import socket
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Engine, func, select, text, update
@@ -23,6 +24,11 @@ from asm.alerts.rules import should_trigger_alerts
 from asm.db.models import Domain, ScanResult
 from asm.db.scans import enqueue_scan
 from asm.scan_common import sanitize_error_text
+from asm.verification import (
+    apply_check_outcome,
+    check_dns_txt_verification,
+    queue_domain_alert,
+)
 from asm.worker.exceptions import (
     EXPECTED_SCANNER_ERRORS,
     LostLeaseError,
@@ -196,6 +202,18 @@ class ASMWorker:
         """Execute one complete polling cycle: recovery, poison pills, scheduling, and claiming."""
         self.reclaim_stale_leases_and_poison_pills()
 
+        # Step: Expire operator overrides that passed verification_expires_at
+        try:
+            self.expire_operator_overrides()
+        except Exception:
+            logger.exception("Unexpected error in worker expire_operator_overrides")
+
+        # Step: Re-verify due domains via DNS TXT
+        try:
+            self.reverify_due_domains()
+        except Exception:
+            logger.exception("Unexpected error in worker reverify_due_domains")
+
         # Step: Schedule due scans (before claiming jobs)
         try:
             self.schedule_due_scans()
@@ -232,8 +250,113 @@ class ASMWorker:
         self.execute_scan_run(scan_run_id, domain_id, claim_token, attempts, max_attempts)
         return True
 
+    def expire_operator_overrides(self, batch_limit: int = 10) -> int:
+        """Expire operator-verified domains that have passed verification_expires_at.
+
+        Moves domain back to pending and emits outbox alert if alerts are enabled.
+        """
+        processed_count = 0
+        for _ in range(batch_limit):
+            with self.session_factory() as session:
+                stmt = (
+                    select(Domain)
+                    .where(
+                        Domain.verification_status == "verified",
+                        Domain.verification_method == "operator",
+                        Domain.verification_expires_at.is_not(None),
+                        Domain.verification_expires_at <= func.now(),
+                    )
+                    .order_by(Domain.verification_expires_at.asc())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                domain = session.scalar(stmt)
+                if not domain:
+                    break
+
+                domain.verification_status = "pending"
+                domain.verification_method = "dns_txt"
+                domain.verification_expires_at = None
+                domain.next_reverification_at = None
+                logger.warning(
+                    "Operator override expired for domain %s (id=%d); status reset to pending",
+                    domain.name,
+                    domain.id,
+                )
+
+                queue_domain_alert(
+                    session,
+                    domain,
+                    subject="Domain verification lapsed: monitoring paused",
+                    body=(
+                        f"Operator verification override for '{domain.name}' has "
+                        "expired. Automated scheduled monitoring is paused until "
+                        "ownership is verified."
+                    ),
+                )
+
+                session.commit()
+                processed_count += 1
+
+        return processed_count
+
+    def reverify_due_domains(self, batch_limit: int = 10) -> int:
+        """Find verified domains due for DNS re-verification and update posture.
+
+        - match: reset consecutive_misses to 0, reschedule ~24h with jitter
+        - definite absence: misses += 1; if misses >= 2: status = lapsed and notify outbox;
+          if misses == 1: fast retry in ~1h
+        - UNKNOWN (timeout/SERVFAIL): change nothing, retry in ~1h
+        """
+        processed_count = 0
+        for _ in range(batch_limit):
+            with self.session_factory() as session:
+                stmt = (
+                    select(Domain)
+                    .where(
+                        Domain.verification_status == "verified",
+                        Domain.verification_method == "dns_txt",
+                        Domain.next_reverification_at <= func.now(),
+                    )
+                    .order_by(Domain.next_reverification_at.asc())
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                domain = session.scalar(stmt)
+                if not domain:
+                    break
+
+                now_utc = datetime.now(UTC)
+                outcome, detail = check_dns_txt_verification(domain.name, domain.verification_token)
+                domain.last_checked_at = now_utc
+
+                just_lapsed = apply_check_outcome(domain, outcome, now_utc)
+                if just_lapsed:
+                    logger.warning(
+                        "Domain %s (id=%d) lapsed after 2 consecutive misses (%s)",
+                        domain.name,
+                        domain.id,
+                        detail,
+                    )
+                    queue_domain_alert(
+                        session,
+                        domain,
+                        subject="Domain verification lapsed: monitoring paused",
+                        body=(
+                            f"Domain verification for '{domain.name}' has lapsed "
+                            "after 2 consecutive failed DNS checks. Automated "
+                            "scheduled monitoring is paused until ownership is "
+                            "re-verified."
+                        ),
+                    )
+
+                session.commit()
+                processed_count += 1
+
+        return processed_count
+
     def schedule_due_scans(self, batch_limit: int = 10) -> int:
-        """Find authorized domains due for scheduled scanning, queue jobs, and advance schedules.
+        """Find verified domains due for scheduled scanning, queue jobs, and advance schedules.
 
         Runs up to batch_limit iterations. Each iteration is an isolated short transaction
         locking one due domain with FOR UPDATE SKIP LOCKED.
@@ -249,7 +372,7 @@ class ASMWorker:
                 stmt = (
                     select(Domain)
                     .where(
-                        Domain.authorized.is_(True),
+                        Domain.verification_status == "verified",
                         Domain.scan_interval_hours.is_not(None),
                         Domain.next_scan_at <= func.now(),
                     )
@@ -515,9 +638,10 @@ class ASMWorker:
                 domain = session.get(Domain, domain_id)
                 if not domain:
                     raise SecurityGateError(f"Domain ID {domain_id} does not exist.")
-                if not domain.authorized:
+                if domain.verification_status != "verified":
                     raise SecurityGateError(
-                        f"Target domain '{domain.name}' authorization is revoked."
+                        f"Target domain '{domain.name}' verification is not active "
+                        f"({domain.verification_status})."
                     )
                 domain_name = domain.name
 
@@ -568,14 +692,13 @@ class ASMWorker:
                     self._mark_stage_skipped(scan_run_id, claim_token, stage, skip_reason)
                     continue
 
-                # Worker-side authorization gate check before active network stages
-                if stage in ("probe", "portscan", "inspect"):
-                    with self.session_factory() as session:
-                        fresh_domain = session.get(Domain, domain_id)
-                        if not fresh_domain or not fresh_domain.authorized:
-                            raise SecurityGateError(
-                                f"Active scanning authorization revoked for '{domain_name}'"
-                            )
+                # Worker-side verification gate check before EVERY stage including discover
+                with self.session_factory() as session:
+                    fresh_domain = session.get(Domain, domain_id)
+                    if not fresh_domain or fresh_domain.verification_status != "verified":
+                        raise SecurityGateError(
+                            f"Domain verification lapsed/revoked for '{domain_name}'"
+                        )
 
                 # Mark stage 'running' in short transaction
                 self._mark_stage_running(scan_run_id, claim_token, stage)
@@ -650,12 +773,12 @@ class ASMWorker:
                                 domain_obj
                                 and domain_obj.alerts_enabled
                                 and domain_obj.alert_emails
-                                and domain_obj.authorized
+                                and domain_obj.verification_status == "verified"
                             ):
                                 should_alert, triggering_changes = should_trigger_alerts(
                                     alerts_enabled=domain_obj.alerts_enabled,
                                     alert_emails=domain_obj.alert_emails,
-                                    authorized=domain_obj.authorized,
+                                    verified=domain_obj.is_verified,
                                     alert_min_severity=domain_obj.alert_min_severity,
                                     change_summary=summary,
                                     changes=changes,

@@ -151,14 +151,23 @@ class MockScannerRunner:
         }
 
 
+def create_verified_domain(client: TestClient, org_id: int, name: str, db_engine) -> int:
+    """Helper to create a domain via API and mark it verified in the DB for pipeline tests."""
+    resp = client.post(f"/orgs/{org_id}/domains", json={"name": name})
+    assert resp.status_code == 201
+    domain_id = resp.json()["id"]
+    with db_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE domains SET verification_status = 'verified' WHERE id = :id"),
+            {"id": domain_id},
+        )
+    return domain_id
+
+
 def test_scan_lifecycle_full_success(client: TestClient, org: Organization, db_engine):
     """Test standard happy-path: all 5 stages transition to succeeded and results are saved."""
     # 1. Register domain
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "lifecycle-success.com", "authorized": True}
-    )
-    assert resp.status_code == 201
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "lifecycle-success.com", db_engine)
 
     # 2. Queue scan run
     post_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
@@ -192,10 +201,7 @@ def test_scan_lifecycle_full_success(client: TestClient, org: Organization, db_e
 
 def test_discover_failure_skips_downstream(client: TestClient, org: Organization, db_engine):
     """Test discover stage failure: downstream stages are skipped and job fails cleanly."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "discover-fail.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "discover-fail.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -220,10 +226,7 @@ def test_discover_failure_skips_downstream(client: TestClient, org: Organization
 
 def test_portscan_failure_partial_visibility(client: TestClient, org: Organization, db_engine):
     """Test portscan failure: inspect and score run; run marked failed with partial reports."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "portscan-fail.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "portscan-fail.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -254,10 +257,7 @@ def test_portscan_failure_partial_visibility(client: TestClient, org: Organizati
 
 def test_zombie_worker_writes_rejected(client: TestClient, org: Organization, db_engine):
     """Test zombie worker protection: worker with reclaimed lease is rejected on writes."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "zombie-test.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "zombie-test.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -295,10 +295,7 @@ def test_unexpected_exception_requeued_and_poison_pill(
     client: TestClient, org: Organization, db_engine
 ):
     """Test unexpected exception requeue with backoff and eventual poison pill termination."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "unexpected-exc.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "unexpected-exc.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -342,10 +339,7 @@ def test_resume_resets_running_stage_to_pending(
     client: TestClient, org: Organization, db_engine
 ):
     """Test resume after crash resets a stage stuck in 'running' back to 'pending'."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "resume-test.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "resume-test.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -397,10 +391,7 @@ def test_resume_resets_running_stage_to_pending(
 
 def test_sigterm_graceful_release(client: TestClient, org: Organization, db_engine):
     """Test worker graceful release on SIGTERM between stages without consuming an attempt."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "sigterm-test.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "sigterm-test.com", db_engine)
 
     client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
 
@@ -424,48 +415,48 @@ def test_sigterm_graceful_release(client: TestClient, org: Organization, db_engi
 
 
 def test_authorization_gate_api_and_worker(client: TestClient, org: Organization, db_engine):
-    """Test double authorization gate: API blocks unauthorized domains; worker halts if revoked."""
-    # 1. API blocks unauthorized domain (must be true)
+    """Test double verification gate: API blocks unverified domains; worker halts if revoked."""
+    # 1. API blocks unverified domain (new domain is pending)
     resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "unauthorized-api.com", "authorized": False}
+        f"/orgs/{org.id}/domains", json={"name": "unauthorized-api.com"}
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 201
+    unauth_domain_id = resp.json()["id"]
+    unauth_scan = client.post(f"/orgs/{org.id}/domains/{unauth_domain_id}/scans")
+    assert unauth_scan.status_code == 422
+    assert "not verified" in unauth_scan.json()["detail"].lower()
 
-    # 2. Register authorized domain
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "auth-revoked.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    # 2. Register verified domain
+    domain_id = create_verified_domain(client, org.id, "auth-revoked.com", db_engine)
 
     # 3. Queue scan
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
+    assert scan_resp.status_code == 202
     scan_id = scan_resp.json()["id"]
 
-    # 4. Revoke authorization in DB before worker executes active stages
+    # 4. Revoke verification in DB before worker executes active stages
     with db_engine.begin() as conn:
         conn.execute(
-            text("UPDATE domains SET authorized = false WHERE id = :id"),
+            text("UPDATE domains SET verification_status = 'lapsed' WHERE id = :id"),
             {"id": domain_id},
         )
 
-    # 5. Worker claims job -> discovers authorization revoked -> terminal failure
+    # 5. Worker claims job -> discovers verification revoked -> terminal failure
     worker = ASMWorker(engine=db_engine, runner=MockScannerRunner())
     assert worker.run_poll_cycle() is True
 
     get_resp = client.get(f"/orgs/{org.id}/scans/{scan_id}")
     data = get_resp.json()
     assert data["status"] == "failed"
-    assert "revoked" in (data["error"] or "").lower()
+    err = (data["error"] or "").lower()
+    assert "revoked" in err or "verification" in err
 
 
 def test_worker_writes_no_local_files(
     client: TestClient, org: Organization, db_engine, tmp_path
 ):
     """Verify that running a scan via DirectScannerRunner writes 0 files to output/."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "no-local-files.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "no-local-files.com", db_engine)
     client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
 
     output_dir = tmp_path / "output"
@@ -480,21 +471,31 @@ def test_worker_writes_no_local_files(
     assert len(files) == 0
 
 
-def test_api_queue_scan_errors(client: TestClient, org: Organization):
-    """Test 404 for missing domain and 422 for unauthorized domain."""
+def test_api_queue_scan_errors(client: TestClient, org: Organization, db_engine):
+    """Test 404 for missing domain and 422 for unverified domain."""
     # 404 if domain does not exist
     resp = client.post(f"/orgs/{org.id}/domains/99999/scans")
     assert resp.status_code == 404
 
-    # 422 if domain is unauthorized
+    # 422 if domain is unverified
     create_resp = client.post(
         f"/orgs/{org.id}/domains",
-        json={"name": "unauthorized-target.com", "authorized": True},
+        json={"name": "unauthorized-target.com"},
     )
     domain_id = create_resp.json()["id"]
 
-    # Temporarily set authorized to False
-    client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")  # works when authorized
+    unauth_scan = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
+    assert unauth_scan.status_code == 422
+    assert "not verified" in unauth_scan.json()["detail"].lower()
+
+    # Once verified, queuing scan succeeds
+    with db_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE domains SET verification_status = 'verified' WHERE id = :id"),
+            {"id": domain_id},
+        )
+    ok_scan = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
+    assert ok_scan.status_code == 202
 
 
 def test_api_get_scan_and_results_not_found(client: TestClient, org: Organization):
@@ -510,10 +511,7 @@ def test_api_list_domain_scans_pagination_and_filter(
     client: TestClient, org: Organization, db_engine
 ):
     """Test GET /orgs/{org_id}/domains/{id}/scans with limit, offset, and status filter."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "list-scans.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "list-scans.com", db_engine)
 
     # Queue 1st scan
     r1 = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
@@ -557,10 +555,7 @@ def test_worker_sanitizes_remote_error_in_db(
     """Verify remote error HTML/control chars are stripped and truncated to 300 in DB."""
     from asm.discovery import CrtshError
 
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "remote-err.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "remote-err.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -608,10 +603,7 @@ def test_worker_sanitizes_remote_error_in_db(
 
 def test_terminal_invariant_stage_failure(client: TestClient, org: Organization, db_engine):
     """Terminal invariant: on stage failure, no stage remains 'running' or 'pending'."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "terminal-stage-fail.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "terminal-stage-fail.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -643,10 +635,7 @@ def test_terminal_invariant_unexpected_exception_max_attempts(
     client: TestClient, org: Organization, db_engine
 ):
     """Terminal invariant: on unexpected exc at max_attempts, no stage is 'running' or 'pending'."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "terminal-unexp-fail.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "terminal-unexp-fail.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -697,10 +686,7 @@ def test_terminal_invariant_poison_pill_lease_recovery(
     client: TestClient, org: Organization, db_engine
 ):
     """Terminal invariant: poison pill recovery fails running stages and skips pending stages."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "terminal-poison-pill.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "terminal-poison-pill.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
@@ -763,18 +749,15 @@ def test_terminal_invariant_poison_pill_lease_recovery(
 
 def test_terminal_invariant_security_gate(client: TestClient, org: Organization, db_engine):
     """Terminal invariant: on security gate rejection, no stage remains 'running' or 'pending'."""
-    resp = client.post(
-        f"/orgs/{org.id}/domains", json={"name": "terminal-sec-gate.com", "authorized": True}
-    )
-    domain_id = resp.json()["id"]
+    domain_id = create_verified_domain(client, org.id, "terminal-sec-gate.com", db_engine)
 
     scan_resp = client.post(f"/orgs/{org.id}/domains/{domain_id}/scans")
     scan_id = scan_resp.json()["id"]
 
-    # Revoke authorization before worker claims
+    # Revoke verification before worker claims
     with db_engine.begin() as conn:
         conn.execute(
-            text("UPDATE domains SET authorized = false WHERE id = :id"),
+            text("UPDATE domains SET verification_status = 'lapsed' WHERE id = :id"),
             {"id": domain_id},
         )
 
@@ -784,7 +767,7 @@ def test_terminal_invariant_security_gate(client: TestClient, org: Organization,
     with Session(db_engine) as session:
         run = session.get(ScanRun, scan_id)
         assert run.status == "failed"
-        assert "authorization is revoked" in (run.error or "")
+        assert "verification" in (run.error or "").lower() or "revoked" in (run.error or "").lower()
 
         stages = session.execute(
             text("SELECT stage, status, error FROM scan_stages WHERE scan_run_id = :id"),

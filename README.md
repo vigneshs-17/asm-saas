@@ -10,7 +10,10 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 
 - **v1 CLI**: Done. 5-stage scanner (`discover`, `probe`, `portscan`, `inspect`, `score`).
 - **v2.0.0 Service**: Done. API + database, job queue with crash recovery, Cert Spotter fallback, change detection, scheduled scans, and email alerts. See [CHANGELOG.md](CHANGELOG.md).
-- **Next: v3**: Accounts, organisations, and tenant isolation.
+- **v3.1a User Auth & Organizations**: Done. Supabase JWT authentication, organization RBAC, and multi-tenant scoping.
+- **v3.1b Tenant Isolation**: Done. Foreign keys, row-level organization fences, and anti-enumeration defenses.
+- **v3.2 Domain Verification**: Done. Domain ownership proof via DNS TXT, continuous background re-verification, operator overrides, and scan gating.
+- **Next: v3.3**: Audit logs and event tracking.
 
 ---
 
@@ -32,7 +35,7 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 6. **Structured Reporting**: Exports results to a JSON file named `<domain>_<timestamp_utc>.json`.
 
 ### Phase 2: Active Host Probing (`asm probe`)
-1. **Mandatory Authorization Gate**: Requires explicit `--authorized` confirmation before dispatching any network packets.
+1. **Mandatory Authorization Gate**: Requires explicit `--authorized` confirmation before dispatching any network packets. (The local CLI is the operator's own tool; the hosted service requires DNS verification.)
 2. **Untrusted Input Defense**: Re-validates every host from the input report against RFC standards and scope boundaries.
 3. **SSRF Pre-Check**: Resolves hosts and blocks loopback, private, link-local, reserved, CGNAT (`100.64.0.0/10`), `0.0.0.0`, and IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`) before issuing HTTP requests.
 4. **Dual-Stack Default Port Probing**: Tests `https://<host>/` first (port 443), then `http://<host>/` (port 80).
@@ -66,7 +69,7 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 
 ## Architecture
 
-`asm` operates as a staged pipeline (`discover` -> `probe` -> `portscan` -> `inspect` -> `score`), where each stage reads the previous stage's JSON report, and active stages require `--authorized`.
+`asm` operates as a staged pipeline (`discover` -> `probe` -> `portscan` -> `inspect` -> `score`), where each stage reads the previous stage's JSON report, and active stages require `--authorized`. The local CLI is the operator's own tool; the hosted service requires DNS verification.
 
 ---
 
@@ -170,7 +173,10 @@ All application API endpoints (except `/health`) require authentication via a va
 | `/orgs/{org_id}/domains` | POST | `admin` | Register a new monitored domain |
 | `/orgs/{org_id}/domains` | GET | `viewer` | List all domains belonging to this organization |
 | `/orgs/{org_id}/domains/{domain_id}` | GET | `viewer` | Get domain details and schedule configuration |
-| `/orgs/{org_id}/domains/{domain_id}/scans` | POST | `admin` | Queue a reconnaissance scan for an authorized domain |
+| `/orgs/{org_id}/domains/{domain_id}/verification` | GET | `viewer` | Returns verification status and DNS TXT record instructions |
+| `/orgs/{org_id}/domains/{domain_id}/verification/check` | POST | `admin` | Check DNS TXT record immediately (30s row-locked cooldown) |
+| `/orgs/{org_id}/domains/{domain_id}/verification/rotate` | POST | `admin` | Generate new verification token and reset status to pending |
+| `/orgs/{org_id}/domains/{domain_id}/scans` | POST | `admin` | Queue a reconnaissance scan for a verified domain |
 | `/orgs/{org_id}/domains/{domain_id}/scans` | GET | `viewer` | List historical scans for a domain |
 | `/orgs/{org_id}/scans` | GET | `viewer` | List all scans across the entire organization |
 | `/orgs/{org_id}/scans/{scan_id}` | GET | `viewer` | Check scan status and pipeline stage progress |
@@ -222,41 +228,112 @@ curl -i -X DELETE http://127.0.0.1:8000/orgs/1/members/<user-uuid> \
 
 ### 5. Managing Domains & Scans Under an Organization
 
-#### Register Monitored Domains
-Register a target domain within an organization (requires `admin` or `owner` role, and `"authorized": true`):
+#### Domain Ownership Verification Flow
+
+To scan a domain on the hosted service, an organization must actively prove ownership via DNS TXT records.
+
+##### Step 1: Register Target Domain (Status: `pending`)
+Register a target domain within an organization (requires `admin` or `owner` role):
 ```bash
 curl -i -X POST http://127.0.0.1:8000/orgs/1/domains \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "example.com",
-    "authorized": true,
-    "authorization_note": "Target owner written authorization"
-  }'
+  -d '{"name": "example.com"}'
 ```
-Response:
+Response (HTTP 201 Created):
 ```json
 {
   "id": 1,
   "org_id": 1,
   "name": "example.com",
-  "authorized": true,
-  "authorization_note": "Target owner written authorization",
-  "created_at": "2026-09-29T18:00:00Z"
+  "verification_status": "pending",
+  "verification_token": "k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO",
+  "verification_method": "dns_txt",
+  "verified_at": null,
+  "last_checked_at": null,
+  "consecutive_misses": 0,
+  "verification_reason": null,
+  "verification_expires_at": null,
+  "scan_interval_hours": null,
+  "next_scan_at": null,
+  "alerts_enabled": false,
+  "alert_emails": [],
+  "alert_min_severity": "MEDIUM",
+  "created_at": "2026-10-02T08:00:00Z",
+  "verification_record_name": "_asm-verify.example.com",
+  "verification_record_type": "TXT",
+  "verification_record_value": "asm-verify=k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO",
+  "is_verified": false
 }
 ```
 
-List registered domains for an organization:
+##### Step 2: Retrieve Verification Instructions
+Inspect the domain's verification posture and exact DNS record requirements:
 ```bash
-curl -i http://127.0.0.1:8000/orgs/1/domains \
+curl -i http://127.0.0.1:8000/orgs/1/domains/1/verification \
   -H "Authorization: Bearer <token>"
 ```
+Response:
+```json
+{
+  "domain_id": 1,
+  "domain_name": "example.com",
+  "status": "pending",
+  "method": "dns_txt",
+  "token": "k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO",
+  "record_name": "_asm-verify.example.com",
+  "record_type": "TXT",
+  "record_value": "asm-verify=k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO",
+  "verified_at": null,
+  "last_checked_at": null,
+  "consecutive_misses": 0,
+  "verification_reason": null,
+  "verification_expires_at": null,
+  "is_verified": false,
+  "check_outcome": null,
+  "check_detail": null
+}
+```
 
-#### Queue and Track Asynchronous Scans
-Background workers process scans asynchronously using PostgreSQL `FOR UPDATE SKIP LOCKED`.
+##### Step 3: Add DNS TXT Record
+Publish the TXT record in your authoritative DNS zone:
+- **Host / Name**: `_asm-verify.example.com`
+- **Type**: `TXT`
+- **Value**: `asm-verify=k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO`
+
+##### Step 4: Verify DNS Record
+Trigger immediate DNS verification check (requires `admin` or `owner` role; rate-limited with a 30s cooldown):
+```bash
+curl -i -X POST http://127.0.0.1:8000/orgs/1/domains/1/verification/check \
+  -H "Authorization: Bearer <token>"
+```
+Response (HTTP 200 OK):
+```json
+{
+  "domain_id": 1,
+  "domain_name": "example.com",
+  "status": "verified",
+  "method": "dns_txt",
+  "token": "k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO",
+  "record_name": "_asm-verify.example.com",
+  "record_type": "TXT",
+  "record_value": "asm-verify=k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO",
+  "verified_at": "2026-10-02T08:05:00Z",
+  "last_checked_at": "2026-10-02T08:05:00Z",
+  "consecutive_misses": 0,
+  "verification_reason": null,
+  "verification_expires_at": null,
+  "is_verified": true,
+  "check_outcome": "match",
+  "check_detail": "Exact TXT record match verified"
+}
+```
+
+##### Step 5: Queue and Track Asynchronous Scans
+Once `is_verified: true`, scans and schedules are permitted. Background workers process scans asynchronously using PostgreSQL `FOR UPDATE SKIP LOCKED`.
 
 ```bash
-# Queue a scan for an authorized domain (returns 202 Accepted)
+# Queue a scan for a verified domain (returns 202 Accepted)
 curl -i -X POST http://127.0.0.1:8000/orgs/1/domains/1/scans \
   -H "Authorization: Bearer <token>" \
   -H "Idempotency-Key: optional-uuid-token"
@@ -594,7 +671,7 @@ Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
 
 ### Key Architectural Invariants
 1. **Database-Backed Worker Scheduling**:
-   The worker polling loop executes `schedule_due_scans()` at the start of each cycle before claiming queued jobs. It selects due domains (`authorized = true AND scan_interval_hours IS NOT NULL AND next_scan_at <= now()`) using `FOR UPDATE SKIP LOCKED`. This allows multiple workers to run concurrently without coordination or duplicated scan jobs.
+   The worker polling loop executes `schedule_due_scans()` at the start of each cycle before claiming queued jobs. It selects due domains (`verification_status = 'verified' AND scan_interval_hours IS NOT NULL AND next_scan_at <= now()`) using `FOR UPDATE SKIP LOCKED`. This allows multiple workers to run concurrently without coordination or duplicated scan jobs.
 2. **One Short Transaction Per Domain**:
    Each due domain is locked, evaluated, and updated within its own dedicated short transaction, minimizing lock contention and preventing failures in one domain from affecting others.
 3. **Shared Enqueue Function**:
@@ -641,6 +718,76 @@ Hosts: 4 total (0 Critical, 2 High, 2 Medium, 0 Low, 0 Info)
    SMTP_FROM=asm-alerts@example.com
    ```
    Open `http://127.0.0.1:8025` in your browser to inspect delivered alert digests in real-time.
+
+---
+
+## Domain Ownership Verification Engine (v3.2)
+
+`asm` replaces the client-asserted `authorized: true` flag with proof of DNS control. An organization may only scan, schedule, or configure alerts for domains it has actively proven ownership of via DNS TXT records.
+
+### Core Architectural Invariants
+
+1. **Proof of DNS Control**:
+   Ownership is verified by publishing a high-entropy secret token (`secrets.token_urlsafe(32)`) as a DNS TXT record at a dedicated verification label.
+   - **Label Name**: `_asm-verify.<domain>`
+   - **Record Type**: `TXT`
+   - **Record Value**: `asm-verify=<token>`
+   - *Example*:
+     For domain `example.com` with token `k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO`:
+     ```text
+     _asm-verify.example.com.  300  IN  TXT  "asm-verify=k8P2qZ_v9LmNx0R4tYw1sA2bC3dE4fG5hI6jK7lM8nO"
+     ```
+   - Multi-string TXT records (RFC 1035 chunking) are joined before evaluation.
+   - Per-tenant tokens ensure that verifying a domain in Organization A never grants scanning rights to Organization B.
+
+2. **Verification State Machine**:
+   - `pending`: Newly added domain or rotated token; scanning is blocked.
+   - `verified`: Successful DNS TXT check or valid operator override; scanning and scheduling allowed.
+   - `lapsed`: Domain failed continuous re-verification after 2 consecutive definite misses; monitoring paused.
+
+3. **Check Logic & "Unknown" vs "Absent"**:
+   - `MATCH`: Verification succeeds (`status = 'verified'`).
+   - `ABSENT`: Definite absence (`NXDOMAIN` or missing/mismatched record). Increments `consecutive_misses`.
+   - `UNKNOWN`: Network timeouts, `SERVFAIL`, or DNS server errors. Never counts as a miss; leaves current verification status unchanged.
+
+4. **Continuous Background Re-Verification**:
+   - The worker periodically re-verifies `verified` domains approximately once per day (`now() + 24h + jitter`).
+   - If a definite miss occurs, a fast retry is scheduled in 1 hour (`now() + 1h`).
+   - Only after **2 consecutive definite misses** does status transition to `lapsed`.
+   - If a domain lapses, active monitoring and scheduled scans are paused immediately.
+   - If domain alerts are enabled, a lapse or operator expiration immediately writes an alert notification to the transactional outbox:
+     `"Domain verification lapsed: monitoring paused"`.
+
+5. **Rate-Limited Check Endpoint**:
+   - Triggering a manual verification check (`POST /orgs/{org_id}/domains/{domain_id}/verification/check`) enforces a 30-second cooldown under a database row lock (`SELECT ... FOR UPDATE`), preventing abuse across distributed API instances. Returns HTTP 429 if called within cooldown.
+
+6. **End-to-End Enforcement**:
+   - `enqueue_scan` (API & worker scheduler) strictly refuses unverified domains with HTTP 422.
+   - Worker re-checks domain verification before **every** active pipeline stage (`discover`, `probe`, `portscan`, `inspect`, `score`). If ownership lapses or is revoked mid-scan, the scan immediately terminates and marks `failed`.
+
+7. **Operator Overrides (Time-Bounded Break-Glass)**:
+   - Operators can grant manual verification with an audit trail:
+     ```bash
+     asm admin verify-domain --domain-id 123 --reason "Emergency security audit agreement #441" --expires-in-days 30
+     ```
+     - `--domain-id DOMAIN_ID`: Target domain ID (required).
+     - `--reason REASON`: Non-empty operator justification for override (required).
+     - `--expires-in-days EXPIRES_IN_DAYS`: Expiration window in days (default: 30, min: 1, max: 90).
+     - Worker automatically moves expired overrides to `pending`.
+   - Operators can explicitly revoke an override at any time:
+     ```bash
+     asm admin revoke-verification --domain-id 123 --reason "Contract completed early"
+     ```
+     - `--domain-id DOMAIN_ID`: Target domain ID (required).
+     - `--reason REASON`: Non-empty operator justification for revocation (required).
+
+### API Endpoints
+
+| Method | Endpoint | Allowed Roles | Description |
+|:---|:---|:---|:---|
+| `GET` | `/orgs/{org_id}/domains/{domain_id}/verification` | `viewer` | Returns verification status and DNS TXT record instructions |
+| `POST` | `/orgs/{org_id}/domains/{domain_id}/verification/check` | `admin` | Checks DNS TXT record now (30s row-locked cooldown, returns 429 on abuse) |
+| `POST` | `/orgs/{org_id}/domains/{domain_id}/verification/rotate` | `admin` | Generates a new verification token and resets status to `pending` |
 
 ---
 

@@ -30,7 +30,7 @@ def create_domain_and_queue_scan(session: Session, domain_name: str) -> tuple[in
     domain = session.query(Domain).filter_by(name=domain_name).first()
     if not domain:
         org = _ensure_org(session)
-        domain = Domain(org_id=org.id, name=domain_name, authorized=True)
+        domain = Domain(org_id=org.id, name=domain_name, verification_status="verified")
         session.add(domain)
         session.flush()
 
@@ -416,7 +416,11 @@ def test_baseline_query_ignores_later_scans(clean_db, db_engine):
     """Baseline query uses id < :current_id strictly, ignoring any scans with id > current."""
     with Session(db_engine) as session:
         org = _ensure_org(session)
-        domain = Domain(org_id=org.id, name="order-check.example.com", authorized=True)
+        domain = Domain(
+            org_id=org.id,
+            name="order-check.example.com",
+            verification_status="verified",
+        )
         session.add(domain)
         session.flush()
 
@@ -473,7 +477,11 @@ def test_unique_constraint_enforcement_on_scan_changes(clean_db, db_engine):
     """Insert of duplicate (scan_run_id, change_type, asset, detail) raises IntegrityError."""
     with Session(db_engine) as session:
         org = _ensure_org(session)
-        domain = Domain(org_id=org.id, name="unique-test.example.com", authorized=True)
+        domain = Domain(
+            org_id=org.id,
+            name="unique-test.example.com",
+            verification_status="verified",
+        )
         session.add(domain)
         session.commit()
 
@@ -520,7 +528,11 @@ def test_cascade_delete_on_scan_changes(clean_db, db_engine):
     """Deleting a ScanRun automatically deletes associated ScanChange records."""
     with Session(db_engine) as session:
         org = _ensure_org(session)
-        domain = Domain(org_id=org.id, name="cascade-test.example.com", authorized=True)
+        domain = Domain(
+            org_id=org.id,
+            name="cascade-test.example.com",
+            verification_status="verified",
+        )
         session.add(domain)
         session.commit()
 

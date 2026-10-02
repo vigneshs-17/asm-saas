@@ -138,7 +138,7 @@ def test_should_trigger_alerts_pure_rules():
     should, trig = should_trigger_alerts(
         alerts_enabled=False,
         alert_emails=["ops@example.com"],
-        authorized=True,
+        verified=True,
         alert_min_severity="MEDIUM",
         change_summary={"status": "computed"},
         changes=changes,
@@ -150,18 +150,18 @@ def test_should_trigger_alerts_pure_rules():
     should, trig = should_trigger_alerts(
         alerts_enabled=True,
         alert_emails=[],
-        authorized=True,
+        verified=True,
         alert_min_severity="MEDIUM",
         change_summary={"status": "computed"},
         changes=changes,
     )
     assert not should
 
-    # 3. Unauthorized domain -> False
+    # 3. Unverified domain -> False
     should, trig = should_trigger_alerts(
         alerts_enabled=True,
         alert_emails=["ops@example.com"],
-        authorized=False,
+        verified=False,
         alert_min_severity="MEDIUM",
         change_summary={"status": "computed"},
         changes=changes,
@@ -172,7 +172,7 @@ def test_should_trigger_alerts_pure_rules():
     should, trig = should_trigger_alerts(
         alerts_enabled=True,
         alert_emails=["ops@example.com"],
-        authorized=True,
+        verified=True,
         alert_min_severity="MEDIUM",
         change_summary={"status": "baseline"},
         changes=changes,
@@ -183,7 +183,7 @@ def test_should_trigger_alerts_pure_rules():
     should, trig = should_trigger_alerts(
         alerts_enabled=True,
         alert_emails=["ops@example.com"],
-        authorized=True,
+        verified=True,
         alert_min_severity="MEDIUM",
         change_summary={"status": "failed"},
         changes=changes,
@@ -194,7 +194,7 @@ def test_should_trigger_alerts_pure_rules():
     should, trig = should_trigger_alerts(
         alerts_enabled=True,
         alert_emails=["ops@example.com"],
-        authorized=True,
+        verified=True,
         alert_min_severity="MEDIUM",
         change_summary={"status": "computed"},
         changes=changes,
@@ -208,7 +208,7 @@ def test_should_trigger_alerts_pure_rules():
     should, trig = should_trigger_alerts(
         alerts_enabled=True,
         alert_emails=["ops@example.com"],
-        authorized=True,
+        verified=True,
         alert_min_severity="CRITICAL",
         change_summary={"status": "computed"},
         changes=changes,

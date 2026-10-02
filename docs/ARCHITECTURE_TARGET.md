@@ -7,12 +7,15 @@ DO NOT restart, redesign, rewrite, or expand the current project all at once.
 The existing ASM SaaS roadmap remains authoritative:
 
 ```
-v1 CLI
+v1 CLI — DONE (verified)
 → v2 service (v2.1) — DONE (verified)
 → v2.2 scan jobs — DONE (verified)
 → v2.3 change detection — DONE (verified)
 → v2.4 scheduling + alerts — DONE (verified)
-→ v3 authentication, ownership verification and dashboard — NEXT
+→ v3.1a user auth + organizations — DONE (verified)
+→ v3.1b tenant isolation — DONE (verified)
+→ v3.2 domain verification — DONE (verified)
+→ v3.3 audit logs and event tracking — NEXT
 ```
 
 Continue from the exact current project state.

@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### User Authentication & Organizations (v3.1a)
+- **Supabase JWT Authentication**: Dependency-injected token verification (`verify_access_token`, `JWKSManager`) validating RS256/ES256 signatures against Supabase JWKS endpoints with cache TTL, min refresh interval, and fail-closed security.
+- **Just-In-Time (JIT) User Provisioning**: Automatic upsertion of authenticated users into the `users` table upon verified token presentation.
+- **Organization & Role-Based Access Control**: Multi-tenant organizations with membership roles (`owner`, `admin`, `viewer`) and role hierarchies (`ROLE_RANKS`).
+- **Organization Management Endpoints**: Endpoints for organization creation (`POST /orgs`), listing (`GET /orgs`), and member management (`POST /orgs/{id}/members`, `PATCH /orgs/{id}/members/{user_id}`, `DELETE /orgs/{id}/members/{user_id}`).
+- **Last-Owner Invariant**: Enforced constraint preventing demotion or removal of an organization's final owner.
+
+#### Tenant Isolation (v3.1b)
+- **Multi-Tenant Scoping**: All domains and scans partitioned by organization ID (`org_id`); API routes scoped under `/orgs/{org_id}/...`.
+- **Anti-Enumeration Security Invariant**: Non-members attempting to access an organization's resources receive HTTP 404 (Not Found), never HTTP 403 (Forbidden), preventing organization ID enumeration.
+- **Database-Level Isolation**: `domains.org_id` foreign key with per-organization uniqueness `(org_id, name)`; scans, results and alerts are scoped through their domain. Every tenant query filters by `id` and `org_id` in SQL.
+- **Legacy Quarantine Migration (0007)**: Creates a quarantine organization identified by `system_kind = 'legacy_quarantine'` (never by name) and assigns existing domains to it.
+- **Operator Move-Domain CLI**: Administrative command `asm admin move-domain --domain-id <id> --target-org-id <id>` for moving quarantined domains to target organizations.
+
+#### Domain Ownership Verification via DNS TXT (v3.2)
+- **Proof of DNS Control**: Replaced client-asserted `authorized: true` with proof of DNS control using high-entropy secret tokens (`secrets.token_urlsafe(32)`) published as DNS TXT records at `_asm-verify.<domain>`.
+- **DNS TXT Check Engine**: Resolver logic with `dnspython` joining multi-string RFC 1035 TXT chunks and matching `asm-verify=<token>`.
+- **Failure Taxonomy**: Tri-state check logic: `MATCH` (verified), `ABSENT` (definite negative: NXDOMAIN or missing/mismatched record), `UNKNOWN` (indeterminate: timeout, SERVFAIL, network error; never counts as a miss).
+- **Verification State Machine**: State tracking (`pending`, `verified`, `lapsed`) with centralized transition function `apply_check_outcome()`.
+- **Continuous Re-Verification**: Daily worker re-checks with randomized jitter; 2-miss threshold with 1-hour fast retries before transitioning to `lapsed`.
+- **Scan Gating**: Endpoints and worker refuse scans for unverified domains (`HTTP 422 Unprocessable Content`). Worker verifies domain ownership before every active stage (`discover`, `probe`, `portscan`, `inspect`, `score`), halting mid-scan if lapsed or revoked.
+- **Rate-Limited Verification API**: `GET /verification` for instructions, `POST /verification/check` with a 30-second database row-locked cooldown, and `POST /verification/rotate` to reset token and status.
+- **Outbox Lapse Alerts**: Atomic emission of transactional outbox email notifications (`"Domain verification lapsed: monitoring paused"`) upon domain lapse or operator override expiration.
+- **Operator Break-Glass Overrides**: Administrative CLI `asm admin verify-domain --domain-id <id> --reason "<text>" [--expires-in-days <1..90>]` and `asm admin revoke-verification --domain-id <id> --reason "<text>"` with mandatory justifications and bounded expiration.
+
+### Changed
+- **BREAKING (API)**: Removed `authorized` and `authorization_note` fields from `DomainCreate` request schema and database models. Client can no longer assert authorization.
+- **BREAKING (Database)**: Migration `0008_domain_verification` resets all existing domains to `verification_status = 'pending'`, pausing automated scheduled scans until DNS verification is completed.
+- **Alert Trigger Rules**: `should_trigger_alerts` requires explicit `verified: bool` argument; removed deprecated `authorized` parameter.
+
 ## [2.0.0] - 2026-10-01
 
 ### Added

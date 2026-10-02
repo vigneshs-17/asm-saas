@@ -10,7 +10,7 @@ from asm.scoring import TIER_RANK
 def should_trigger_alerts(
     alerts_enabled: bool,
     alert_emails: list[str] | None,
-    authorized: bool,
+    verified: bool,
     alert_min_severity: str,
     change_summary: dict[str, Any] | None,
     changes: list[dict[str, Any]] | None,
@@ -19,7 +19,7 @@ def should_trigger_alerts(
 
     Rules:
     1. Domain must have alerts_enabled == True and 1..5 alert_emails configured.
-    2. Domain must be authorized.
+    2. Domain must be verified.
     3. change_summary['status'] must be strictly 'computed'.
        - Never triggers on 'baseline' (first scan).
        - Never triggers on 'failed' (detection error).
@@ -32,7 +32,7 @@ def should_trigger_alerts(
     Returns:
         (should_alert, triggering_exposure_changes)
     """
-    if not alerts_enabled or not alert_emails or not authorized:
+    if not alerts_enabled or not alert_emails or not verified:
         return False, []
 
     if not change_summary or change_summary.get("status") != "computed":

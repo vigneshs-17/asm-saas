@@ -58,7 +58,9 @@ def db_engine():
     # Safety check: database name in TEST_DATABASE_URL MUST end with '_test'
     validate_test_database_url(test_db_url)
 
-    engine = create_engine(test_db_url, pool_pre_ping=True)
+    engine = create_engine(
+        test_db_url, pool_pre_ping=True, connect_args={"connect_timeout": 5}
+    )
 
     # Verify database connectivity
     try:

@@ -24,7 +24,7 @@ def test_schedule_interval_bounds_validation(
     client: TestClient, db_session: Session, test_org: Organization
 ) -> None:
     """Interval outside 6..720 is rejected with 422 Unprocessable Entity."""
-    domain = Domain(org_id=test_org.id, name="sched-bounds.com", authorized=True)
+    domain = Domain(org_id=test_org.id, name="sched-bounds.com", verification_status="verified")
     db_session.add(domain)
     db_session.flush()
 
@@ -56,11 +56,11 @@ def test_schedule_interval_bounds_validation(
 
 
 @pytest.mark.db
-def test_schedule_unauthorized_domain_rejected(
+def test_schedule_unverified_domain_rejected(
     client: TestClient, db_session: Session, test_org: Organization
 ) -> None:
-    """Enabling a schedule on an unauthorized domain returns 422 matching POST /scans."""
-    domain = Domain(org_id=test_org.id, name="sched-unauth.com", authorized=False)
+    """Enabling a schedule on an unverified domain returns 422 matching POST /scans."""
+    domain = Domain(org_id=test_org.id, name="sched-unauth.com", verification_status="pending")
     db_session.add(domain)
     db_session.flush()
 
@@ -68,7 +68,7 @@ def test_schedule_unauthorized_domain_rejected(
         f"/orgs/{test_org.id}/domains/{domain.id}/schedule", json={"interval_hours": 24}
     )
     assert res.status_code == 422
-    assert "not authorized for scanning" in res.json()["detail"]
+    assert "not verified" in res.json()["detail"].lower()
 
 
 @pytest.mark.db
@@ -77,7 +77,10 @@ def test_schedule_enable_from_null_sets_next_scan_at_now(
 ) -> None:
     """Enabling schedule from null sets next_scan_at to current database time."""
     domain = Domain(
-        org_id=test_org.id, name="sched-enable.com", authorized=True, scan_interval_hours=None
+        org_id=test_org.id,
+        name="sched-enable.com",
+        verification_status="verified",
+        scan_interval_hours=None,
     )
     db_session.add(domain)
     db_session.flush()
@@ -107,7 +110,7 @@ def test_schedule_change_existing_interval_advances_next_scan_at(
     domain = Domain(
         org_id=test_org.id,
         name="sched-change.com",
-        authorized=True,
+        verification_status="verified",
         scan_interval_hours=12,
         next_scan_at=datetime.now(UTC),
     )
@@ -140,7 +143,7 @@ def test_schedule_disable_with_null(
     domain = Domain(
         org_id=test_org.id,
         name="sched-disable.com",
-        authorized=True,
+        verification_status="verified",
         scan_interval_hours=24,
         next_scan_at=datetime.now(UTC),
     )
@@ -169,7 +172,11 @@ def test_shared_enqueue_used_by_post_scan_sets_manual_trigger(
     """POST /orgs/{org_id}/domains/{id}/scans uses shared enqueue_scan
     and sets trigger to 'manual'.
     """
-    domain = Domain(org_id=test_org.id, name="post-manual-trigger.com", authorized=True)
+    domain = Domain(
+        org_id=test_org.id,
+        name="post-manual-trigger.com",
+        verification_status="verified",
+    )
     db_session.add(domain)
     db_session.flush()
 

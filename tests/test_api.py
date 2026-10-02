@@ -41,18 +41,19 @@ def test_health_endpoint_db_failure(client: TestClient) -> None:
 
 
 def test_create_domain_success(client: TestClient, test_org: Organization) -> None:
-    """POST /orgs/{org_id}/domains registers a valid domain with explicit authorization."""
+    """POST /orgs/{org_id}/domains registers a valid domain in pending verification state."""
     payload = {
         "name": "example.com",
-        "authorized": True,
-        "authorization_note": "Explicit written permission from target owner",
     }
     response = client.post(f"/orgs/{test_org.id}/domains", json=payload)
     assert response.status_code == 201
     data = response.json()
     assert data["name"] == "example.com"
-    assert data["authorized"] is True
-    assert data["authorization_note"] == "Explicit written permission from target owner"
+    assert data["verification_status"] == "pending"
+    assert "verification_token" in data
+    assert data["verification_record_name"] == "_asm-verify.example.com"
+    assert data["verification_record_value"] == f"asm-verify={data['verification_token']}"
+    assert data["is_verified"] is False
     assert "id" in data
     assert "created_at" in data
 
@@ -61,7 +62,6 @@ def test_create_domain_normalizes_input(client: TestClient, test_org: Organizati
     """POST /orgs/{org_id}/domains normalizes input (strips scheme, port, path, casing)."""
     payload = {
         "name": "https://DEV.EXAMPLE.COM:8443/api/v1",
-        "authorized": True,
     }
     response = client.post(f"/orgs/{test_org.id}/domains", json=payload)
     assert response.status_code == 201
@@ -70,28 +70,31 @@ def test_create_domain_normalizes_input(client: TestClient, test_org: Organizati
 
 
 def test_create_domain_unauthorized_rejected(client: TestClient, test_org: Organization) -> None:
-    """POST /orgs/{org_id}/domains rejects requests with authorized=False with HTTP 422."""
+    """POST /orgs/{org_id}/domains creates pending domain and scans are rejected with 422."""
     payload = {
         "name": "unauthorized.com",
-        "authorized": False,
     }
     response = client.post(f"/orgs/{test_org.id}/domains", json=payload)
-    assert response.status_code == 422
-    assert "authorized" in response.text.lower()
+    assert response.status_code == 201
+    domain_id = response.json()["id"]
+
+    scan_resp = client.post(f"/orgs/{test_org.id}/domains/{domain_id}/scans")
+    assert scan_resp.status_code == 422
+    assert "not verified" in scan_resp.text.lower()
 
 
 def test_create_domain_invalid_syntax_rejected(client: TestClient, test_org: Organization) -> None:
     """POST /orgs/{org_id}/domains rejects IP addresses and invalid RFC domain labels with 422."""
     # Test IP address rejection
     ip_res = client.post(
-        f"/orgs/{test_org.id}/domains", json={"name": "192.168.1.1", "authorized": True}
+        f"/orgs/{test_org.id}/domains", json={"name": "192.168.1.1"}
     )
     assert ip_res.status_code == 422
     assert "invalid domain" in ip_res.text.lower()
 
     # Test invalid hyphen placement
     hyphen_res = client.post(
-        f"/orgs/{test_org.id}/domains", json={"name": "-invalid-.com", "authorized": True}
+        f"/orgs/{test_org.id}/domains", json={"name": "-invalid-.com"}
     )
     assert hyphen_res.status_code == 422
     assert "invalid domain" in hyphen_res.text.lower()
@@ -99,7 +102,7 @@ def test_create_domain_invalid_syntax_rejected(client: TestClient, test_org: Org
 
 def test_create_domain_duplicate_conflict(client: TestClient, test_org: Organization) -> None:
     """POST /orgs/{org_id}/domains returns 409 Conflict when attempting duplicate registration."""
-    payload = {"name": "unique.com", "authorized": True}
+    payload = {"name": "unique.com"}
     first_res = client.post(f"/orgs/{test_org.id}/domains", json=payload)
     assert first_res.status_code == 201
 
@@ -111,8 +114,8 @@ def test_create_domain_duplicate_conflict(client: TestClient, test_org: Organiza
 
 def test_list_domains(client: TestClient, test_org: Organization) -> None:
     """GET /orgs/{org_id}/domains returns all registered domains in ascending ID order."""
-    client.post(f"/orgs/{test_org.id}/domains", json={"name": "alpha.com", "authorized": True})
-    client.post(f"/orgs/{test_org.id}/domains", json={"name": "beta.com", "authorized": True})
+    client.post(f"/orgs/{test_org.id}/domains", json={"name": "alpha.com"})
+    client.post(f"/orgs/{test_org.id}/domains", json={"name": "beta.com"})
 
     response = client.get(f"/orgs/{test_org.id}/domains")
     assert response.status_code == 200
@@ -125,7 +128,7 @@ def test_list_domains(client: TestClient, test_org: Organization) -> None:
 def test_get_domain_by_id_success(client: TestClient, test_org: Organization) -> None:
     """GET /orgs/{org_id}/domains/{id} returns domain details for an existing ID."""
     create_res = client.post(
-        f"/orgs/{test_org.id}/domains", json={"name": "lookup.com", "authorized": True}
+        f"/orgs/{test_org.id}/domains", json={"name": "lookup.com"}
     )
     domain_id = create_res.json()["id"]
 
@@ -168,7 +171,7 @@ def test_get_domain_changes_success_and_filters(
     client: TestClient, test_org: Organization, db_session: Session
 ) -> None:
     """GET /orgs/{org_id}/domains/{id}/changes returns newest-first changes with filtering."""
-    domain = Domain(org_id=test_org.id, name="api-changes.com", authorized=True)
+    domain = Domain(org_id=test_org.id, name="api-changes.com", verification_status="verified")
     db_session.add(domain)
     db_session.flush()
 
@@ -242,7 +245,7 @@ def test_get_scan_changes_success(
     client: TestClient, test_org: Organization, db_session: Session
 ) -> None:
     """GET /orgs/{org_id}/scans/{id}/changes returns changes for a specific scan run."""
-    domain = Domain(org_id=test_org.id, name="scan-changes.com", authorized=True)
+    domain = Domain(org_id=test_org.id, name="scan-changes.com", verification_status="verified")
     db_session.add(domain)
     db_session.flush()
 
@@ -290,7 +293,7 @@ def test_changes_endpoints_not_found_and_validation(
     assert "Scan run with ID 999999 not found" in res_scan.json()["detail"]
 
     # 422 for invalid since datetime
-    domain = Domain(org_id=test_org.id, name="validation-test.com", authorized=True)
+    domain = Domain(org_id=test_org.id, name="validation-test.com", verification_status="verified")
     db_session.add(domain)
     db_session.flush()
 

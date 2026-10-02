@@ -72,7 +72,7 @@ def test_outbox_written_atomically_in_fenced_transaction(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="alert-atomic.com",
-            authorized=True,
+            verification_status="verified",
             alerts_enabled=True,
             alert_emails=["sec@alert-atomic.com", "ops@alert-atomic.com"],
             alert_min_severity="MEDIUM",
@@ -179,7 +179,7 @@ def test_no_alert_for_summary_only_or_below_threshold(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="alert-filter.com",
-            authorized=True,
+            verification_status="verified",
             alerts_enabled=True,
             alert_emails=["ops@alert-filter.com"],
             alert_min_severity="HIGH",  # High threshold
@@ -256,7 +256,7 @@ def test_digest_builder_exception_leaves_run_succeeded_with_alert_error(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="digest-err.com",
-            authorized=True,
+            verification_status="verified",
             alerts_enabled=True,
             alert_emails=["ops@digest-err.com"],
             alert_min_severity="LOW",
@@ -342,7 +342,7 @@ def test_uniqueness_per_recipient(db_engine, clean_db: None) -> None:
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="uniq-test.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.flush()
@@ -384,7 +384,7 @@ def test_worker_delivery_success_and_retry_backoff(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="delivery-test.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.flush()
@@ -494,7 +494,7 @@ def test_concurrent_workers_deliver_each_row_once(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="concurrent-delivery.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.flush()
@@ -554,7 +554,7 @@ def test_smtp_host_unset_leaves_rows_pending(db_engine, clean_db: None) -> None:
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="unset-smtp.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.flush()

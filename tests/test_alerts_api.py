@@ -33,11 +33,15 @@ def test_alerts_endpoints_404_on_unknown_domain(
 def test_alerts_endpoint_422_on_unauthorized_domain(
     lifecycle_client: TestClient, lifecycle_org: Organization, db_engine
 ) -> None:
-    """Configuring alerts on an unauthorized domain must return 422."""
+    """Configuring alerts on an unverified domain must return 422."""
     client = lifecycle_client
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(org_id=lifecycle_org.id, name="unauth-alerts.com", authorized=False)
+        domain = Domain(
+            org_id=lifecycle_org.id,
+            name="unauth-alerts.com",
+            verification_status="pending",
+        )
         session.add(domain)
         session.commit()
         domain_id = domain.id
@@ -51,7 +55,7 @@ def test_alerts_endpoint_422_on_unauthorized_domain(
         },
     )
     assert res.status_code == 422
-    assert "not authorized" in res.json()["detail"].lower()
+    assert "not verified" in res.json()["detail"].lower()
 
 
 @pytest.mark.db
@@ -62,7 +66,11 @@ def test_alerts_configure_and_disable(
     client = lifecycle_client
     session_factory = sessionmaker(bind=db_engine)
     with session_factory() as session:
-        domain = Domain(org_id=lifecycle_org.id, name="auth-alerts.com", authorized=True)
+        domain = Domain(
+            org_id=lifecycle_org.id,
+            name="auth-alerts.com",
+            verification_status="verified",
+        )
         session.add(domain)
         session.commit()
         domain_id = domain.id
@@ -107,7 +115,11 @@ def test_list_alert_notifications_paginated_and_body(
     with session_factory() as session:
         from asm.db.scans import enqueue_scan
 
-        domain = Domain(org_id=lifecycle_org.id, name="history-alerts.com", authorized=True)
+        domain = Domain(
+            org_id=lifecycle_org.id,
+            name="history-alerts.com",
+            verification_status="verified",
+        )
         session.add(domain)
         session.flush()
 

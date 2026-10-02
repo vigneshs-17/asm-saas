@@ -19,6 +19,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from asm.verification import generate_verification_token
+
 
 def utc_now() -> datetime:
     """Return the current datetime in UTC timezone."""
@@ -38,6 +40,18 @@ class Domain(Base):
     __table_args__ = (
         UniqueConstraint("org_id", "name", name="uq_domains_org_id_name"),
         CheckConstraint(
+            "verification_status IN ('pending', 'verified', 'lapsed')",
+            name="ck_domains_verification_status",
+        ),
+        CheckConstraint(
+            "verification_method IN ('dns_txt', 'operator')",
+            name="ck_domains_verification_method",
+        ),
+        CheckConstraint(
+            "consecutive_misses >= 0",
+            name="ck_domains_consecutive_misses",
+        ),
+        CheckConstraint(
             "scan_interval_hours IS NULL OR "
             "(scan_interval_hours >= 6 AND scan_interval_hours <= 720)",
             name="ck_domains_scan_interval_hours",
@@ -56,7 +70,23 @@ class Domain(Base):
         Index(
             "ix_domains_schedule_due",
             "next_scan_at",
-            postgresql_where=text("authorized = true AND scan_interval_hours IS NOT NULL"),
+            postgresql_where=text(
+                "verification_status = 'verified' AND scan_interval_hours IS NOT NULL"
+            ),
+        ),
+        Index(
+            "ix_domains_reverify_due",
+            "next_reverification_at",
+            postgresql_where=text(
+                "verification_status = 'verified' AND verification_method = 'dns_txt'"
+            ),
+        ),
+        Index(
+            "ix_domains_operator_expiry_due",
+            "verification_expires_at",
+            postgresql_where=text(
+                "verification_status = 'verified' AND verification_method = 'operator'"
+            ),
         ),
     )
 
@@ -68,9 +98,26 @@ class Domain(Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
-    # Fail-safe default is False; explicit authorization is strictly required
-    authorized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    authorization_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # v3.2 Domain ownership verification state
+    verification_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    verification_token: Mapped[str] = mapped_column(
+        String(64), default=generate_verification_token, nullable=False
+    )
+    verification_method: Mapped[str] = mapped_column(String(32), default="dns_txt", nullable=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    consecutive_misses: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    verification_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verification_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    next_reverification_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     scan_interval_hours: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     next_scan_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None, index=True
@@ -83,6 +130,21 @@ class Domain(Base):
         default=utc_now,
         nullable=False,
     )
+
+    @property
+    def is_verified(self) -> bool:
+        """Return True if domain has proven control and active verified status."""
+        return self.verification_status == "verified"
+
+    @property
+    def verification_record_name(self) -> str:
+        """Return the designated DNS TXT record label for domain verification."""
+        return f"_asm-verify.{self.name}"
+
+    @property
+    def verification_record_value(self) -> str:
+        """Return the exact DNS TXT payload string required to verify domain control."""
+        return f"asm-verify={self.verification_token}"
 
     # Relationships
     organization: Mapped["Organization"] = relationship(back_populates="domains")
@@ -321,9 +383,9 @@ class AlertNotification(Base):
         nullable=False,
         index=True,
     )
-    scan_run_id: Mapped[int] = mapped_column(
+    scan_run_id: Mapped[int | None] = mapped_column(
         ForeignKey("scan_runs.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     recipient: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -347,7 +409,7 @@ class AlertNotification(Base):
 
     # Relationships
     domain: Mapped["Domain"] = relationship(back_populates="alert_notifications")
-    scan_run: Mapped["ScanRun"] = relationship(back_populates="alert_notifications")
+    scan_run: Mapped["ScanRun | None"] = relationship(back_populates="alert_notifications")
 
 
 class User(Base):

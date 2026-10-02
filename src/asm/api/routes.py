@@ -2,8 +2,8 @@
 
 import logging
 from collections.abc import Sequence
-from datetime import datetime
-from typing import Annotated, Any
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
@@ -24,6 +24,7 @@ from asm.api.schemas import (
     DomainCreate,
     DomainRead,
     DomainScheduleUpdate,
+    DomainVerificationRead,
     HealthResponse,
     ScanChangeRead,
     ScanRunDetail,
@@ -40,6 +41,13 @@ from asm.db.models import (
 )
 from asm.db.scans import enqueue_scan
 from asm.validators import DomainValidationError, normalize_domain, validate_domain
+from asm.verification import (
+    VERIFICATION_CHECK_COOLDOWN_SECONDS,
+    apply_check_outcome,
+    check_dns_txt_verification,
+    generate_verification_token,
+    queue_domain_alert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +83,11 @@ def health_check(db: DbSession) -> HealthResponse:
     status_code=status.HTTP_201_CREATED,
     summary="Register a new domain for scanning within an organization",
     responses={
-        201: {"description": "Domain registered successfully"},
+        201: {"description": "Domain registered successfully with verification instructions"},
         403: {"description": "Insufficient organization permissions (admin required)"},
         404: {"description": "Organization not found (or non-member)"},
         409: {"description": "Domain already exists in this organization"},
-        422: {"description": "Validation error or authorization missing"},
+        422: {"description": "Validation error"},
     },
 )
 def create_domain(
@@ -88,13 +96,7 @@ def create_domain(
     auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
     db: DbSession,
 ) -> Domain:
-    """Register a new domain within an organization, enforcing per-org uniqueness."""
-    if not payload.authorized:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Scanning requires explicit authorization. 'authorized' must be set to true.",
-        )
-
+    """Register a new domain within an organization in pending verification status."""
     try:
         validated_name = validate_domain(payload.name)
     except DomainValidationError as err:
@@ -117,15 +119,23 @@ def create_domain(
             detail=f"Domain '{normalized}' already exists.",
         )
 
+    token = generate_verification_token()
     domain = Domain(
         org_id=org_id,
         name=normalized,
-        authorized=True,
-        authorization_note=payload.authorization_note,
+        verification_status="pending",
+        verification_token=token,
+        verification_method="dns_txt",
     )
     db.add(domain)
     db.commit()
     db.refresh(domain)
+    logger.info(
+        "Registered domain %s (id=%d) for org %d in pending verification status",
+        normalized,
+        domain.id,
+        org_id,
+    )
     return domain
 
 
@@ -168,6 +178,171 @@ def get_domain(
     return get_domain_for_org(db, org_id, domain_id)
 
 
+def _domain_to_verification_read(
+    domain: Domain,
+    check_outcome: Literal["match", "absent", "unknown"] | None = None,
+    check_detail: str | None = None,
+) -> DomainVerificationRead:
+    return DomainVerificationRead(
+        domain_id=domain.id,
+        domain_name=domain.name,
+        status=domain.verification_status,  # type: ignore[arg-type]
+        method=domain.verification_method,  # type: ignore[arg-type]
+        token=domain.verification_token,
+        record_name=domain.verification_record_name,
+        record_type="TXT",
+        record_value=domain.verification_record_value,
+        verified_at=domain.verified_at,
+        last_checked_at=domain.last_checked_at,
+        consecutive_misses=domain.consecutive_misses,
+        verification_reason=domain.verification_reason,
+        verification_expires_at=domain.verification_expires_at,
+        is_verified=domain.is_verified,
+        check_outcome=check_outcome,
+        check_detail=check_detail,
+    )
+
+
+@router.get(
+    "/domains/{domain_id}/verification",
+    response_model=DomainVerificationRead,
+    summary="Get domain ownership verification status and DNS TXT record details",
+    responses={
+        200: {"description": "Domain verification details and instructions returned"},
+        404: {"description": "Organization or Domain ID not found"},
+    },
+)
+def get_domain_verification(
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    db: DbSession,
+) -> DomainVerificationRead:
+    """Retrieve current verification status and the exact DNS TXT record to publish."""
+    domain = get_domain_for_org(db, org_id, domain_id)
+    return _domain_to_verification_read(domain)
+
+
+@router.post(
+    "/domains/{domain_id}/verification/check",
+    response_model=DomainVerificationRead,
+    summary="Trigger immediate DNS TXT check for domain ownership verification",
+    responses={
+        200: {"description": "Verification check completed; returns updated status"},
+        403: {"description": "Insufficient organization permissions (admin required)"},
+        404: {"description": "Organization or Domain ID not found"},
+        429: {"description": "Verification check is on cooldown"},
+    },
+)
+def check_domain_verification(
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
+    db: DbSession,
+) -> DomainVerificationRead:
+    """Perform immediate DNS TXT record lookup under row lock with a 30s rate limit cooldown."""
+    stmt = (
+        select(Domain)
+        .where(Domain.org_id == org_id, Domain.id == domain_id)
+        .with_for_update()
+    )
+    domain = db.scalar(stmt)
+    if not domain:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain ID {domain_id} not found in organization {org_id}.",
+        )
+
+    now_utc = datetime.now(UTC)
+    if domain.last_checked_at is not None:
+        elapsed = (now_utc - domain.last_checked_at).total_seconds()
+        if elapsed < VERIFICATION_CHECK_COOLDOWN_SECONDS:
+            retry_after = max(1, int(VERIFICATION_CHECK_COOLDOWN_SECONDS - elapsed))
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Verification check is on cooldown. Try again in {retry_after}s.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    domain.last_checked_at = now_utc
+
+    outcome, detail = check_dns_txt_verification(domain.name, domain.verification_token)
+    just_lapsed = apply_check_outcome(domain, outcome, now_utc)
+    if just_lapsed:
+        logger.warning(
+            "Domain %s (id=%d) lapsed after 2 consecutive misses (%s)",
+            domain.name,
+            domain.id,
+            detail,
+        )
+        queue_domain_alert(
+            db,
+            domain,
+            subject="Domain verification lapsed: monitoring paused",
+            body=(
+                f"Domain verification for '{domain.name}' has lapsed after 2 "
+                "consecutive failed DNS checks. Automated scheduled monitoring "
+                "is paused until ownership is re-verified."
+            ),
+        )
+
+    db.commit()
+    db.refresh(domain)
+    return _domain_to_verification_read(
+        domain,
+        check_outcome=outcome.value,  # type: ignore[arg-type]
+        check_detail=detail,
+    )
+
+
+@router.post(
+    "/domains/{domain_id}/verification/rotate",
+    response_model=DomainVerificationRead,
+    summary="Rotate verification token and reset status to pending",
+    responses={
+        200: {"description": "Token rotated successfully; status reset to pending"},
+        403: {"description": "Insufficient organization permissions (admin required)"},
+        404: {"description": "Organization or Domain ID not found"},
+    },
+)
+def rotate_domain_verification(
+    org_id: int,
+    domain_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
+    db: DbSession,
+) -> DomainVerificationRead:
+    """Invalidate current verification token, generate a new token, and reset status to pending."""
+    stmt = (
+        select(Domain)
+        .where(Domain.org_id == org_id, Domain.id == domain_id)
+        .with_for_update()
+    )
+    domain = db.scalar(stmt)
+    if not domain:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Domain ID {domain_id} not found in organization {org_id}.",
+        )
+
+    domain.verification_token = generate_verification_token()
+    domain.verification_status = "pending"
+    domain.verification_method = "dns_txt"
+    domain.verified_at = None
+    domain.consecutive_misses = 0
+    domain.verification_reason = None
+    domain.verification_expires_at = None
+    domain.next_reverification_at = None
+
+    db.commit()
+    db.refresh(domain)
+    logger.info(
+        "Rotated verification token for domain %s (id=%d); reset to pending",
+        domain.name,
+        domain.id,
+    )
+    return _domain_to_verification_read(domain)
+
+
 @router.post(
     "/domains/{domain_id}/scans",
     response_model=ScanRunRead,
@@ -182,7 +357,7 @@ def get_domain(
         403: {"description": "Insufficient organization permissions (admin required)"},
         404: {"description": "Organization or Domain ID not found"},
         409: {"description": "Active scan already in progress", "model": ActiveScanConflict},
-        422: {"description": "Domain is not authorized for scanning"},
+        422: {"description": "Domain is not verified for active scanning"},
     },
 )
 def queue_scan(
@@ -193,13 +368,16 @@ def queue_scan(
     response: Response,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Any:
-    """Queue a scan run for an authorized domain with atomic idempotency and concurrency guards."""
+    """Queue a scan run for a verified domain with atomic idempotency and concurrency guards."""
     domain = get_domain_for_org(db, org_id, domain_id)
 
-    if not domain.authorized:
+    if domain.verification_status != "verified":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Domain '{domain.name}' is not authorized for active scanning.",
+            detail=(
+                f"Domain '{domain.name}' is not verified for active scanning. "
+                "Ownership verification is required."
+            ),
         )
 
     if idempotency_key:
@@ -453,10 +631,10 @@ def update_domain_schedule(
         domain.scan_interval_hours = None
         domain.next_scan_at = None
     else:
-        if not domain.authorized:
+        if domain.verification_status != "verified":
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Domain '{domain.name}' is not authorized for scanning.",
+                detail=f"Domain '{domain.name}' is not verified for scanning.",
             )
 
         if domain.scan_interval_hours is None:
@@ -481,7 +659,7 @@ def update_domain_schedule(
         200: {"description": "Alert settings updated successfully"},
         403: {"description": "Insufficient organization permissions (admin required)"},
         404: {"description": "Organization or Domain not found"},
-        422: {"description": "Domain not authorized or validation error"},
+        422: {"description": "Domain not verified or validation error"},
     },
 )
 def update_domain_alerts(
@@ -494,10 +672,10 @@ def update_domain_alerts(
     """Configure or disable automated email alerts for detected attack surface exposures."""
     domain = get_domain_for_org(db, org_id, domain_id)
 
-    if not domain.authorized:
+    if domain.verification_status != "verified":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Domain '{domain.name}' is not authorized.",
+            detail=f"Domain '{domain.name}' is not verified.",
         )
 
     domain.alerts_enabled = payload.alerts_enabled

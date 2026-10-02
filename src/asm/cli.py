@@ -230,6 +230,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="ID of the target customer organization",
     )
 
+    admin_verify = admin_subparsers.add_parser(
+        "verify-domain",
+        help="Grant an operator override verification to a domain",
+    )
+    admin_verify.add_argument(
+        "--domain-id",
+        type=int,
+        required=True,
+        help="ID of the domain to verify",
+    )
+    admin_verify.add_argument(
+        "--reason",
+        type=str,
+        required=True,
+        help="Mandatory justification for operator verification override",
+    )
+    admin_verify.add_argument(
+        "--expires-in-days",
+        type=int,
+        default=30,
+        help="Duration in days before the override expires (default: 30, max: 90)",
+    )
+
+    admin_revoke = admin_subparsers.add_parser(
+        "revoke-verification",
+        help="Revoke domain verification and reset status to pending",
+    )
+    admin_revoke.add_argument(
+        "--domain-id",
+        type=int,
+        required=True,
+        help="ID of the domain whose verification will be revoked",
+    )
+    admin_revoke.add_argument(
+        "--reason",
+        type=str,
+        required=True,
+        help="Mandatory justification for revoking domain verification",
+    )
+
     return parser
 
 
@@ -814,13 +854,22 @@ def main(argv: list[str] | None = None) -> int:
             output_dir_arg=args.output_dir,
         )
     if args.command == "admin":
-        from asm.admin import move_domain
+        from asm.admin import move_domain, revoke_verification, verify_domain
         from asm.db.session import get_session_factory
 
         factory = get_session_factory()
         with factory() as session:
             if args.admin_command == "move-domain":
                 return move_domain(session, args.domain_id, args.target_org_id)
+            elif args.admin_command == "verify-domain":
+                return verify_domain(
+                    session,
+                    args.domain_id,
+                    args.reason,
+                    expires_in_days=args.expires_in_days,
+                )
+            elif args.admin_command == "revoke-verification":
+                return revoke_verification(session, args.domain_id, args.reason)
 
     return 0
 

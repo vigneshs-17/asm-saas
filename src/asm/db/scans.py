@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from asm.db.models import ScanRun, ScanStage
+from asm.db.models import Domain, ScanRun, ScanStage
+
+
+class UnverifiedDomainError(ValueError):
+    """Raised when attempting to enqueue a scan for a domain that is not verified."""
+
+    pass
 
 
 def enqueue_scan(
@@ -14,6 +20,8 @@ def enqueue_scan(
     idempotency_key: str | None = None,
 ) -> ScanRun:
     """Insert a queued scan_run and its 5 pending stage tracking rows.
+
+    Enforces that only domains with status 'verified' can have scans enqueued.
 
     Args:
         session: Active SQLAlchemy database session.
@@ -25,9 +33,17 @@ def enqueue_scan(
         The newly created ScanRun instance.
 
     Raises:
+        UnverifiedDomainError: If the domain does not exist or is not verified.
         IntegrityError: If a database constraint (such as active scan or idempotency key)
             is violated.
     """
+    domain = session.get(Domain, domain_id)
+    if domain is None or domain.verification_status != "verified":
+        raise UnverifiedDomainError(
+            f"Domain ID {domain_id} is not verified. "
+            "Ownership verification is required before scanning."
+        )
+
     scan_run = ScanRun(
         domain_id=domain_id,
         status="queued",

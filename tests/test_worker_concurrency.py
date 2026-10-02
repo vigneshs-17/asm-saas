@@ -22,8 +22,8 @@ def test_concurrent_workers_skip_locked(clean_db, db_engine):
         session.add(org)
         session.flush()
 
-        domain1 = Domain(org_id=org.id, name="skip-locked-1.com", authorized=True)
-        domain2 = Domain(org_id=org.id, name="skip-locked-2.com", authorized=True)
+        domain1 = Domain(org_id=org.id, name="skip-locked-1.com", verification_status="verified")
+        domain2 = Domain(org_id=org.id, name="skip-locked-2.com", verification_status="verified")
         session.add_all([domain1, domain2])
         session.commit()
 
@@ -71,7 +71,7 @@ def test_concurrent_posts_single_active_scan(
         domain = Domain(
             org_id=lifecycle_org.id,
             name="active-scan-race.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.commit()
@@ -107,7 +107,7 @@ def test_idempotent_post_while_running(
         domain = Domain(
             org_id=lifecycle_org.id,
             name="idemp-running.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.commit()

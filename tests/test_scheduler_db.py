@@ -38,7 +38,7 @@ def test_scheduler_enqueues_due_domain_with_scheduled_trigger(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="due-domain.com",
-            authorized=True,
+            verification_status="verified",
             scan_interval_hours=24,
             next_scan_at=t_due,
         )
@@ -91,7 +91,7 @@ def test_scheduler_concurrent_workers_produce_exactly_one_scan(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="concurrent-sched.com",
-            authorized=True,
+            verification_status="verified",
             scan_interval_hours=12,
             next_scan_at=datetime.now(UTC) - timedelta(minutes=10),
         )
@@ -131,7 +131,7 @@ def test_scheduler_active_scan_skips_duplicate_and_advances_schedule(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="active-scan-sched.com",
-            authorized=True,
+            verification_status="verified",
             scan_interval_hours=24,
             next_scan_at=t_due,
         )
@@ -165,24 +165,24 @@ def test_scheduler_active_scan_skips_duplicate_and_advances_schedule(
 def test_scheduler_skips_unauthorized_and_null_interval_domains(
     db_engine, clean_db: None
 ) -> None:
-    """Unauthorized domains or domains with null intervals are never scheduled."""
+    """Unverified domains or domains with null intervals are never scheduled."""
     session_factory = sessionmaker(bind=db_engine)
     t_past = datetime.now(UTC) - timedelta(hours=1)
     with session_factory() as session:
         org_id = _ensure_org(session).id
-        # 1. Unauthorized domain with interval and past next_scan_at
+        # 1. Unverified domain with interval and past next_scan_at
         d_unauth = Domain(
             org_id=org_id,
             name="unauth-due.com",
-            authorized=False,
+            verification_status="pending",
             scan_interval_hours=24,
             next_scan_at=t_past,
         )
-        # 2. Authorized domain with null interval and past next_scan_at
+        # 2. Verified domain with null interval and past next_scan_at
         d_null = Domain(
             org_id=org_id,
             name="null-interval.com",
-            authorized=True,
+            verification_status="verified",
             scan_interval_hours=None,
             next_scan_at=t_past,
         )
@@ -207,7 +207,7 @@ def test_scheduler_no_backfill_after_downtime(db_engine, clean_db: None) -> None
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="downtime-domain.com",
-            authorized=True,
+            verification_status="verified",
             scan_interval_hours=24,
             next_scan_at=t_10_days_ago,
         )
@@ -244,7 +244,7 @@ def test_scheduler_reraises_non_active_scan_integrity_error(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="foreign-key-err.com",
-            authorized=True,
+            verification_status="verified",
             scan_interval_hours=24,
             next_scan_at=datetime.now(UTC) - timedelta(minutes=5),
         )
@@ -274,7 +274,7 @@ def test_scheduler_exception_does_not_stop_job_claiming(
         domain = Domain(
             org_id=_ensure_org(session).id,
             name="claim-resilient.com",
-            authorized=True,
+            verification_status="verified",
         )
         session.add(domain)
         session.flush()
