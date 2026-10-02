@@ -6,7 +6,15 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class HealthResponse(BaseModel):
@@ -266,3 +274,23 @@ class OrgMemberUpdate(BaseModel):
         ...,
         description="New role to assign to the member",
     )
+
+
+class AuditEventRead(BaseModel):
+    """Response schema for an audit event."""
+
+    id: int
+    org_id: int
+    actor_type: str
+    actor_user_id: UUID | None = None
+    action: str
+    target_type: str
+    target_id: str
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("metadata_", "metadata"),
+    )
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+

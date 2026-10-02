@@ -1521,3 +1521,221 @@ Platform operators can grant emergency overrides:
 
 
 
+
+
+---
+
+# Part 9: v3.3 — Append-Only Audit Logging & Event Tracking
+
+## 1. Plain-English Architecture & Design Walkthrough
+
+### Why Audit Logging in Multi-Tenant Security SaaS?
+Security teams and auditors expect a reliable record of security-sensitive actions. When an active scan is launched against public infrastructure, when user roles or organization memberships change, or when domain ownership is verified, overridden, or revoked, security teams must be able to reconstruct an authoritative timeline: who performed the action, under what authority, when it occurred, and what changed.
+
+In a multi-tenant platform, audit logging introduces three strict architectural constraints:
+1. **Tenant Isolation:** Audit events must be scoped by `org_id`. An organization's administrators must only ever observe their own tenant's audit trail.
+2. **Immutability Against the Application:** Application code, API endpoints, and potential SQL injection vulnerabilities must never be capable of modifying or deleting historical audit records.
+3. **Atomic Recording:** An audit record must never be committed if the underlying business action fails, nor should a business action succeed without its corresponding audit record.
+
+---
+
+### Database-Enforced Immutability: The Append-Only Trigger
+Rather than relying on application-level conventions (e.g. omitting update/delete methods in ORM models), immutability is enforced directly by PostgreSQL via a database trigger:
+- **Table:** `audit_events` (created in migration `0009_audit_events`).
+- **Trigger Function:**
+  ```sql
+  CREATE OR REPLACE FUNCTION prevent_audit_events_mutation()
+  RETURNS TRIGGER AS $$
+  BEGIN
+      RAISE EXCEPTION 'audit_events is append-only';
+  END;
+  $$ LANGUAGE plpgsql;
+  ```
+- **Trigger Definition:**
+  ```sql
+  CREATE TRIGGER trg_audit_events_append_only
+  BEFORE UPDATE OR DELETE ON audit_events
+  FOR EACH ROW
+  EXECUTE FUNCTION prevent_audit_events_mutation();
+  ```
+- **The "Append-Only Against the Application" Invariant:**
+  We explicitly document this guarantee as: *"append-only against the application; the table owner can disable the trigger"*.
+  We never use the marketing phrase "tamper-proof". Anyone with database superuser or table ownership privileges can execute `ALTER TABLE audit_events DISABLE TRIGGER trg_audit_events_append_only;` or drop the table directly. Honesty about trust boundaries is foundational to sound security architecture.
+
+---
+
+### The Unified Helper: `record_event()` in `src/asm/audit.py`
+All 15 audit events across the platform are created through a single authoritative function:
+```python
+def record_event(
+    db: Session,
+    *,
+    org_id: int,
+    actor_type: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    actor_user_id: uuid.UUID | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> AuditEvent:
+```
+
+#### The "No Flush, No Commit" Invariant
+`record_event()` constructs an `AuditEvent` model instance and calls `db.add(event)`.
+It intentionally **never** calls `db.flush()` or `db.commit()`.
+- **Atomic Fate with Business Transactions:** The audit event lives inside the caller's active database transaction. If the caller's operation completes successfully, `db.commit()` commits the state change and the audit event together. If the caller encounters an exception or rolls back, the audit event is rolled back with it.
+- **Elimination of Ghost Events:** If `record_event()` committed independently, an error occurring later in the API route (such as a database constraint violation or network failure) would leave a ghost audit event recording an action that never actually took effect.
+
+---
+
+### Metadata Sanitization & Defensive Invariants
+To prevent audit logs from becoming vectors for data exfiltration, storage exhaustion, or PII leakage, `record_event()` enforces strict defensive controls:
+
+1. **Per-Action Key and Type Allowlists (`ACTION_METADATA_SCHEMAS`):**
+   Every action has an immutable schema defining permitted metadata keys and their required Python types (e.g. `{"scan_type": str, "source": str}` for `scan.queued`). Any unexpected key or mismatched data type raises a `ValueError`.
+2. **Prohibited Sensitive Data:**
+   Tokens, JWTs, user passwords, user email addresses, and IP addresses are strictly forbidden from metadata schemas.
+3. **Truncation & Redaction for Free-Text Inputs:**
+   Certain actions accept free-text inputs provided by users or operators (`name` in `org.created`, `reason` in `verification.operator_verified` and `verification.revoked`).
+   - The value is truncated to **500 characters** before processing.
+   - Any patterns matching email addresses or IPv4/IPv6 addresses are masked with `[redacted]` via regular expressions.
+4. **Byte Size Cap:**
+   The serialized JSON metadata payload is checked to ensure it does not exceed **2048 bytes**, preventing denial-of-service via database storage bloat.
+
+---
+
+### The 15 Standardized Audit Actions
+The system tracks 15 discrete, security-relevant actions across 5 domains:
+
+| Action | Actor | When Recorded | Target Type |
+|---|---|---|---|
+| `org.created` | user / system | Organization is created | `organization` |
+| `membership.added` | user | User invited or added to organization | `membership` |
+| `membership.role_changed` | user | Member role updated (e.g. viewer to admin) | `membership` |
+| `membership.removed` | user | Member removed from organization | `membership` |
+| `domain.created` | user | Domain added to organization inventory | `domain` |
+| `domain.deleted` | user | Domain deleted from organization | `domain` |
+| `domain.alerts_changed` | user | Domain alerting enabled, disabled, or recipients changed | `domain` |
+| `domain.moved` | operator | Domain moved between organizations (2 events: source & target) | `domain` |
+| `verification.token_generated` | user / system | New verification token generated upon domain creation | `domain` |
+| `verification.checked` | user | Verification check requested via API | `domain` |
+| `verification.rotated` | user | Domain verification token rotated | `domain` |
+| `verification.operator_verified` | operator | Operator break-glass override applied | `domain` |
+| `verification.revoked` | operator | Operator override revoked | `domain` |
+| `verification.lapsed` | system | Background worker marks domain lapsed after 2 misses or expiration | `domain` |
+| `scan.queued` | user / system | Scan enqueued via API or scheduler | `scan_run` |
+
+**What is intentionally NOT recorded:**
+- Denied requests (e.g. HTTP 401 or 403 authorization failures). These are captured in edge/WAF logs, not the tenant business audit trail.
+- Client IP addresses and User-Agent headers (to avoid PII and GDPR/privacy storage overhead).
+- User authentication/login events (managed entirely by Supabase Auth).
+
+---
+
+### Audit Log Querying & Keyset Cursor Pagination
+The audit log is accessible via `GET /orgs/{org_id}/audit-events`:
+- **RBAC Protection:** Requires minimum role `admin` or `owner`. Non-members receive `404 Not Found`; `viewer` members receive `403 Forbidden`.
+- **Filtering:** Optional query parameters `domain_id` (bigint) and `action` (string).
+- **Keyset Cursor Pagination:**
+  - Standard pagination with `OFFSET` degrades to $O(N)$ query performance as table size grows.
+  - Keyset cursor pagination uses the primary key: `WHERE org_id = :org_id AND id < :before_id ORDER BY id DESC LIMIT :limit`.
+  - Capped at `limit <= 100` (default 50).
+  - Backed by the composite B-tree index `ix_audit_events_org_id_id` on `(org_id, id)`, queries execute in $O(\log N)$ time regardless of pagination depth.
+
+---
+
+## 2. Five Audit Logging & Event Tracking Interview Questions & Answers
+
+### Question 1: Why is the audit log described as "append-only against the application; the table owner can disable the trigger" rather than "tamper-proof"? What is the security difference between application-level immutability and true hardware/cryptographic immutability?
+**Answer:**
+- **Honest Trust Boundaries vs. Marketing Claims:**
+  In cybersecurity architecture, labeling an RDBMS table "tamper-proof" is inaccurate and misleading. Any user or process possessing database superuser privileges or table ownership can execute:
+  ```sql
+  ALTER TABLE audit_events DISABLE TRIGGER trg_audit_events_append_only;
+  ```
+  or directly run `DROP TABLE audit_events;`.
+- **Application-Level Immutability ("Append-Only Against the Application"):**
+  What the PostgreSQL trigger actually guarantees is that the **application runtime**, the web API, ORM operations, worker processes, and any SQL injection vulnerabilities executing within the application's database role cannot update or delete audit events. Even if an attacker gains full remote code execution inside the web application container, their SQL queries execute under the application's database credentials, where the trigger intercepts and blocks all `UPDATE` and `DELETE` attempts.
+- **True Immutability:**
+  True immutability requires:
+  1. *WORM Storage (Write Once, Read Many):* Cloud object storage with Object Lock in Compliance Mode (e.g. AWS S3 Object Lock, GCP Bucket Retention), where not even the root account can delete objects before the retention period expires.
+  2. *Cryptographic Hash-Chains:* Merkle-tree based public ledgers (such as Certificate Transparency logs or Sigstore Rekor) where every new event contains the cryptographic hash of the previous event and is signed by external witnesses.
+  Documenting the design honestly defines clear operational boundaries and avoids deceptive compliance assurances.
+
+---
+
+### Question 2: Why must the audit helper `record_event` intentionally avoid calling `db.commit()` or `db.flush()`? What catastrophic failure modes occur if an audit function commits independently?
+**Answer:**
+- **The Principle of Transaction Atomicity (All-or-Nothing):**
+  An audit log is an accurate record of events that *actually occurred* in the system. The creation of an audit record must therefore share the exact ACID transaction boundary of the business operation it describes.
+- **Failure Mode 1: Ghost Audit Records (False Positives):**
+  If `record_event()` called `db.commit()` immediately upon creating the audit row:
+  1. The API route calls `record_event(..., action="domain.created")`. The audit row commits to disk.
+  2. The next line of code attempts to commit the domain, but encounters a database unique constraint collision or foreign key failure.
+  3. The route raises an HTTP 409 exception and rolls back the domain insert.
+  4. *Result:* The audit log now contains a permanent, un-deletable record asserting that a domain was created, when in reality no domain was ever created. In a security incident investigation, ghost records corrupt the forensic timeline.
+- **Failure Mode 2: Premature Locks and Flushes:**
+  Calling `db.flush()` sends SQL queries to the database server before the business logic is complete, obtaining locks on sequences and rows prematurely and increasing database lock contention.
+- **The Correct Architecture:**
+  `record_event()` only calls `db.add(event)`. If the caller's outer transaction succeeds and commits, both the entity change and the audit event persist together. If an unhandled exception occurs, both roll back cleanly.
+
+---
+
+### Question 3: Why are free-text metadata fields (such as organization names or operator override reasons) truncated to 500 characters and masked as `[redacted]` rather than raising validation errors if emails or IPs are detected?
+**Answer:**
+- **Availability of Primary Business Operations:**
+  Audit logging is a secondary, cross-cutting telemetry concern. A failure in audit formatting must never block or abort a critical business or security operation.
+- **The Hazard of Fail-Closed Pattern Rejection:**
+  If the audit system raised a validation exception whenever an input matched an email or IP pattern:
+  1. *Operator Break-Glass Lockout:* An operator executing an emergency override via `asm admin verify-domain --reason "Bypassing DNS check for internal proxy 192.168.1.10"` would have their command aborted because the reason contained an IP address.
+  2. *Worker Lapsing Failure:* If a background verification worker encountered a DNS error containing an IP address and passed it to an audit metadata field, an exception would crash the worker and prevent the domain from transitioning to `lapsed`, leaving unauthorized scans running indefinitely.
+  3. *User Registration Friction:* A customer creating an organization named `support@company.com` would receive an unexpected 500 or 422 error.
+- **Sanitization via Masking and Truncation:**
+  By truncating strings to 500 characters and replacing email/IP patterns with `[redacted]`:
+  1. The business transaction always completes successfully.
+  2. Sensitive personal data (PII) and network topologies are prevented from leaking into audit logs.
+  3. Denial-of-service attacks attempting to bloat JSONB storage with multi-megabyte strings are neutralized upfront.
+
+---
+
+### Question 4: Explain why keyset cursor pagination (`before_id` / `id < before_id`) is superior to offset pagination (`OFFSET n LIMIT m`) for high-volume, append-only event streams.
+**Answer:**
+- **1. $O(\log N)$ Index Seeks vs. $O(N)$ Sequential Scans:**
+  - *Offset Pagination:* In `SELECT * FROM audit_events WHERE org_id = 1 ORDER BY id DESC LIMIT 50 OFFSET 100000;`, PostgreSQL must traverse the B-tree index to locate the start, read 100,000 index tuples, discard them all, and then return the next 50 rows. As the table grows into millions of records, deep pagination causes high disk I/O, CPU spikes, and query timeouts.
+  - *Keyset Pagination:* In `SELECT * FROM audit_events WHERE org_id = 1 AND id < 100050 ORDER BY id DESC LIMIT 50;`, the database uses the composite index `ix_audit_events_org_id_id` on `(org_id, id)` to perform a direct B-tree search for `(1, 100050)`. It immediately reads the subsequent 50 rows. The query executes in constant $O(\log N)$ time regardless of whether the user is on page 1 or page 10,000.
+- **2. Elimination of the "Pagination Shift / Missing Rows" Phenomenon:**
+  In an active system, new audit events are continuously inserted at the top of the table.
+  - If a user reads page 1 (`OFFSET 0 LIMIT 50`) and 10 new events are inserted while they inspect the results, requesting page 2 (`OFFSET 50 LIMIT 50`) shifts the window: the last 10 rows from page 1 are pushed into page 2 and displayed a second time.
+  - Conversely, in systems where rows are deleted, records are skipped entirely.
+  - With keyset cursor pagination, `before_id` anchors the query to a deterministic point in time. The next page consists strictly of records created before that specific ID, providing a consistent, non-shifting view of history.
+
+---
+
+### Question 5: When transferring a domain between organizations (`asm admin move-domain`), why does the system record two separate audit events (`domain.moved` under the source org and `domain.moved` under the target org) in the same transaction?
+**Answer:**
+- **Strict Multi-Tenant Scoping of Audit Queries:**
+  In multi-tenant architecture, tenant audit log queries are strictly filtered by organization:
+  ```sql
+  SELECT * FROM audit_events WHERE org_id = :org_id;
+  ```
+  Tenant administrators have no visibility into other organizations' audit records.
+- **The Blind Spot of a Single Event:**
+  - If `domain.moved` was recorded only under the source organization (`org_id = source_org_id`): The target organization's administrators would see a new domain appear in their inventory with no audit trail explaining when it arrived, who transferred it, or where it came from.
+  - If `domain.moved` was recorded only under the target organization (`org_id = target_org_id`): The source organization's administrators would see an asset vanish from their attack surface inventory with zero explanatory log entries, creating confusion during forensic audits.
+- **The Dual-Event Architecture:**
+  By recording two distinct audit events in the same atomic database transaction:
+  1. *Source Organization Event:*
+     - `org_id`: `source_org_id`
+     - `action`: `domain.moved`
+     - `actor_type`: `operator`
+     - `target_type`: `domain`
+     - `target_id`: str(domain_id)
+     - `metadata`: `{"to_org_id": target_org_id}`
+  2. *Target Organization Event:*
+     - `org_id`: `target_org_id`
+     - `action`: `domain.moved`
+     - `actor_type`: `operator`
+     - `target_type`: `domain`
+     - `target_id`: str(domain_id)
+     - `metadata`: `{"from_org_id": source_org_id}`
+  Both organizations receive a record of the asset movement without breaching tenant data isolation.

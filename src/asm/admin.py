@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from asm.audit import record_event
 from asm.db.models import Domain, Organization
 from asm.db.session import get_session_factory
 from asm.verification import queue_domain_alert
@@ -65,6 +66,27 @@ def move_domain(
 
     old_org_id = domain.org_id
     domain.org_id = target_org_id
+
+    # Record dual events in the same transaction
+    record_event(
+        session,
+        org_id=old_org_id,
+        actor_type="operator",
+        action="domain.moved",
+        target_type="domain",
+        target_id=str(domain_id),
+        metadata={"to_org_id": target_org_id, "reason": f"Moved to org {target_org_id}"},
+    )
+    record_event(
+        session,
+        org_id=target_org_id,
+        actor_type="operator",
+        action="domain.moved",
+        target_type="domain",
+        target_id=str(domain_id),
+        metadata={"from_org_id": old_org_id, "reason": f"Moved from org {old_org_id}"},
+    )
+
     session.commit()
     print(
         f"Successfully moved domain {domain_id} ('{domain.name}') from legacy quarantine "
@@ -109,6 +131,22 @@ def verify_domain(
     domain.verified_at = now_utc
     domain.consecutive_misses = 0
     domain.next_reverification_at = None
+
+    record_event(
+        session,
+        org_id=domain.org_id,
+        actor_type="operator",
+        action="verification.operator_granted",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={
+            "reason": cleaned_reason,
+            "expires_in_days": expires_in_days,
+            "verification_expires_at": domain.verification_expires_at.isoformat()
+            if domain.verification_expires_at
+            else None,
+        },
+    )
 
     session.commit()
     logger.info(
@@ -165,6 +203,16 @@ def revoke_verification(
             f"Reason: {cleaned_reason}. Automated scheduled monitoring is paused "
             "until ownership is verified."
         ),
+    )
+
+    record_event(
+        session,
+        org_id=domain.org_id,
+        actor_type="operator",
+        action="verification.operator_revoked",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={"reason": cleaned_reason},
     )
 
     session.commit()

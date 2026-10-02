@@ -13,7 +13,8 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 - **v3.1a User Auth & Organizations**: Done. Supabase JWT authentication, organization RBAC, and multi-tenant scoping.
 - **v3.1b Tenant Isolation**: Done. Foreign keys, row-level organization fences, and anti-enumeration defenses.
 - **v3.2 Domain Verification**: Done. Domain ownership proof via DNS TXT, continuous background re-verification, operator overrides, and scan gating.
-- **Next: v3.3**: Audit logs and event tracking.
+- **v3.3 Audit Log & Event Tracking**: Done. Append-only audit events table, trigger against app tampering, 15 structured actions, and organization audit API.
+- **Next: v3.4**: Dashboard.
 
 ---
 
@@ -190,6 +191,7 @@ All application API endpoints (except `/health`) require authentication via a va
 | `/orgs/{org_id}/members` | POST | `admin` | Add a member by email (`owner` only to appoint owners) |
 | `/orgs/{org_id}/members/{user_id}` | PATCH | `owner` | Update member role (enforces last-owner rule) |
 | `/orgs/{org_id}/members/{user_id}` | DELETE | `owner` / self | Remove member or leave organization |
+| `/orgs/{org_id}/audit-events` | GET | `admin` | List organization audit events with keyset cursor pagination |
 
 #### Managing Organizations and Members
 ```bash
@@ -403,13 +405,56 @@ curl -i http://127.0.0.1:8000/orgs/1/domains/1/alert-notifications \
 
 ---
 
-### 6. Admin CLI: Migrating Quarantine Domains
+### 6. Audit Log (v3.3)
+
+The ASM platform maintains an append-only audit trail recording state-changing actions performed by users, operators, and background system workers. The audit log is append-only against the application; the table owner can disable the trigger.
+
+#### Audit Actions (15 Actions)
+
+| Action | Actor | When |
+|---|---|---|
+| `org.created` | `user` | An organization is created via API |
+| `membership.added` | `user` | A member is added to an organization |
+| `membership.role_changed` | `user` | A member's role is updated |
+| `membership.removed` | `user` | A member is removed or leaves an organization |
+| `domain.created` | `user` | A domain is registered within an organization |
+| `domain.schedule_changed` | `user` | Domain recurring scan schedule is updated or disabled |
+| `domain.alerts_changed` | `user` | Domain email alert settings are configured |
+| `verification.checked` | `user` | Immediate DNS TXT verification check is triggered |
+| `verification.rotated` | `user` | Verification token is regenerated and status reset to pending |
+| `verification.operator_granted` | `operator` | Operator grants break-glass verification override via CLI |
+| `verification.operator_revoked` | `operator` | Operator revokes verification override via CLI |
+| `verification.lapsed` | `system` | Background worker lapses domain after 2 consecutive DNS misses |
+| `verification.override_expired` | `system` | Background worker expires operator override past validity window |
+| `domain.moved` | `operator` | Operator moves a domain from legacy quarantine to an organization |
+| `scan.queued` | `user` | A manual scan run is queued via API |
+
+#### Security & Privacy Invariants
+- **What is not recorded:** Denied requests (HTTP 401, 403, 404, 422), client IP addresses, user agents, and user login events are never recorded in `audit_events`.
+- **Metadata hygiene:** Metadata strictly uses a fixed allowlist of keys and data types per action. Audit events never store verification tokens, JWTs, email addresses, or IP addresses.
+- **Free-text redaction & truncation:** Free-text values (organization name, operator reasons) are truncated to at most 500 characters, and email addresses or IP address patterns are masked as `[redacted]`.
+- **Payload size cap:** Serialized event metadata is hard-capped at 2048 bytes.
+
+#### Querying Organization Audit Events
+Audit events are scoped strictly to the organization and accessible only to `admin` and `owner` roles (`viewer` receives HTTP 403 Forbidden; non-members receive HTTP 404 Not Found to prevent tenant enumeration):
+- **Filters:** `domain_id` (filters domain-scoped events) and `action` (filters by exact action name).
+- **Pagination & Ordering:** Results are returned newest first (`id DESC`). Keyset cursor pagination uses `before_id` (returns events with `id < before_id`) and `limit` (default 50, maximum 100).
+
+```bash
+# Query audit trail with filters and keyset cursor pagination
+curl -i "http://127.0.0.1:8000/orgs/1/audit-events?domain_id=1&action=verification.checked&limit=50&before_id=100" \
+  -H "Authorization: Bearer <token>"
+```
+
+---
+
+### 7. Admin CLI: Migrating Quarantine Domains
 
 Migration `0007_tenant_isolation` safely moved pre-existing unscoped domains into an isolated organization with `system_kind = 'legacy_quarantine'` (with zero members, rendering it inaccessible to all normal users).
 
 To move a quarantined domain into a customer organization, administrators use the CLI tool:
 ```bash
-python -m asm admin move-domain <domain_id> <target_org_id>
+python -m asm admin move-domain --domain-id <domain_id> --target-org-id <target_org_id>
 ```
 Security invariants enforced:
 - **Refuses Non-Quarantine Domains:** Exits with code 1 if the domain's current organization is not `system_kind = 'legacy_quarantine'`.
@@ -417,7 +462,7 @@ Security invariants enforced:
 - **Per-Org Name Collision Check:** Exits with code 1 if the target organization already monitors that domain name.
 
 
-### 7. Local Database Testing Setup & Migrations
+### 8. Local Database Testing Setup & Migrations
 
 #### How the Test Suite Creates the Database Schema
 The pytest integration test suite (`pytest -m db`) creates its database schema programmatically via SQLAlchemy:

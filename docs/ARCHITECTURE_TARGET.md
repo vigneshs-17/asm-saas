@@ -15,7 +15,8 @@ v1 CLI — DONE (verified)
 → v3.1a user auth + organizations — DONE (verified)
 → v3.1b tenant isolation — DONE (verified)
 → v3.2 domain verification — DONE (verified)
-→ v3.3 audit logs and event tracking — NEXT
+→ v3.3 audit logs and event tracking — DONE (verified)
+→ v3.4 dashboard — NEXT
 ```
 
 Continue from the exact current project state.

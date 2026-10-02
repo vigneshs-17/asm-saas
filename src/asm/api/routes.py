@@ -20,6 +20,7 @@ from asm.api.deps import (
 from asm.api.schemas import (
     ActiveScanConflict,
     AlertNotificationRead,
+    AuditEventRead,
     DomainAlertsUpdate,
     DomainCreate,
     DomainRead,
@@ -30,8 +31,10 @@ from asm.api.schemas import (
     ScanRunDetail,
     ScanRunRead,
 )
+from asm.audit import record_event
 from asm.db.models import (
     AlertNotification,
+    AuditEvent,
     Domain,
     Membership,
     Organization,
@@ -128,6 +131,20 @@ def create_domain(
         verification_method="dns_txt",
     )
     db.add(domain)
+    db.flush()
+
+    _, caller_membership = auth_context
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="domain.created",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={"name": domain.name},
+    )
+
     db.commit()
     db.refresh(domain)
     logger.info(
@@ -286,6 +303,34 @@ def check_domain_verification(
             ),
         )
 
+    _, caller_membership = auth_context
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="verification.checked",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={
+            "outcome": outcome.value,
+            "consecutive_misses": domain.consecutive_misses,
+        },
+    )
+    if just_lapsed:
+        record_event(
+            db,
+            org_id=org_id,
+            actor_type="system",
+            action="verification.lapsed",
+            target_type="domain",
+            target_id=str(domain.id),
+            metadata={
+                "consecutive_misses": domain.consecutive_misses,
+                "outcome": "absent",
+            },
+        )
+
     db.commit()
     db.refresh(domain)
     return _domain_to_verification_read(
@@ -332,6 +377,18 @@ def rotate_domain_verification(
     domain.verification_reason = None
     domain.verification_expires_at = None
     domain.next_reverification_at = None
+
+    _, caller_membership = auth_context
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="verification.rotated",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={},
+    )
 
     db.commit()
     db.refresh(domain)
@@ -393,6 +450,17 @@ def queue_scan(
 
     try:
         scan_run = enqueue_scan(db, domain.id, trigger="manual", idempotency_key=idempotency_key)
+        _, caller_membership = auth_context
+        record_event(
+            db,
+            org_id=org_id,
+            actor_type="user",
+            actor_user_id=caller_membership.user_id,
+            action="scan.queued",
+            target_type="domain",
+            target_id=str(domain.id),
+            metadata={"scan_run_id": scan_run.id, "trigger": "manual"},
+        )
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -627,6 +695,7 @@ def update_domain_schedule(
     """Configure or disable automated periodic scanning for an authorized domain."""
     domain = get_domain_for_org(db, org_id, domain_id)
 
+    old_interval = domain.scan_interval_hours
     if payload.interval_hours is None:
         domain.scan_interval_hours = None
         domain.next_scan_at = None
@@ -645,6 +714,21 @@ def update_domain_schedule(
             domain.next_scan_at = func.now() + text("interval '1 hour' * :h").bindparams(
                 h=payload.interval_hours
             )
+
+    _, caller_membership = auth_context
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="domain.schedule_changed",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={
+            "old_interval_hours": old_interval,
+            "new_interval_hours": payload.interval_hours,
+        },
+    )
 
     db.commit()
     db.refresh(domain)
@@ -678,9 +762,29 @@ def update_domain_alerts(
             detail=f"Domain '{domain.name}' is not verified.",
         )
 
+    old_enabled = domain.alerts_enabled
+    old_severity = domain.alert_min_severity
+
     domain.alerts_enabled = payload.alerts_enabled
     domain.alert_emails = [str(email) for email in payload.alert_emails]
     domain.alert_min_severity = payload.alert_min_severity
+
+    _, caller_membership = auth_context
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="domain.alerts_changed",
+        target_type="domain",
+        target_id=str(domain.id),
+        metadata={
+            "old_enabled": old_enabled,
+            "new_enabled": payload.alerts_enabled,
+            "old_min_severity": old_severity,
+            "new_min_severity": payload.alert_min_severity,
+        },
+    )
 
     db.commit()
     db.refresh(domain)
@@ -717,3 +821,41 @@ def list_domain_alert_notifications(
         .limit(limit)
     )
     return db.scalars(query).all()
+
+
+@router.get(
+    "/audit-events",
+    response_model=list[AuditEventRead],
+    summary="List organization audit events",
+    responses={
+        200: {"description": "List of audit events returned"},
+        403: {"description": "Insufficient permissions (admin or owner required)"},
+        404: {"description": "Organization not found (or non-member)"},
+    },
+)
+def list_audit_events(
+    org_id: int,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
+    db: DbSession,
+    domain_id: Annotated[int | None, Query(description="Filter by domain ID")] = None,
+    action: Annotated[str | None, Query(description="Filter by action")] = None,
+    limit: Annotated[int, Query(ge=1, le=100, description="Max items to return")] = 50,
+    before_id: Annotated[
+        int | None,
+        Query(description="Keyset cursor: return events with id < before_id"),
+    ] = None,
+) -> list[AuditEventRead]:
+    """Retrieve audit trail of events for this organization, newest first."""
+    stmt = select(AuditEvent).where(AuditEvent.org_id == org_id)
+    if domain_id is not None:
+        stmt = stmt.where(
+            AuditEvent.target_type == "domain", AuditEvent.target_id == str(domain_id)
+        )
+    if action is not None:
+        stmt = stmt.where(AuditEvent.action == action)
+    if before_id is not None:
+        stmt = stmt.where(AuditEvent.id < before_id)
+    stmt = stmt.order_by(AuditEvent.id.desc()).limit(limit)
+    events = db.scalars(stmt).all()
+    return [AuditEventRead.model_validate(e) for e in events]
+

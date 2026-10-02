@@ -16,6 +16,7 @@ from asm.api.schemas import (
     OrgRead,
     OrgWithRoleRead,
 )
+from asm.audit import record_event
 from asm.db.models import Membership, Organization, User
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,18 @@ def create_organization(
         role="owner",
     )
     db.add(membership)
+
+    record_event(
+        db,
+        org_id=org.id,
+        actor_type="user",
+        actor_user_id=current_user.id,
+        action="org.created",
+        target_type="org",
+        target_id=str(org.id),
+        metadata={"name": org.name},
+    )
+
     db.commit()
     db.refresh(org)
 
@@ -181,6 +194,19 @@ def add_organization_member(
         role=payload.role,
     )
     db.add(membership)
+    db.flush()
+
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="membership.added",
+        target_type="membership",
+        target_id=str(membership.id),
+        metadata={"user_id": str(target_user.id), "role": payload.role},
+    )
+
     db.commit()
     db.refresh(membership)
 
@@ -213,6 +239,8 @@ def update_member_role(
     db: DbSession,
 ) -> OrgMemberRead:
     """Update a member's role. Restricted to owners. Enforces last-owner invariant."""
+    _, caller_membership = auth_context
+
     target_member = db.execute(
         select(Membership).where(
             Membership.org_id == org_id,
@@ -243,7 +271,24 @@ def update_member_role(
                 detail="Cannot demote the last owner of an organization",
             )
 
+    old_role = target_member.role
     target_member.role = payload.role
+
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=caller_membership.user_id,
+        action="membership.role_changed",
+        target_type="membership",
+        target_id=str(target_member.id),
+        metadata={
+            "user_id": str(user_id),
+            "old_role": old_role,
+            "new_role": payload.role,
+        },
+    )
+
     db.commit()
     db.refresh(target_member)
 
@@ -328,6 +373,20 @@ def remove_organization_member(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Cannot remove the last owner of an organization",
             )
+
+    target_member_id = target_member.id
+    target_member_role = target_member.role
+
+    record_event(
+        db,
+        org_id=org_id,
+        actor_type="user",
+        actor_user_id=current_user.id,
+        action="membership.removed",
+        target_type="membership",
+        target_id=str(target_member_id),
+        metadata={"user_id": str(user_id), "role": target_member_role},
+    )
 
     db.delete(target_member)
     db.commit()

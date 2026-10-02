@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
+    DDL,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -14,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -457,6 +460,9 @@ class Organization(Base):
     domains: Mapped[list["Domain"]] = relationship(
         back_populates="organization", cascade="all, delete-orphan"
     )
+    audit_events: Mapped[list["AuditEvent"]] = relationship(
+        back_populates="organization"
+    )
 
 
 class Membership(Base):
@@ -494,4 +500,66 @@ class Membership(Base):
     # Relationships
     organization: Mapped["Organization"] = relationship(back_populates="memberships")
     user: Mapped["User"] = relationship(back_populates="memberships")
+
+
+class AuditEvent(Base):
+    """Append-only audit event recording actions taken by users, operators, or the system."""
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        CheckConstraint(
+            "actor_type IN ('user', 'operator', 'system')",
+            name="ck_audit_events_actor_type",
+        ),
+        Index("ix_audit_events_org_id_id", "org_id", "id"),
+        Index("ix_audit_events_org_target", "org_id", "target_type", "target_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    org_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    actor_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=text("now()"),
+        nullable=False,
+    )
+
+    # Relationships
+    organization: Mapped["Organization"] = relationship(back_populates="audit_events")
+
+
+_audit_trigger_ddl = DDL("""
+CREATE OR REPLACE FUNCTION prevent_audit_events_tampering()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_events is append-only: updates, deletes, and truncates are prohibited';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_audit_events_append_only
+BEFORE UPDATE OR DELETE OR TRUNCATE ON audit_events
+FOR EACH STATEMENT
+EXECUTE FUNCTION prevent_audit_events_tampering();
+""")
+
+event.listen(
+    AuditEvent.__table__,
+    "after_create",
+    _audit_trigger_ddl.execute_if(dialect="postgresql"),
+)
+
 

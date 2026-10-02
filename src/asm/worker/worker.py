@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from asm.alerts.delivery import send_smtp_email
 from asm.alerts.digest import build_alert_digest
 from asm.alerts.rules import should_trigger_alerts
+from asm.audit import record_event
 from asm.db.models import Domain, ScanResult
 from asm.db.scans import enqueue_scan
 from asm.scan_common import sanitize_error_text
@@ -295,6 +296,16 @@ class ASMWorker:
                     ),
                 )
 
+                record_event(
+                    session,
+                    org_id=domain.org_id,
+                    actor_type="system",
+                    action="verification.override_expired",
+                    target_type="domain",
+                    target_id=str(domain.id),
+                    metadata={},
+                )
+
                 session.commit()
                 processed_count += 1
 
@@ -348,6 +359,18 @@ class ASMWorker:
                             "scheduled monitoring is paused until ownership is "
                             "re-verified."
                         ),
+                    )
+                    record_event(
+                        session,
+                        org_id=domain.org_id,
+                        actor_type="system",
+                        action="verification.lapsed",
+                        target_type="domain",
+                        target_id=str(domain.id),
+                        metadata={
+                            "consecutive_misses": domain.consecutive_misses,
+                            "outcome": "absent",
+                        },
                     )
 
                 session.commit()

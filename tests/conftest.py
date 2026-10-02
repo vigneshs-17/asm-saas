@@ -115,15 +115,22 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 @pytest.fixture
 def clean_db(db_engine) -> Generator[None, None, None]:
     """Ensure database tables are truncated before and after multi-threaded concurrency tests."""
-    truncate_sql = text(
-        "TRUNCATE TABLE memberships, organizations, users, alert_notifications, "
-        "scan_changes, scan_results, scan_stages, scan_runs, domains RESTART IDENTITY CASCADE"
-    )
+    def _truncate(conn):
+        conn.execute(text("ALTER TABLE audit_events DISABLE TRIGGER trg_audit_events_append_only;"))
+        conn.execute(
+            text(
+                "TRUNCATE TABLE memberships, organizations, users, alert_notifications, "
+                "scan_changes, scan_results, scan_stages, scan_runs, domains, audit_events "
+                "RESTART IDENTITY CASCADE;"
+            )
+        )
+        conn.execute(text("ALTER TABLE audit_events ENABLE TRIGGER trg_audit_events_append_only;"))
+
     with db_engine.begin() as conn:
-        conn.execute(truncate_sql)
+        _truncate(conn)
     yield
     with db_engine.begin() as conn:
-        conn.execute(truncate_sql)
+        _truncate(conn)
 
 
 @pytest.fixture

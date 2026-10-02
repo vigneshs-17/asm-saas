@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Outbox Lapse Alerts**: Atomic emission of transactional outbox email notifications (`"Domain verification lapsed: monitoring paused"`) upon domain lapse or operator override expiration.
 - **Operator Break-Glass Overrides**: Administrative CLI `asm admin verify-domain --domain-id <id> --reason "<text>" [--expires-in-days <1..90>]` and `asm admin revoke-verification --domain-id <id> --reason "<text>"` with mandatory justifications and bounded expiration.
 
+#### Audit Log & Event Tracking (v3.3)
+- **Append-Only Audit Events Table (0009)**: Migration `0009_audit_events` creates `audit_events` table with BigInteger primary key, foreign key `org_id` referencing `organizations(id)` (`ON DELETE RESTRICT`), actor type check constraint (`user`, `operator`, `system`), nullable `actor_user_id` UUID without foreign key, `action`, `target_type`, `target_id`, `metadata` JSONB, and `created_at` timestamptz. Covered by composite indexes `(org_id, id)` and `(org_id, target_type, target_id)`.
+- **Append-Only Database Trigger**: PostgreSQL trigger `trg_audit_events_append_only` and function `prevent_audit_events_tampering()` raising exceptions on any `UPDATE`, `DELETE`, or `TRUNCATE` operations against `audit_events` (attached via migration and SQLAlchemy model `after_create` DDL).
+- **15 Structured Lifecycle Actions**: Complete instrumentation across user, operator, and system actions:
+  - Organizations: `org.created`
+  - Memberships: `membership.added`, `membership.role_changed`, `membership.removed`
+  - Domains: `domain.created`, `domain.schedule_changed`, `domain.alerts_changed`
+  - Verification: `verification.checked`, `verification.rotated`, `verification.operator_granted`, `verification.operator_revoked`, `verification.lapsed`, `verification.override_expired`
+  - Movement & Scans: `domain.moved` (dual-event recorded in source and target orgs in the same transaction), `scan.queued` (manual scan runs only; idempotent replays emit no duplicate events).
+- **Metadata Sanitization & Redaction**: Strict per-action allowlisted keys and expected types; unknown or wrong-typed keys raise `ValueError`. Never stores tokens, JWTs, emails, or IP addresses. Free-text values (`org.created` name, operator reasons) are truncated to 500 characters, and email/IP patterns are masked as `[redacted]`. Serialized event metadata is hard-capped at 2048 bytes.
+- **Organization Audit API**: `GET /orgs/{org_id}/audit-events` restricted to `admin` and `owner` roles (viewer 403, non-member 404) with `domain_id` and `action` filters and keyset cursor pagination (`limit` capped at 100, `before_id` cursor, ordered by `id DESC`).
+- **Transactional Atomicity**: Single helper `record_event(session, ...)` adds events to the caller's session without committing or flushing, guaranteeing that failed or rolled-back operations never leave orphan audit records.
+
 ### Changed
 - **BREAKING (API)**: Removed `authorized` and `authorization_note` fields from `DomainCreate` request schema and database models. Client can no longer assert authorization.
 - **BREAKING (Database)**: Migration `0008_domain_verification` resets all existing domains to `verification_status = 'pending'`, pausing automated scheduled scans until DNS verification is completed.
