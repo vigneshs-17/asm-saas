@@ -1,0 +1,187 @@
+{#- Polling attributes are emitted together, and only while polling. An hx-get with no
+    hx-trigger falls back to htmx's default "click" trigger, which would re-fetch the
+    whole panel on any click inside a finished scan. -#}
+<section class="surface-panel" id="scan-detail-container"
+  {%- if should_poll %}
+  hx-get="/ui/orgs/{{ org.id }}/scans/{{ scan_run.id }}"
+  hx-target="this"
+  hx-swap="outerHTML"
+  hx-trigger="every 3s"
+  {%- endif %}>
+
+  <div class="surface-panel-header">
+    <div class="action-row">
+      <button type="button" id="btn-back-scans" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+        Back to scans
+      </button>
+    </div>
+    <h2 class="panel-title">Scan #{{ scan_run.id }} for {{ domain.name }}</h2>
+    <p class="panel-subtitle">Multi-stage pipeline execution, attack surface findings, and delta changes.</p>
+  </div>
+
+  {% if is_stale_active %}
+  <div class="banner-stale" role="status">
+    <span>Still {{ status_display|lower }} after 15 minutes. Automatic updates have stopped.</span>
+    <button type="button" id="btn-refresh-scan" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-scan-id="{{ scan_run.id }}">
+      Refresh
+    </button>
+  </div>
+  {% endif %}
+
+  <div class="form-group">
+    <label class="form-label">Scan status</label>
+    <div>
+      <span class="status-badge status-{{ scan_run.status }}">Status: {{ status_display }}</span>
+      <span class="text-muted scan-meta">
+        Trigger: {{ scan_run.trigger|capitalize }} | Created: {{ scan_run.created_at.strftime('%Y-%m-%d %H:%M UTC') }} | Duration: {{ duration }}
+      </span>
+    </div>
+  </div>
+
+  {% if scan_run.error %}
+  <div class="alert-box alert-error">
+    <strong>Scan failed:</strong> {{ scan_run.error }}
+  </div>
+  {% endif %}
+
+  <!-- Pipeline Stages -->
+  <div class="surface-panel-header section-header-first">
+    <h3 class="panel-title">Pipeline stages</h3>
+  </div>
+  <div class="stage-pipeline">
+    {% for stage in pipeline_stages %}
+    <div class="stage-card">
+      <div class="stage-card-title">{{ stage.name }}</div>
+      <div class="stage-card-status">
+        <span class="status-badge status-{{ stage.status }}">{{ stage.status_display }}</span>
+      </div>
+      <div class="stage-card-duration">Duration: {{ stage.duration }}</div>
+      {% if stage.error %}
+      <div class="stage-card-error">
+        {{ stage.error }}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- Fix First: Prioritized Findings -->
+  <div class="surface-panel-header section-header">
+    <h3 class="panel-title">Fix first</h3>
+    <p class="panel-subtitle">Prioritized security findings sorted by severity tier, score impact, and target host.</p>
+  </div>
+
+  {% if fix_first and fix_first.total > 0 %}
+  <div class="score-summary-grid">
+    <div class="score-card">
+      <div class="score-card-value">{{ fix_first.domain_score }}</div>
+      <div class="score-card-label">Domain score</div>
+    </div>
+    <div class="score-card">
+      <div class="score-card-value">
+        <span class="tier-badge tier-{{ fix_first.domain_band.lower() }}">{{ fix_first.domain_band_display }}</span>
+      </div>
+      <div class="score-card-label">Risk band</div>
+    </div>
+    <div class="score-card">
+      <div class="score-card-value">{{ fix_first.counts.get('CRITICAL', 0) }}</div>
+      <div class="score-card-label">Critical</div>
+    </div>
+    <div class="score-card">
+      <div class="score-card-value">{{ fix_first.counts.get('HIGH', 0) }}</div>
+      <div class="score-card-label">High</div>
+    </div>
+    <div class="score-card">
+      <div class="score-card-value">{{ fix_first.counts.get('MEDIUM', 0) }}</div>
+      <div class="score-card-label">Medium</div>
+    </div>
+    <div class="score-card">
+      <div class="score-card-value">{{ fix_first.counts.get('LOW', 0) }}</div>
+      <div class="score-card-label">Low</div>
+    </div>
+  </div>
+
+  <div class="table-container">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Tier</th>
+          <th>Finding</th>
+          <th>Host / Port</th>
+          <th>Points</th>
+          <th>Evidence</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in fix_first.findings %}
+        <tr>
+          <td>
+            <span class="tier-badge tier-{{ f.tier.lower() }}">{{ f.tier_display }}</span>
+          </td>
+          <td>
+            <strong>{{ f.title }}</strong>
+            {% if f.why_it_matters %}
+            <p class="text-muted finding-why">{{ f.why_it_matters }}</p>
+            {% endif %}
+          </td>
+          <td>
+            <code>{{ f.host }}{% if f.port is not none %}:{{ f.port }}{% endif %}</code>
+          </td>
+          <td>{{ f.points }}</td>
+          <td>
+            <code>{{ f.evidence }}</code>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if fix_first.more_count > 0 %}
+  <p class="text-muted findings-more">... and {{ fix_first.more_count }} more findings.</p>
+  {% endif %}
+
+  {% else %}
+  <p class="text-muted">No findings reported for this scan run.</p>
+  {% endif %}
+
+  <!-- Scan Changes -->
+  <div class="surface-panel-header section-header">
+    <h3 class="panel-title">Changes detected</h3>
+    <p class="panel-subtitle">Differences observed compared against the baseline scan.</p>
+  </div>
+
+  {% if scan_changes %}
+  <div class="table-container">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Severity</th>
+          <th>Category</th>
+          <th>Change type</th>
+          <th>Asset</th>
+          <th>Detail</th>
+          <th>Evidence</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ch in scan_changes %}
+        <tr>
+          <td>
+            <span class="tier-badge tier-{{ ch.severity.lower() }}">{{ ch.severity|capitalize }}</span>
+          </td>
+          <td>{{ ch.category|capitalize }}</td>
+          <td><code>{{ ch.change_type }}</code></td>
+          <td><code>{{ ch.asset }}</code></td>
+          <td>{{ ch.detail }}</td>
+          <td><code>{{ ch.evidence }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-muted">No changes detected in this scan.</p>
+  {% endif %}
+
+</section>

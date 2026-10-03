@@ -1,0 +1,78 @@
+<section class="surface-panel">
+  <div class="surface-panel-header">
+    <div class="action-row">
+      <button type="button" id="btn-back-domain-detail" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+        Back to domain
+      </button>
+    </div>
+    <h2 class="panel-title">Scans for {{ domain.name }}</h2>
+    <p class="panel-subtitle">Recent scan executions and attack surface changes.</p>
+  </div>
+
+  {% if user_role in ('admin', 'owner') %}
+  <div class="surface-panel-header">
+    <div class="action-row">
+      {% if domain.verification_status == 'verified' %}
+      <button type="button" id="btn-run-scan" class="btn btn-primary" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+        Run scan
+      </button>
+      {% else %}
+      <div>
+        <button type="button" id="btn-run-scan" class="btn btn-primary" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}" disabled title="Domain ownership verification required to run scans">
+          Run scan
+        </button>
+        <p class="text-muted run-scan-hint">Domain ownership verification required to run scans.</p>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if scans_data %}
+  <div class="table-container">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Scan ID</th>
+          <th>Trigger</th>
+          <th>Status</th>
+          <th>Started at</th>
+          <th>Duration</th>
+          <th>Changes</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in scans_data %}
+        <tr>
+          <td><strong>#{{ item.scan.id }}</strong></td>
+          <td>{{ item.scan.trigger|capitalize }}</td>
+          <td>
+            <span class="status-badge status-{{ item.scan.status }}">Status: {{ item.status_display }}</span>
+          </td>
+          <td class="text-muted">
+            {% if item.scan.started_at %}
+            {{ item.scan.started_at.strftime('%Y-%m-%d %H:%M UTC') }}
+            {% else %}
+            --
+            {% endif %}
+          </td>
+          <td class="text-muted">{{ item.duration }}</td>
+          <td>{{ item.changes_summary }}</td>
+          <td>
+            <button type="button" class="btn btn-secondary btn-sm btn-view-scan" data-org-id="{{ org.id }}" data-scan-id="{{ item.scan.id }}">
+              View scan
+            </button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if is_limited %}
+  <p class="text-muted findings-more">Showing the latest {{ scans_limit }} scans.</p>
+  {% endif %}
+  {% else %}
+  <p class="text-muted">No scans run yet for this domain.</p>
+  {% endif %}
+</section>

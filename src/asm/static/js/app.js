@@ -74,15 +74,26 @@
         }
         currentAccessToken = data.session.access_token;
         isRefreshing = false;
-        // Retry the failed HTMX request once
+        // Retry the failed HTMX request once, keeping the original element's swap style.
+        // The scan detail poller uses hx-target="this" + hx-swap="outerHTML"; retrying with
+        // htmx's default swap (replace the target's children) would nest a second polling
+        // <section> inside the first.
         if (evt.detail.requestConfig) {
           const cfg = evt.detail.requestConfig;
-          window.htmx.ajax(cfg.verb.toUpperCase(), cfg.path, {
+          const sourceElt = evt.detail.elt;
+          const swapStyle = sourceElt && sourceElt.getAttribute
+            ? sourceElt.getAttribute('hx-swap')
+            : null;
+          const retryContext = {
             target: evt.detail.target,
             headers: Object.assign({}, cfg.headers, {
               Authorization: 'Bearer ' + currentAccessToken,
             }),
-          });
+          };
+          if (swapStyle) {
+            retryContext.swap = swapStyle;
+          }
+          window.htmx.ajax(cfg.verb.toUpperCase(), cfg.path, retryContext);
         }
       } catch (err) {
         isRefreshing = false;
@@ -185,6 +196,20 @@
   function loadDomainDetail(orgId, domainId) {
     if (!orgId || !domainId) return Promise.resolve();
     return window.htmx.ajax('GET', '/ui/orgs/' + orgId + '/domains/' + domainId, {
+      target: '#main-content-area',
+    });
+  }
+
+  function loadScansList(orgId, domainId) {
+    if (!orgId || !domainId) return Promise.resolve();
+    return window.htmx.ajax('GET', '/ui/orgs/' + orgId + '/domains/' + domainId + '/scans', {
+      target: '#main-content-area',
+    });
+  }
+
+  function loadScanDetail(orgId, scanId) {
+    if (!orgId || !scanId) return Promise.resolve();
+    return window.htmx.ajax('GET', '/ui/orgs/' + orgId + '/scans/' + scanId, {
       target: '#main-content-area',
     });
   }
@@ -500,6 +525,113 @@
         loadDomainDetail(orgId, domainId);
       } catch (err) {
         showError('Token rotation error: ' + err.message);
+      }
+      return;
+    }
+
+    // Navigation: View domain scans list
+    if (target.classList.contains('btn-view-scans')) {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const domainId = target.getAttribute('data-domain-id');
+      loadScansList(orgId, domainId);
+      return;
+    }
+
+    // Navigation: View scan detail
+    if (target.classList.contains('btn-view-scan')) {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const scanId = target.getAttribute('data-scan-id');
+      loadScanDetail(orgId, scanId);
+      return;
+    }
+
+    // Navigation: Back to domain detail
+    if (target.id === 'btn-back-domain-detail') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const domainId = target.getAttribute('data-domain-id');
+      loadDomainDetail(orgId, domainId);
+      return;
+    }
+
+    // Action: Manually refresh a scan whose automatic polling stopped (15-minute cap)
+    if (target.id === 'btn-refresh-scan') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const scanId = target.getAttribute('data-scan-id');
+      loadScanDetail(orgId, scanId);
+      return;
+    }
+
+    // Navigation: Back to scans list
+    if (target.id === 'btn-back-scans') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const domainId = target.getAttribute('data-domain-id');
+      loadScansList(orgId, domainId);
+      return;
+    }
+
+    // Action: Run Scan (POST /orgs/{org_id}/domains/{domain_id}/scans)
+    if (target.id === 'btn-run-scan') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const domainId = target.getAttribute('data-domain-id');
+
+      target.disabled = true;
+      const originalBtnText = target.textContent;
+      target.textContent = 'Starting scan...';
+
+      const idempotencyKey = (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : String(Date.now());
+
+      try {
+        const resp = await authenticatedFetch(
+          '/orgs/' + orgId + '/domains/' + domainId + '/scans',
+          {
+            method: 'POST',
+            headers: {
+              'Idempotency-Key': idempotencyKey,
+            },
+          }
+        );
+
+        target.disabled = false;
+        target.textContent = originalBtnText;
+
+        if (resp.status === 409) {
+          const errData = await resp.json().catch(function () { return {}; });
+          showError(errData.detail || 'A scan is already active for this domain.');
+          return;
+        }
+
+        if (resp.status === 422) {
+          const errData = await resp.json().catch(function () { return {}; });
+          showError(errData.detail || 'Domain ownership verification required before scanning.');
+          return;
+        }
+
+        if (!resp.ok) {
+          const errData = await resp.json().catch(function () { return {}; });
+          showError(errData.detail || 'Failed to start scan.');
+          return;
+        }
+
+        const scanData = await resp.json();
+        loadScanDetail(orgId, scanData.id);
+      } catch (err) {
+        target.disabled = false;
+        target.textContent = originalBtnText;
+        showError('Run scan error: ' + err.message);
       }
       return;
     }

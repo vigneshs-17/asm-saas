@@ -85,6 +85,66 @@
 - **Fix:** Handled `TOKEN_REFRESHED` by only updating `currentAccessToken` in module memory and returning early without touching the DOM. Guarded `onUserAuthenticated()` with an `isAuthenticated` flag so it runs only once per sign-in.
 - **How to prevent it:** Distinguish between token lifecycle events (`TOKEN_REFRESHED`) and user session state changes (`SIGNED_IN`, `SIGNED_OUT`).
 
+### Entry O: Fix-First Count Cards Always Showed 0 on Real Scans
+- **What happened:** In real scans, the summary cards for Critical, High, Medium, and Low findings displayed 0 even when findings of those tiers existed.
+- **Root cause:** Test fixtures were built using invented dictionary keys (e.g., `{"CRITICAL": 1, "HIGH": 2}`), whereas the real producer `ScoreReport.to_dict()` in `scoring.py` serializes keys as `findings_critical`, `findings_high`, `hosts_high`, etc.
+- **Fix:** Per-tier counts are now computed directly from all parsed findings in memory before applying the 50-row cap (`counts = dict.fromkeys(TIER_ORDER, 0)`), ignoring the producer's internal report counts mapping.
+- **How to prevent it:** Build test fixtures from the real producer (`ScoreReport(...).to_dict()`) rather than handwriting mock dictionary payloads.
+
+### Entry P: Scans List Showed "No Changes" for Scans with Real Changes
+- **What happened:** The domain scans list showed "No changes" for completed scans that actually had detected attack surface changes.
+- **Root cause:** The initial UI parser expected a `"total"` key inside `scan_runs.change_detection["counts"]`. The worker (`worker.py`) writes counts as a dictionary of five individual tiers (`{"critical": ..., "high": ..., "medium": ..., "low": ..., "info": ...}`) without any `"total"` key.
+- **Fix:** Updated `format_change_summary` to sum the counts across all five tiers (`critical`, `high`, `medium`, `low`, `info`). If the sum is zero, it renders "No changes"; otherwise, it lists non-zero tiers (e.g. `1 critical, 2 info`).
+- **How to prevent it:** Use contract test fixtures derived directly from worker output rather than synthetic test dictionaries.
+
+### Entry Q: Finished Scans Re-Fetched on Every Click
+- **What happened:** Clicking anywhere inside a completed or failed scan detail panel triggered an unwanted HTTP GET request back to the server.
+- **Root cause:** `hx-get` was placed unconditionally on the `<section id="scan-detail-container">` container. When the scan finished, `hx-trigger="every 3s"` was omitted, causing HTMX to fall back to its default element trigger (`click`).
+- **Fix:** Emitted all HTMX polling attributes (`hx-get`, `hx-target="this"`, `hx-swap="outerHTML"`, `hx-trigger="every 3s"`) together inside `{% if should_poll %}`. Finished scans omit `hx-get` entirely.
+- **How to prevent it:** In HTMX templates, never emit `hx-get` without an explicit trigger if the element is not intended to be clickable.
+
+### Entry R: CSP Blocked Inline Style Attributes
+- **What happened:** The strict Content Security Policy (`style-src 'self'`) blocked 8 inline `style="..."` attributes in the dashboard partials.
+- **Root cause:** Quick inline styling was added during development without considering that `style-src 'self'` forbids inline styles.
+- **Fix:** Replaced all inline style attributes with semantic CSS classes in `src/asm/static/css/app.css` (`.section-header`, `.section-header-first`, `.stage-card-error`, `.finding-why`, `.findings-more`, `.run-scan-hint`, `.scan-meta`). Added `test_templates_have_no_csp_blocked_inline_code` to catch inline styles during test runs.
+- **How to prevent it:** Enforce CSP compliance in automated test suites with a template AST or regex guard test.
+
+### Entry S: Two Broken Test Cases in v3.4b Suite
+- **What happened:** Two newly added tests failed during implementation: one failed on database uniqueness constraint, and one failed on ordering assertion.
+- **Root cause:**
+  1. Setting up two running scans for the same domain violated the partial unique index `uq_scan_runs_active_domain` (which permits at most one queued or running scan per domain).
+  2. Capping test generated hostnames like `host1.example.com`, `host2.example.com` ... `host10.example.com`; alphabetical string sorting placed `host10` before `host2`, breaking the expected index sequence.
+- **Fix:**
+  1. Used a separate domain fixture for the stale active scan test case.
+  2. Zero-padded test hostnames (`host00`, `host01`, ..., `host59`) so alphabetical ordering matches integer index ordering.
+- **How to prevent it:** Respect domain database constraints in test setup; use zero-padding when string ordering must align with numeric sequence.
+
+### Entry T: 401 Token Refresh Nested Duplicate Polling Containers
+- **What happened:** Code review (not a user report) found that if an access token expired during background polling, the 401 refresh-and-retry would re-render the scan detail container nested inside the existing one.
+- **Root cause:** The scan detail poller uses `hx-target="this"` and `hx-swap="outerHTML"`. The generic 401 retry handler in `app.js` executed `window.htmx.ajax()` with default swap behavior (`innerHTML`), inserting the outer container inside itself.
+- **Fix:** Updated `app.js` 401 response error handler to inspect the source element's `hx-swap` attribute (`evt.detail.elt.getAttribute('hx-swap')`) and preserve it on retry (`retryContext.swap = swapStyle`).
+- **How to prevent it:** When replaying requests in HTMX error handlers, preserve the original request's swap and target context.
+
+### Entry U: WCAG AA Color Contrast Failure on Tungsten Warning Text
+- **What happened:** Accessibility check revealed that `--color-tungsten-warning: #c25700` on `--color-tungsten-bg: #fff8f0` yielded a contrast ratio of 4.28:1, failing WCAG AA requirements ($\ge 4.5:1$).
+- **Root cause:** The color was selected visually without calculating the WCAG 2.x relative-luminance contrast ratio against the light background.
+- **Fix:** Introduced `--color-tungsten-text: #a84b00`, which achieves 5.43:1 contrast against `#fff8f0` (exceeding WCAG AA 4.5:1), retaining `#c25700` for borders and non-text accents only.
+- **How to prevent it:** Calculate and verify relative-luminance contrast ratios for all foreground text tokens against their respective backgrounds during design token creation.
+
+### Entry V: Builder's Implementation Report Described Pre-Fix Code and Claimed Full Pass Without Output
+- **What happened:** An earlier implementation report described outdated banner text, unconditional `hx-get`, and stale contrast numbers (6.81/6.25), claiming full-suite pass without pasting raw execution output.
+- **Root cause:** The builder summarized initial planning intentions and pre-fix code from memory instead of inspecting the final modified files on disk and pasting verified terminal output.
+- **Fix:** Verified on disk: Signal Crimson `#a81a2e` has 7.36:1 contrast on `#ffffff` and 6.77:1 on `#fdf3f4`; Tungsten text `#a84b00` has 5.43:1 on `#fff8f0`. All documentation is strictly sourced from disk.
+- **How to prevent it:** Documentation must be written from code on disk; reports must include verbatim, raw command output.
+
+### Entry W: Owner Full Test Run Encountered 139 Setup ERRORs
+- **What happened:** The owner's first full run failed at import (ModuleNotFoundError: sqlalchemy); the second run produced 139 ERRORs.
+- **Root cause:**
+  1. On the first run, pytest was invoked with the host Python instead of the virtual environment (`.venv`), missing installed dependencies (`ModuleNotFoundError: sqlalchemy`).
+  2. On the second run, the throwaway PostgreSQL test container (`asm-test-db`) had stopped, causing connection timeouts on port `5433`. Note that in pytest, `ERROR` denotes test fixture or setup failure, whereas `FAILED` denotes test assertion failure.
+- **Fix:** Activated `.venv`, ensured `TEST_DATABASE_URL` was exported, and started `asm-test-db` container (`docker start asm-test-db`). All 430 tests then passed cleanly.
+- **How to prevent it:** Always run tests using `.venv\Scripts\pytest`, verify that `TEST_DATABASE_URL` is set, and confirm the test database container is running with `docker ps` before running integration tests.
+
 ---
 
 ## Architectural Decisions
@@ -133,6 +193,18 @@
 - **Decision:** Configured Supabase Auth client to persist session tokens in `sessionStorage`.
 - **Rejected alternatives:** `localStorage`. Rejected because `localStorage` persists indefinitely across browser restarts and all tabs, whereas `sessionStorage` is isolated to the tab and cleared upon window close, reducing the window of token exposure.
 
+### 12. HTMX Polling with 15-Minute Cap and Self-Swapping Container
+- **Decision:** Implemented live scan status updates using HTMX polling (`hx-trigger="every 3s"`, `hx-target="this"`, `hx-swap="outerHTML"`) capped at 15 minutes from scan creation. When 15 minutes elapse, polling ceases and renders a stale warning banner with a manual Refresh button.
+- **Rejected alternatives:** WebSockets or Server-Sent Events (SSE). Rejected because WebSockets/SSE introduce persistent connection state, require custom connection management and reconnect logic, complicate load balancing, and demand a dedicated asynchronous notification channel.
+
+### 13. Counts Derived from Findings Rather Than Trusting Stored Report Counts
+- **Decision:** Derived summary count cards (Critical, High, Medium, Low) by counting parsed finding objects directly in presentation logic before applying the 50-item display cap.
+- **Rejected alternatives:** Reading `report["counts"]` directly. Rejected because `scoring.py` serializes internal keys (`findings_critical`, `hosts_high`) that do not match UI tier keys, and relying on pre-computed counts can cause discrepancies with the findings table when filtering or formatting.
+
+### 14. Attacker-Influenced Evidence Rendered as Escaped Text, Never Links
+- **Decision:** Rendered finding evidence, why-it-matters strings, and change assets strictly as HTML-escaped text inside `<code>` and standard elements, never converting URLs or endpoints into active clickable links (`<a href>`).
+- **Rejected alternatives:** Automatically hyperlinking evidence strings (e.g. rendering discovered URLs or endpoints as clickable links). Rejected because evidence strings are attacker-influenced (drawn from certificate transparency logs, web banners, and HTTP responses); rendering active links creates stored XSS vectors (e.g. `javascript:...` URIs or data URIs) and phishing risks.
+
 ---
 
 ## Known Limitations
@@ -140,10 +212,18 @@
 - **Append-only scope:** The `audit_events` table is append-only against the application; the table owner can disable the trigger.
 - **Retention & Purge:** No retention or purge policy is currently implemented; audit logs grow indefinitely until partitioned or archived.
 - **Unrecorded Events:** Denied requests (e.g. HTTP 401/403 authorization failures), IP addresses, user agents, and user login events are not recorded in the audit log.
+- **Scans List Pagination:** The scans list displays the latest 20 scans only; pagination for older scan history is not yet implemented.
+- **15-Minute Polling Cap from `created_at`:** The polling cap calculates elapsed time from scan `created_at`. Scans that spend extended time queued before worker claim will stop auto-polling earlier in their active execution, requiring manual Refresh.
+- **UTC Label Without Conversion:** Timestamps are printed with a literal "UTC" suffix but are not explicitly converted to UTC first; they are only correct while the database session time zone is UTC.
+- **Untested 401 Retry Swap Path:** The preserved `hx-swap` on 401 token refresh has been verified in code and unit logic, but has not yet been exercised via an end-to-end browser test.
 
 ---
 
 ## Metrics
 
 - tests collected 339 -> 375, db tests 91 -> 112.
+- v3.4b: tests passed 412 -> 430 (2 deselected in both runs; owner-verified).
+- v3.4b: 141 tests marked db (pytest -m db --collect-only).
 - v3.3 audit logging added 15 tracked actions, migration 0009, and append-only trigger protection.
+- v3.4a added dashboard shell, Supabase auth, domains list, and DNS TXT verification.
+- v3.4b added scans list, scan detail with 5 stages, Fix first prioritization, and attack surface changes.

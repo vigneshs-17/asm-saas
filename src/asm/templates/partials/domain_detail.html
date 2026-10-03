@@ -4,6 +4,9 @@
       <button type="button" id="btn-back-domains" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}">
         Back to domains
       </button>
+      <button type="button" id="btn-view-scans" class="btn btn-secondary btn-sm btn-view-scans" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+        View scans
+      </button>
     </div>
     <h2 class="panel-title">{{ domain.name }}</h2>
     <p class="panel-subtitle">Domain ownership and DNS verification state.</p>

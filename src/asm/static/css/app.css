@@ -1,4 +1,7 @@
-/* Concept: A crisp radar-inspired visual hierarchy where calm navigational slate and sea-glass paper frame high-visibility alert markers for exposed assets. */
+/* Concept: A crisp radar-inspired visual hierarchy where calm navigational slate and sea-glass paper frame high-visibility alert markers for exposed assets.
+   Contrast (WCAG 2.x relative-luminance formula): Signal Crimson #a81a2e is 7.36:1 on #ffffff
+   and 6.77:1 on #fdf3f4. Tungsten text #a84b00 is 5.43:1 on #fff8f0 (#c25700 there is only
+   4.28:1, below AA 4.5:1, so #c25700 is kept for borders and accents only). */
 
 @font-face {
   font-family: 'IBM Plex Sans';
@@ -32,8 +35,12 @@
   --color-cobalt-beacon-hover: #164696;
   --color-tungsten-warning: #c25700;
   --color-tungsten-bg: #fff8f0;
+  --color-tungsten-text: #a84b00;
   --color-active-veridian: #0d7d55;
   --color-active-bg: #f0faf5;
+  --color-signal-crimson: #a81a2e;
+  --color-signal-crimson-bg: #fdf3f4;
+  --color-signal-crimson-border: rgba(168, 26, 46, 0.3);
   --color-border-subtle: #d8dee6;
   --color-muted-text: #4a5568;
 
@@ -248,16 +255,192 @@ body {
   border: 1px solid transparent;
 }
 
-.status-verified {
+.status-verified, .status-succeeded {
   background-color: var(--color-active-bg);
   color: var(--color-active-veridian);
   border-color: rgba(13, 125, 85, 0.3);
 }
 
-.status-pending, .status-lapsed {
+.status-pending, .status-lapsed, .status-queued {
   background-color: var(--color-tungsten-bg);
-  color: var(--color-tungsten-warning);
+  color: var(--color-tungsten-text);
   border-color: rgba(194, 87, 0, 0.3);
+}
+
+.status-skipped {
+  background-color: var(--color-sea-glass);
+  color: var(--color-muted-text);
+  border-color: var(--color-border-subtle);
+}
+
+.status-running {
+  background-color: #ebf3ff;
+  color: var(--color-cobalt-beacon);
+  border-color: rgba(29, 91, 191, 0.3);
+}
+
+.status-failed {
+  background-color: var(--color-signal-crimson-bg);
+  color: var(--color-signal-crimson);
+  border-color: var(--color-signal-crimson-border);
+}
+
+/* Severity & Risk Tier Badges */
+.tier-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  text-transform: capitalize;
+}
+
+.tier-critical {
+  background-color: var(--color-signal-crimson-bg);
+  color: var(--color-signal-crimson);
+  border-color: var(--color-signal-crimson-border);
+}
+
+.tier-high {
+  background-color: var(--color-tungsten-bg);
+  color: var(--color-tungsten-text);
+  border-color: rgba(194, 87, 0, 0.3);
+}
+
+.tier-medium {
+  background-color: #fffde7;
+  color: #856404;
+  border-color: rgba(133, 100, 4, 0.3);
+}
+
+.tier-low {
+  background-color: #ebf3ff;
+  color: var(--color-cobalt-beacon);
+  border-color: rgba(29, 91, 191, 0.3);
+}
+
+.tier-info {
+  background-color: var(--color-sea-glass);
+  color: var(--color-muted-text);
+  border-color: var(--color-border-subtle);
+}
+
+/* Pipeline Stage Progress Indicators */
+.stage-pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1.25rem 0;
+}
+
+.stage-card {
+  flex: 1;
+  min-width: 130px;
+  padding: 0.75rem 0.85rem;
+  background-color: var(--color-sea-glass);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+}
+
+.stage-card-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-muted-text);
+  text-transform: capitalize;
+}
+
+.stage-card-status {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.25rem;
+}
+
+.stage-card-duration {
+  font-size: 0.75rem;
+  color: var(--color-muted-text);
+  margin-top: 0.2rem;
+}
+
+/* Score Summary Grid */
+.score-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.score-card {
+  padding: 0.85rem 1rem;
+  background-color: var(--color-sea-glass);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+}
+
+.score-card-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--color-abyssal-ink);
+}
+
+.score-card-label {
+  font-size: 0.8rem;
+  color: var(--color-muted-text);
+}
+
+.banner-stale {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  background-color: var(--color-tungsten-bg);
+  color: var(--color-tungsten-text);
+  border: 1px solid rgba(194, 87, 0, 0.3);
+  padding: 0.85rem 1rem;
+  border-radius: 4px;
+  margin-bottom: 1.25rem;
+  font-weight: 500;
+}
+
+/* Wide finding/change tables scroll inside the panel instead of overflowing it */
+.table-container {
+  overflow-x: auto;
+}
+
+.data-table code {
+  overflow-wrap: anywhere;
+}
+
+/* Scan detail layout helpers (no inline style attributes: CSP style-src 'self') */
+.section-header-first {
+  margin-top: 1.5rem;
+}
+
+.section-header {
+  margin-top: 2rem;
+}
+
+.scan-meta {
+  margin-left: 0.75rem;
+}
+
+.stage-card-error {
+  color: var(--color-signal-crimson);
+  font-size: 0.75rem;
+  margin-top: 0.25rem;
+}
+
+.finding-why {
+  margin-top: 0.25rem;
+}
+
+.findings-more {
+  margin-top: 0.75rem;
+}
+
+.run-scan-hint {
+  margin-top: 0.5rem;
 }
 
 /* Code & DNS Inspection Blocks */
@@ -294,9 +477,9 @@ body {
 }
 
 .alert-error {
-  background-color: #fdf2f2;
-  color: #991b1b;
-  border-color: #fecaca;
+  background-color: var(--color-signal-crimson-bg);
+  color: var(--color-signal-crimson);
+  border-color: var(--color-signal-crimson-border);
 }
 
 .alert-success {

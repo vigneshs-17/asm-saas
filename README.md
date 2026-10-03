@@ -15,7 +15,8 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 - **v3.2 Domain Verification**: Done. Domain ownership proof via DNS TXT, continuous background re-verification, operator overrides, and scan gating.
 - **v3.3 Audit Log & Event Tracking**: Done. Append-only audit events table, trigger against app tampering, 15 structured actions, and organization audit API.
 - **v3.4a Dashboard Shell & Verification UI**: Done. Server-rendered dashboard (FastAPI + Jinja2 + HTMX), Supabase browser authentication, organization management, domains list, and DNS TXT verification UI.
-- **Next: v3.4b**: Scans, results, and changes UI.
+- **v3.4b Scans, Results & Changes UI**: Done. Scans list (latest 20 runs, status, trigger, duration, changes summary), Run scan button (gated by domain verification and role), scan detail with 5 pipeline stages, Fix first prioritized findings (capped at 50 with overflow count), per-tier count cards, and changes table with auto-polling (3s, 15m cap).
+- **Next: v3.4c**: Schedule and alerts UI, audit log UI, browser tests.
 
 ---
 
@@ -449,7 +450,7 @@ curl -i "http://127.0.0.1:8000/orgs/1/audit-events?domain_id=1&action=verificati
 
 ---
 
-### 7. Dashboard (v3.4a)
+### 7. Dashboard (v3.4a, v3.4b)
 
 A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templates, and HTMX with zero node/npm build dependencies.
 
@@ -475,9 +476,17 @@ A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templat
   - "Check now" button displaying real-time check outcome (`match`, `absent`, `unknown`) and detailed failure reason.
   - "Rotate token" button (with confirmation modal) to generate a fresh token if an existing record is compromised.
 - **Role-Based Views:** Users with the `viewer` role see a read-only interface; write forms and state mutation buttons are omitted from the rendered DOM (and writes remain enforced by the API).
+- **Scans List:** Latest 20 runs for the selected domain with status, trigger, started at timestamp, duration, and a change summary (`Baseline scan`, `No changes`, or tier counts like `1 critical, 2 info`).
+- **Run Scan:** Gated to `admin` and `owner` roles. When the domain is unverified, the button is disabled with a visible reason: `"Domain ownership verification required to run scans."`
+- **Scan Detail:** Inspection panel featuring:
+  - 5 pipeline stages (`discover`, `probe`, `portscan`, `inspect`, `score`) with stage status badges, execution durations, and error descriptions.
+  - Fix first: Prioritized security findings sorted by severity tier (`Critical` > `High` > `Medium` > `Low` > `Info`), score points descending, target host ascending, and port ascending (`None` precedes numeric ports). Capped at 50 rows with an overflow count: `"... and N more findings."`
+  - Per-tier count cards: Summary cards for Domain score, Risk band, Critical, High, Medium, and Low counts (calculated across all parsed findings before capping).
+  - Changes table: Structured delta entries from `ScanChange` records displaying severity, category, change type, asset, detail, and evidence (or `"No changes detected in this scan."`).
+- **Real-Time Polling & Cap:** Scans in `queued` or `running` state poll `/ui/orgs/{org_id}/scans/{scan_id}` every 3 seconds via HTMX (`hx-trigger="every 3s"`, `hx-target="this"`, `hx-swap="outerHTML"`). Polling is capped at 15 minutes from `created_at`; after that, polling stops and displays a banner: `"Still <status> after 15 minutes. Automatic updates have stopped."` alongside a manual `"Refresh"` button. Finished scans omit polling attributes entirely to prevent unintentional re-fetching on user clicks.
 
 #### Security Design
-- **All Writes Reuse the Existing JSON API:** The dashboard introduces zero new write endpoints and no duplicated business logic. Form submissions and action triggers dispatch `fetch()` requests directly to `/orgs`, `/orgs/{org_id}/domains`, and `/orgs/{org_id}/domains/{domain_id}/verification/*`, then refresh DOM fragments via `htmx.ajax()`.
+- **All Writes Reuse the Existing JSON API:** The dashboard introduces zero new write endpoints and no duplicated business logic. Form submissions and action triggers dispatch `fetch()` requests directly to `/orgs`, `/orgs/{org_id}/domains`, `/orgs/{org_id}/domains/{domain_id}/verification/*`, and `/orgs/{org_id}/domains/{domain_id}/scans`, then refresh DOM fragments via `htmx.ajax()`.
 - **Bearer Token Authorization:** Every HTMX request and `fetch()` call attaches `Authorization: Bearer <access_token>` synchronously via `htmx:configRequest`. This is inherently immune to Cross-Site Request Forgery (CSRF).
 - **XSS Mitigation Trade-off:** Storing access tokens in browser memory introduces potential XSS exposure if malicious JavaScript executes. This risk is defended through layered controls:
   - Strict Content Security Policy (CSP) on `/app`, `/ui/*`, and `/static/*`: `default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' <SUPABASE_URL>; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`.
@@ -485,6 +494,8 @@ A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templat
   - `htmx.config.allowEval = false` and `htmx.config.allowScriptTags = false` configured in JS and via `<meta name="htmx-config">`.
   - Jinja autoescape enabled on all templates.
   - API responses rendered dynamically via `textContent` only; zero occurrences of `innerHTML`.
+- **Attacker-Influenced Evidence & Change Fields:** Finding evidence, why-it-matters strings, titles, change assets, details, and error descriptions are attacker-influenced data derived from network scans and DNS records. They are rendered exclusively as HTML-escaped text in `<code>` blocks and standard markup, never as active links (`<a href>`) or raw unescaped HTML (`|safe`).
+- **Template CSP Guard Test:** A dedicated test (`test_templates_have_no_csp_blocked_inline_code`) validates all Jinja2 templates on disk, failing the build if any template contains an inline `style` attribute, `<style>` block, inline event handler (`on*=`), HTMX eval handler (`hx-on`), or inline `<script>` tag.
 - **Cache Invalidation:** `Cache-Control: no-store` header is enforced on all `/ui/*` HTML fragment responses to prevent caching sensitive tenant data.
 - **Session Storage:** Tokens are held in module memory and backed by `sessionStorage` (cleared when the browser tab closes, never persisted to `localStorage`).
 - **Vendored Libraries:** HTMX `2.0.11` and Supabase JS `2.117.2` UMD builds are vendored locally with pinned versions, official upstream URLs, and cryptographic SHA-256 checksums documented in `src/asm/static/vendor/VENDOR.md`.

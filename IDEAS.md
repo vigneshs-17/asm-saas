@@ -1,1 +1,5 @@
 Ideas outside the roadmap go here and are not built.
+
+- On a 409 (scan already active), navigate to and open the already-active scan (the JSON API response provides `active_scan_id`).
+- Paginate the domain scans list (currently hard-limited to the 20 most recent runs).
+- Replace deprecated `HTTP_422_UNPROCESSABLE_ENTITY` with `HTTP_422_UNPROCESSABLE_CONTENT` across test suites and resolve the Starlette testclient/httpx deprecation warning.
