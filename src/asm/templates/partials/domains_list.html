@@ -1,5 +1,12 @@
 <section class="surface-panel">
   <div class="surface-panel-header">
+    {% if user_role in ('admin', 'owner') %}
+    <div class="action-row">
+      <button type="button" id="btn-nav-audit-log" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}">
+        Audit log
+      </button>
+    </div>
+    {% endif %}
     <h2 class="panel-title">Domains for {{ org.name }}</h2>
     <p class="panel-subtitle">Monitored internet-facing root domains.</p>
   </div>

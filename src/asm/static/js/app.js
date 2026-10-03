@@ -214,6 +214,31 @@
     });
   }
 
+  function loadAlertNotifications(orgId, domainId, offset) {
+    if (!orgId || !domainId) return Promise.resolve();
+    const off = offset || 0;
+    return window.htmx.ajax('GET', '/ui/orgs/' + orgId + '/domains/' + domainId + '/alert-notifications?offset=' + off, {
+      target: '#main-content-area',
+    });
+  }
+
+  function loadAuditLog(orgId, params) {
+    if (!orgId) return Promise.resolve();
+    const p = params || {};
+    let url = '/ui/orgs/' + orgId + '/audit-events';
+    const queryParts = [];
+    if (p.action) queryParts.push('action=' + encodeURIComponent(p.action));
+    if (p.domain_id) queryParts.push('domain_id=' + encodeURIComponent(p.domain_id));
+    if (p.before_id) queryParts.push('before_id=' + encodeURIComponent(p.before_id));
+    if (queryParts.length > 0) {
+      url += '?' + queryParts.join('&');
+    }
+    return window.htmx.ajax('GET', url, {
+      target: '#main-content-area',
+    });
+  }
+
+
   // Authenticated fetch wrapper
   async function authenticatedFetch(url, options) {
     const opts = options || {};
@@ -378,6 +403,99 @@
       } catch (err) {
         showError('Error adding domain: ' + err.message);
       }
+      return;
+    }
+
+    // 4. Schedule Settings Form (PUT /orgs/{org_id}/domains/{domain_id}/schedule)
+    if (form && form.id === 'schedule-settings-form') {
+      evt.preventDefault();
+      clearError();
+      const orgId = form.getAttribute('data-org-id');
+      const domainId = form.getAttribute('data-domain-id');
+      const intervalSelect = form.querySelector('select[name="interval_hours"]');
+      const intervalVal = intervalSelect ? intervalSelect.value : '';
+      const intervalHours = (intervalVal === '' || intervalVal === 'null') ? null : parseInt(intervalVal, 10);
+
+      try {
+        const resp = await authenticatedFetch(
+          '/orgs/' + orgId + '/domains/' + domainId + '/schedule',
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ interval_hours: intervalHours }),
+          }
+        );
+
+        if (!resp.ok) {
+          const errData = await resp.json().catch(function () { return {}; });
+          showError(formatErrorMessage(errData.detail, 'Failed to update scan schedule.'));
+          return;
+        }
+
+        loadDomainDetail(orgId, domainId);
+      } catch (err) {
+        showError('Error updating schedule: ' + err.message);
+      }
+      return;
+    }
+
+    // 5. Alerts Settings Form (PUT /orgs/{org_id}/domains/{domain_id}/alerts)
+    if (form && form.id === 'alerts-settings-form') {
+      evt.preventDefault();
+      clearError();
+      const orgId = form.getAttribute('data-org-id');
+      const domainId = form.getAttribute('data-domain-id');
+      const enabledCheckbox = form.querySelector('#alerts-enabled-checkbox');
+      const alertsEnabled = enabledCheckbox ? enabledCheckbox.checked : false;
+      const severitySelect = form.querySelector('#alerts-min-severity-select');
+      const minSeverity = severitySelect ? severitySelect.value : 'MEDIUM';
+
+      const emailChips = form.querySelectorAll('#alert-emails-list .email-chip-text');
+      const alertEmails = Array.prototype.map.call(emailChips, function (el) {
+        return el.textContent.trim();
+      });
+
+      try {
+        const resp = await authenticatedFetch(
+          '/orgs/' + orgId + '/domains/' + domainId + '/alerts',
+          {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              alerts_enabled: alertsEnabled,
+              alert_emails: alertEmails,
+              alert_min_severity: minSeverity,
+            }),
+          }
+        );
+
+        if (!resp.ok) {
+          const errData = await resp.json().catch(function () { return {}; });
+          showError(formatErrorMessage(errData.detail, 'Failed to update alert settings.'));
+          return;
+        }
+
+        loadDomainDetail(orgId, domainId);
+      } catch (err) {
+        showError('Error updating alert settings: ' + err.message);
+      }
+      return;
+    }
+
+    // 6. Audit Filter Form
+    if (form && form.id === 'audit-filter-form') {
+      evt.preventDefault();
+      clearError();
+      const orgId = form.getAttribute('data-org-id');
+      const actionSelect = form.querySelector('#audit-filter-action');
+      const domainSelect = form.querySelector('#audit-filter-domain');
+      const actionVal = actionSelect ? actionSelect.value : '';
+      const domainVal = domainSelect ? domainSelect.value : '';
+
+      loadAuditLog(orgId, {
+        action: actionVal,
+        domain_id: domainVal,
+      });
       return;
     }
   });
@@ -633,6 +751,133 @@
         target.textContent = originalBtnText;
         showError('Run scan error: ' + err.message);
       }
+      return;
+    }
+
+    // Action: Add Alert Email Chip
+    if (target.id === 'btn-add-alert-email') {
+      evt.preventDefault();
+      clearError();
+      const input = document.getElementById('input-alert-email');
+      if (!input) return;
+      const val = input.value.trim();
+      if (!val) {
+        showError('Email address is required.');
+        return;
+      }
+      if (!input.checkValidity() || val.indexOf('@') === -1 || val.indexOf('.') === -1) {
+        showError('Please enter a valid email address.');
+        return;
+      }
+      const list = document.getElementById('alert-emails-list');
+      if (!list) return;
+
+      if (list.children.length >= 5) {
+        showError('Maximum of 5 alert emails allowed.');
+        return;
+      }
+
+      const existingChips = list.querySelectorAll('.email-chip-text');
+      const lowerVal = val.toLowerCase();
+      let isDuplicate = false;
+      for (let i = 0; i < existingChips.length; i++) {
+        if (existingChips[i].textContent.trim().toLowerCase() === lowerVal) {
+          isDuplicate = true;
+          break;
+        }
+      }
+      if (isDuplicate) {
+        showError('Email address is already in the list.');
+        return;
+      }
+
+      const li = document.createElement('li');
+      li.className = 'email-chip';
+
+      const span = document.createElement('span');
+      span.className = 'email-chip-text';
+      span.textContent = val;
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-secondary btn-xs btn-remove-email';
+      removeBtn.textContent = 'Remove';
+
+      li.appendChild(span);
+      li.appendChild(removeBtn);
+      list.appendChild(li);
+
+      input.value = '';
+      return;
+    }
+
+    // Action: Remove Alert Email Chip
+    if (target.classList.contains('btn-remove-email')) {
+      evt.preventDefault();
+      const chip = target.closest('.email-chip');
+      if (chip) {
+        chip.remove();
+      }
+      return;
+    }
+
+    // Navigation: View Alert Notifications
+    if (target.id === 'btn-view-alert-notifications') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const domainId = target.getAttribute('data-domain-id');
+      loadAlertNotifications(orgId, domainId, 0);
+      return;
+    }
+
+    // Navigation: Alert Notifications Pagination
+    if (target.classList.contains('btn-page-alert-notifications')) {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const domainId = target.getAttribute('data-domain-id');
+      const offset = parseInt(target.getAttribute('data-offset') || '0', 10);
+      loadAlertNotifications(orgId, domainId, offset);
+      return;
+    }
+
+    // Navigation: View Audit Log
+    if (target.id === 'btn-nav-audit-log') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      loadAuditLog(orgId);
+      return;
+    }
+
+    // Navigation: Audit Log Older Events
+    if (target.id === 'btn-audit-older') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const beforeId = target.getAttribute('data-before-id');
+      const action = target.getAttribute('data-action');
+      const domainId = target.getAttribute('data-domain-id');
+      loadAuditLog(orgId, {
+        action: action,
+        domain_id: domainId,
+        before_id: beforeId,
+      });
+      return;
+    }
+
+    // Navigation: Audit Log Newest Events
+    if (target.id === 'btn-audit-newest') {
+      evt.preventDefault();
+      clearError();
+      const orgId = target.getAttribute('data-org-id');
+      const action = target.getAttribute('data-action');
+      const domainId = target.getAttribute('data-domain-id');
+      loadAuditLog(orgId, {
+        action: action,
+        domain_id: domainId,
+      });
       return;
     }
   });

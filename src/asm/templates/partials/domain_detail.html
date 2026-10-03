@@ -7,6 +7,9 @@
       <button type="button" id="btn-view-scans" class="btn btn-secondary btn-sm btn-view-scans" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
         View scans
       </button>
+      <button type="button" id="btn-view-alert-notifications" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+        View alert history
+      </button>
     </div>
     <h2 class="panel-title">{{ domain.name }}</h2>
     <p class="panel-subtitle">Domain ownership and DNS verification state.</p>
@@ -70,4 +73,122 @@
 
   <!-- Live verification check outcome container -->
   <div id="verification-check-result" aria-live="polite"></div>
+
+  <!-- Scan schedule section -->
+  <div class="surface-panel-header">
+    <h3 class="panel-title">Scan schedule</h3>
+    <p class="panel-subtitle">Automated periodic reconnaissance scanning.</p>
+  </div>
+
+  <div class="form-group">
+    <label class="form-label">Current schedule</label>
+    <div>
+      {% if domain.scan_interval_hours %}
+      <span>Every {{ domain.scan_interval_hours }} hours</span>
+      {% else %}
+      <span class="text-muted">Not scheduled</span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="text-muted">Next scan: </span>
+      {% if domain.next_scan_at %}
+      <span>{{ domain.next_scan_at.strftime('%Y-%m-%d %H:%M UTC') }}</span>
+      {% else %}
+      <span class="text-muted">Not scheduled</span>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if user_role in ('admin', 'owner') %}
+  <form id="schedule-settings-form" class="settings-form" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+    {% if domain.verification_status != 'verified' %}
+    <div class="alert-box alert-warning">
+      Domain ownership verification required before scheduling automated scans.
+    </div>
+    {% endif %}
+    <div class="form-group">
+      <label for="schedule-interval-select" class="form-label">Scan interval</label>
+      <select id="schedule-interval-select" name="interval_hours" class="form-select">
+        <option value=""{% if not domain.scan_interval_hours %} selected{% endif %}>Off</option>
+        <option value="6"{% if domain.scan_interval_hours == 6 %} selected{% endif %}{% if domain.verification_status != 'verified' %} disabled{% endif %}>Every 6 hours</option>
+        <option value="12"{% if domain.scan_interval_hours == 12 %} selected{% endif %}{% if domain.verification_status != 'verified' %} disabled{% endif %}>Every 12 hours</option>
+        <option value="24"{% if domain.scan_interval_hours == 24 %} selected{% endif %}{% if domain.verification_status != 'verified' %} disabled{% endif %}>Every 24 hours</option>
+        <option value="168"{% if domain.scan_interval_hours == 168 %} selected{% endif %}{% if domain.verification_status != 'verified' %} disabled{% endif %}>Every 7 days</option>
+        <option value="720"{% if domain.scan_interval_hours == 720 %} selected{% endif %}{% if domain.verification_status != 'verified' %} disabled{% endif %}>Every 30 days</option>
+        {% if domain.scan_interval_hours and domain.scan_interval_hours not in (6, 12, 24, 168, 720) %}
+        <option value="{{ domain.scan_interval_hours }}" selected{% if domain.verification_status != 'verified' %} disabled{% endif %}>Every {{ domain.scan_interval_hours }} hours (current)</option>
+        {% endif %}
+      </select>
+    </div>
+    <button type="submit" id="btn-save-schedule" class="btn btn-primary btn-sm">Save schedule</button>
+  </form>
+  {% endif %}
+
+  <!-- Alerts section -->
+  <div class="surface-panel-header">
+    <h3 class="panel-title">Email alerts</h3>
+    <p class="panel-subtitle">Notifications for newly exposed attack surface assets.</p>
+  </div>
+
+  <div class="form-group">
+    <label class="form-label">Alert status</label>
+    <div>
+      {% if domain.alerts_enabled %}
+      <span class="status-badge status-verified">Alerts: enabled</span>
+      {% else %}
+      <span class="status-badge status-skipped">Alerts: disabled</span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="text-muted">Minimum severity: </span>
+      <span>{{ domain.alert_min_severity.capitalize() }}</span>
+    </div>
+    <div>
+      <span class="text-muted">Configured recipients: </span>
+      <span>{{ domain.alert_emails|length }} recipient{% if domain.alert_emails|length != 1 %}s{% endif %} configured</span>
+    </div>
+  </div>
+
+  {% if user_role in ('admin', 'owner') %}
+  <form id="alerts-settings-form" class="settings-form" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+    {% if domain.verification_status != 'verified' %}
+    <div class="alert-box alert-warning">
+      Domain ownership verification required before enabling alerts.
+    </div>
+    {% endif %}
+    <div class="form-group form-checkbox-group">
+      <label class="checkbox-label">
+        <input type="checkbox" id="alerts-enabled-checkbox" name="alerts_enabled" {% if domain.alerts_enabled %}checked{% endif %}>
+        Enable email alerts
+      </label>
+    </div>
+    <div class="form-group">
+      <label for="alerts-min-severity-select" class="form-label">Minimum severity</label>
+      <select id="alerts-min-severity-select" name="alert_min_severity" class="form-select">
+        <option value="CRITICAL" {% if domain.alert_min_severity == 'CRITICAL' %}selected{% endif %}>Critical</option>
+        <option value="HIGH" {% if domain.alert_min_severity == 'HIGH' %}selected{% endif %}>High</option>
+        <option value="MEDIUM" {% if domain.alert_min_severity == 'MEDIUM' or not domain.alert_min_severity %}selected{% endif %}>Medium</option>
+        <option value="LOW" {% if domain.alert_min_severity == 'LOW' %}selected{% endif %}>Low</option>
+        <option value="INFO" {% if domain.alert_min_severity == 'INFO' %}selected{% endif %}>Info</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Recipient emails (up to 5)</label>
+      <ul id="alert-emails-list" class="email-chip-list">
+        {% for email in domain.alert_emails %}
+        <li class="email-chip">
+          <span class="email-chip-text">{{ email }}</span>
+          <button type="button" class="btn btn-secondary btn-xs btn-remove-email">Remove</button>
+        </li>
+        {% endfor %}
+      </ul>
+      <div class="form-inline add-email-group">
+        <label for="input-alert-email" class="form-label">Add recipient email</label>
+        <input type="email" id="input-alert-email" class="form-input" placeholder="e.g. security@example.com" autocomplete="email">
+        <button type="button" id="btn-add-alert-email" class="btn btn-secondary btn-sm">Add email</button>
+      </div>
+    </div>
+    <button type="submit" id="btn-save-alerts" class="btn btn-primary btn-sm">Save alert settings</button>
+  </form>
+  {% endif %}
 </section>

@@ -8,9 +8,10 @@ import re
 import uuid
 from typing import Any
 
+from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
-from asm.db.models import AuditEvent
+from asm.db.models import AuditEvent, User
 
 ALLOWED_ACTOR_TYPES = {"user", "operator", "system"}
 
@@ -210,3 +211,33 @@ def record_event(
     )
     session.add(event)
     return event
+
+
+def build_audit_query(
+    org_id: int,
+    domain_id: int | None = None,
+    action: str | None = None,
+    limit: int = 50,
+    before_id: int | None = None,
+    include_user: bool = False,
+) -> Select:
+    """Build shared audit events query used by both JSON API and UI fragments."""
+    if include_user:
+        stmt = select(AuditEvent, User.email).outerjoin(
+            User, AuditEvent.actor_user_id == User.id
+        )
+    else:
+        stmt = select(AuditEvent)
+
+    stmt = stmt.where(AuditEvent.org_id == org_id)
+    if domain_id is not None:
+        stmt = stmt.where(
+            AuditEvent.target_type == "domain", AuditEvent.target_id == str(domain_id)
+        )
+    if action is not None:
+        stmt = stmt.where(AuditEvent.action == action)
+    if before_id is not None:
+        stmt = stmt.where(AuditEvent.id < before_id)
+    stmt = stmt.order_by(AuditEvent.id.desc()).limit(limit)
+    return stmt
+

@@ -1,0 +1,94 @@
+<section class="surface-panel">
+  <div class="surface-panel-header">
+    <div class="action-row">
+      <button type="button" id="btn-back-domains" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}">
+        Back to domains
+      </button>
+    </div>
+    <h2 class="panel-title">Audit log for {{ org.name }}</h2>
+    <p class="panel-subtitle">Append-only administrative and security event trail.</p>
+  </div>
+
+  <div class="surface-panel-header">
+    <form id="audit-filter-form" class="form-inline" data-org-id="{{ org.id }}">
+      <div class="form-group">
+        <label for="audit-filter-action" class="form-label">Action</label>
+        <select id="audit-filter-action" name="action" class="form-select">
+          <option value="">All actions</option>
+          {% for act in audit_actions %}
+          <option value="{{ act }}" {% if selected_action == act %}selected{% endif %}>{{ act }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="audit-filter-domain" class="form-label">Domain</label>
+        <select id="audit-filter-domain" name="domain_id" class="form-select">
+          <option value="">All domains</option>
+          {% for d in org_domains %}
+          <option value="{{ d.id }}" {% if selected_domain_id == d.id %}selected{% endif %}>{{ d.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
+    </form>
+  </div>
+
+  {% if events_data %}
+  <div class="table-container">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Actor</th>
+          <th>Action</th>
+          <th>Target</th>
+          <th>Metadata</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in events_data %}
+        <tr>
+          <td class="text-muted">{{ item.event.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}</td>
+          <td>{{ item.actor_display }}</td>
+          <td><code>{{ item.event.action }}</code></td>
+          <td><code>{{ item.target_display }}</code></td>
+          <td>
+            <details class="metadata-details">
+              <summary>View metadata</summary>
+              <pre class="metadata-block"><code>{{ item.metadata_json }}</code></pre>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if before_id or oldest_id %}
+  <div class="action-row pagination-controls">
+    {% if before_id %}
+    <button type="button" id="btn-audit-newest" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-action="{{ selected_action }}" data-domain-id="{{ selected_domain_id or '' }}">
+      Newest
+    </button>
+    {% endif %}
+    {% if oldest_id %}
+    <button type="button" id="btn-audit-older" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-before-id="{{ oldest_id }}" data-action="{{ selected_action }}" data-domain-id="{{ selected_domain_id or '' }}">
+      Older events
+    </button>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% else %}
+  <p class="text-muted">No audit events match the selected criteria.</p>
+  {% if before_id %}
+  <div class="action-row pagination-controls">
+    <button type="button" id="btn-audit-newest" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-action="{{ selected_action }}" data-domain-id="{{ selected_domain_id or '' }}">
+      Newest
+    </button>
+  </div>
+  {% endif %}
+  {% endif %}
+</section>

@@ -1,11 +1,12 @@
-"""Server-rendered UI routes for ASM SaaS dashboard (v3.4a)."""
+"""Server-rendered UI routes for ASM SaaS dashboard (v3.4a/b/c)."""
 
+import json
 import logging
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from fastapi.responses import HTMLResponse
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from sqlalchemy import select
@@ -18,8 +19,10 @@ from asm.api.deps import (
     get_scan_for_org,
     require_org_role,
 )
+from asm.audit import AUDIT_ACTIONS, build_audit_query
 from asm.auth.config import AuthSettings
 from asm.db.models import (
+    AlertNotification,
     Domain,
     Membership,
     Organization,
@@ -312,3 +315,129 @@ def get_org_scan_detail_ui(
         is_stale_active=is_stale_active,
         user_role=membership.role,
     )
+
+
+@ui_router.get(
+    "/ui/orgs/{org_id}/domains/{domain_id}/alert-notifications",
+    response_class=HTMLResponse,
+    summary="Domain alert notifications partial",
+)
+def get_org_domain_alert_notifications_ui(
+    org_id: int,
+    domain_id: int,
+    response: Response,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("viewer"))],
+    auth_settings: Annotated[AuthSettings, Depends(get_current_auth_settings)],
+    db: DbSession,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> str:
+    """Render historical alert notifications for a domain."""
+    apply_security_headers(response, auth_settings, is_fragment=True)
+    org, membership = auth_context
+
+    domain = get_domain_for_org(db, org_id, domain_id)
+    limit = 50
+
+    query = (
+        select(AlertNotification)
+        .where(AlertNotification.domain_id == domain.id)
+        .order_by(AlertNotification.created_at.desc(), AlertNotification.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    notifications = list(db.scalars(query).all())
+
+    template = templates_env.get_template("partials/alert_notifications.html")
+    return template.render(
+        org=org,
+        domain=domain,
+        user_role=membership.role,
+        notifications=notifications,
+        offset=offset,
+        limit=limit,
+        has_next=len(notifications) == limit,
+        has_prev=offset > 0,
+        prev_offset=max(0, offset - limit),
+        next_offset=offset + limit,
+    )
+
+
+@ui_router.get(
+    "/ui/orgs/{org_id}/audit-events",
+    response_class=HTMLResponse,
+    summary="Organization audit events partial",
+)
+def get_org_audit_events_ui(
+    org_id: int,
+    response: Response,
+    auth_context: Annotated[tuple[Organization, Membership], Depends(require_org_role("admin"))],
+    auth_settings: Annotated[AuthSettings, Depends(get_current_auth_settings)],
+    db: DbSession,
+    action: Annotated[str | None, Query(description="Filter by action")] = None,
+    domain_id: Annotated[int | None, Query(description="Filter by domain ID")] = None,
+    before_id: Annotated[
+        int | None,
+        Query(description="Keyset cursor: return events with id < before_id"),
+    ] = None,
+) -> str:
+    """Render the audit events log HTML fragment for an organization."""
+    apply_security_headers(response, auth_settings, is_fragment=True)
+    org, membership = auth_context
+
+    limit = 50
+    action_filter = action if action and action.strip() else None
+    stmt = build_audit_query(
+        org_id=org_id,
+        domain_id=domain_id,
+        action=action_filter,
+        limit=limit,
+        before_id=before_id,
+        include_user=True,
+    )
+    rows = db.execute(stmt).all()
+
+    events_data = []
+    for event, user_email in rows:
+        if user_email:
+            actor_display = user_email
+        elif event.actor_user_id:
+            actor_display = f"{event.actor_type}:{event.actor_user_id}"
+        else:
+            actor_display = event.actor_type
+
+        meta_json = json.dumps(
+            event.metadata_,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+        events_data.append({
+            "event": event,
+            "actor_display": actor_display,
+            "target_display": f"{event.target_type}:{event.target_id}",
+            "metadata_json": meta_json,
+        })
+
+    org_domains = list(
+        db.scalars(
+            select(Domain).where(Domain.org_id == org_id).order_by(Domain.name.asc())
+        ).all()
+    )
+    sorted_actions = sorted(AUDIT_ACTIONS)
+    oldest_id = events_data[-1]["event"].id if len(events_data) == limit else None
+
+    template = templates_env.get_template("partials/audit_events.html")
+    return template.render(
+        org=org,
+        user_role=membership.role,
+        events_data=events_data,
+        org_domains=org_domains,
+        audit_actions=sorted_actions,
+        selected_action=action or "",
+        selected_domain_id=domain_id,
+        before_id=before_id,
+        oldest_id=oldest_id,
+        limit=limit,
+    )
+

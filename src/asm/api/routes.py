@@ -31,10 +31,9 @@ from asm.api.schemas import (
     ScanRunDetail,
     ScanRunRead,
 )
-from asm.audit import record_event
+from asm.audit import build_audit_query, record_event
 from asm.db.models import (
     AlertNotification,
-    AuditEvent,
     Domain,
     Membership,
     Organization,
@@ -756,7 +755,7 @@ def update_domain_alerts(
     """Configure or disable automated email alerts for detected attack surface exposures."""
     domain = get_domain_for_org(db, org_id, domain_id)
 
-    if domain.verification_status != "verified":
+    if domain.verification_status != "verified" and payload.alerts_enabled:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Domain '{domain.name}' is not verified.",
@@ -846,16 +845,15 @@ def list_audit_events(
     ] = None,
 ) -> list[AuditEventRead]:
     """Retrieve audit trail of events for this organization, newest first."""
-    stmt = select(AuditEvent).where(AuditEvent.org_id == org_id)
-    if domain_id is not None:
-        stmt = stmt.where(
-            AuditEvent.target_type == "domain", AuditEvent.target_id == str(domain_id)
-        )
-    if action is not None:
-        stmt = stmt.where(AuditEvent.action == action)
-    if before_id is not None:
-        stmt = stmt.where(AuditEvent.id < before_id)
-    stmt = stmt.order_by(AuditEvent.id.desc()).limit(limit)
+    stmt = build_audit_query(
+        org_id=org_id,
+        domain_id=domain_id,
+        action=action,
+        limit=limit,
+        before_id=before_id,
+        include_user=False,
+    )
     events = db.scalars(stmt).all()
     return [AuditEventRead.model_validate(e) for e in events]
+
 

@@ -1,0 +1,95 @@
+<section class="surface-panel">
+  <div class="surface-panel-header">
+    <div class="action-row">
+      <button type="button" id="btn-back-domain-detail" class="btn btn-secondary btn-sm" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}">
+        Back to domain
+      </button>
+    </div>
+    <h2 class="panel-title">Alert history for {{ domain.name }}</h2>
+    <p class="panel-subtitle">Outbox log of automated email notifications dispatched for this domain.</p>
+  </div>
+
+  {% if notifications %}
+  <div class="table-container">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Created</th>
+          <th>Sent</th>
+          {% if user_role in ('admin', 'owner') %}
+          <th>Recipient</th>
+          {% endif %}
+          <th>Subject</th>
+          <th>Status</th>
+          <th>Attempts</th>
+          {% if user_role in ('admin', 'owner') %}
+          <th>Last error</th>
+          {% endif %}
+          <th>Body</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for n in notifications %}
+        <tr>
+          <td class="text-muted">{{ n.created_at.strftime('%Y-%m-%d %H:%M UTC') }}</td>
+          <td class="text-muted">
+            {% if n.sent_at %}
+            {{ n.sent_at.strftime('%Y-%m-%d %H:%M UTC') }}
+            {% else %}
+            --
+            {% endif %}
+          </td>
+          {% if user_role in ('admin', 'owner') %}
+          <td>{{ n.recipient }}</td>
+          {% endif %}
+          <td>{{ n.subject }}</td>
+          <td>
+            {% if n.status == 'sent' %}
+            <span class="status-badge status-verified">Sent</span>
+            {% elif n.status == 'pending' %}
+            <span class="status-badge status-pending">Pending</span>
+            {% else %}
+            <span class="status-badge status-failed">Failed</span>
+            {% endif %}
+          </td>
+          <td>{{ n.attempts }}/{{ n.max_attempts }}</td>
+          {% if user_role in ('admin', 'owner') %}
+          <td class="text-muted">
+            {% if n.last_error %}
+            {{ n.last_error }}
+            {% else %}
+            --
+            {% endif %}
+          </td>
+          {% endif %}
+          <td>
+            <details class="alert-body-details">
+              <summary>View message body</summary>
+              <pre class="code-block"><code>{{ n.body }}</code></pre>
+            </details>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if has_prev or has_next %}
+  <div class="action-row pagination-controls">
+    {% if has_prev %}
+    <button type="button" class="btn btn-secondary btn-sm btn-page-alert-notifications" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}" data-offset="{{ prev_offset }}">
+      Previous
+    </button>
+    {% endif %}
+    {% if has_next %}
+    <button type="button" class="btn btn-secondary btn-sm btn-page-alert-notifications" data-org-id="{{ org.id }}" data-domain-id="{{ domain.id }}" data-offset="{{ next_offset }}">
+      Next
+    </button>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% else %}
+  <p class="text-muted">No alert notifications recorded for this domain.</p>
+  {% endif %}
+</section>

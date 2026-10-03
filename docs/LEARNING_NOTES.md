@@ -2028,3 +2028,151 @@ The audit log is accessible via `GET /orgs/{org_id}/audit-events`:
 - **Choke Point Chaining:**
   `get_scan_for_org` verifies both that the scan exists AND that `Domain.org_id == org_id`. If either condition fails, it raises an anti-enumeration HTTP 404. By chaining all subsequent database queries strictly off the verified `scan_run.id` returned by the choke point, cross-tenant data leaks and parameter-tampering attacks are structurally eliminated.
 
+---
+
+# Part 11: Phase v3.4c — Schedule Settings, Alert Settings, Alert History & Audit Log UI
+
+## 1. Plain-English Code Walkthrough & Architecture
+
+### `src/asm/audit.py` (`build_audit_query`)
+- **What it is:** A centralized SQLAlchemy query constructor for `AuditEvent` records, shared by the JSON API and UI routes.
+- **Why it exists:** Prevents query drift between the JSON API (`GET /orgs/{org_id}/audit-events`) and the UI fragment (`GET /ui/orgs/{org_id}/audit-events`). If filtering logic, tenant isolation, or ordering were duplicated across two files, changes to one could accidentally leave the other vulnerable to cross-tenant exposure or inconsistent sorting.
+- **Key Parameters & Invariants:**
+  - `org_id`: Enforces tenant boundary (`AuditEvent.org_id == org_id`).
+  - `domain_id`: Optional target domain filter (`AuditEvent.target_type == "domain"`, `AuditEvent.target_id == str(domain_id)`).
+  - `action`: Optional action filter (`AuditEvent.action == action`).
+  - `limit`: Result count bound (default 50).
+  - `before_id`: Keyset pagination cursor (`AuditEvent.id < before_id`).
+  - `include_user`: When true, performs an outer join with `User` (`select(AuditEvent, User.email).outerjoin(User, AuditEvent.actor_user_id == User.id)`), allowing the UI to display the actor's email address alongside user-initiated actions without N+1 queries.
+  - Sorting: Always orders by `AuditEvent.id.desc()`.
+  - Top-level imports: `from asm.db.models import AuditEvent, User`.
+
+### `src/asm/api/routes_ui.py` (v3.4c Endpoints)
+- **Domain Detail Enhancement (`GET /ui/orgs/{org_id}/domains/{domain_id}`):**
+  - Passes schedule interval, `next_scan_at`, and email alert configuration into the template context.
+  - Viewers receive read-only status indicators; mutation forms are rendered for `admin` and `owner` roles.
+- **Domain Alert History (`GET /ui/orgs/{org_id}/domains/{domain_id}/alert-notifications`):**
+  - Protected by role gate `require_org_role("viewer")` and tenant choke point `get_domain_for_org(db, org_id, domain_id)`.
+  - Queries `AlertNotification` rows for the domain ordered by `created_at DESC, id DESC` (same as the JSON API) with offset pagination (`offset` and `limit=50`).
+  - Computes pagination flags: `has_prev = offset > 0`, `has_next = len(notifications) == limit`, `prev_offset = max(0, offset - limit)`, `next_offset = offset + limit`.
+- **Organization Audit Log (`GET /ui/orgs/{org_id}/audit-events`):**
+  - Protected by role gate `require_org_role("admin")` (admin/owner only; viewer receives 403, non-member receives 404).
+  - Normalizes empty action string (`action if action and action.strip() else None`) to prevent empty string matches against action names.
+  - Calls `build_audit_query` with `include_user=True` and `limit=50`.
+  - Serializes `event.metadata_` using Python's standard `json.dumps(event.metadata_, indent=2, sort_keys=True, ensure_ascii=False)` into a plain string `metadata_json`.
+  - Resolves `oldest_id = events_data[-1]["event"].id` when the page is full (50 events) to provide the `before_id` cursor for keyset pagination.
+
+### Templates (`partials/domain_detail.html`, `partials/alert_notifications.html`, `partials/audit_events.html`)
+- **`domain_detail.html` (Schedule & Alerts):**
+  - Schedule Section: Shows current cadence and next scan timestamp. Admin form renders `<select>` with options `Off`, `Every 6 hours`, `Every 12 hours`, `Every 24 hours`, `Every 7 days`, `Every 30 days`, plus `Every N hours (current)` for custom intervals. Unverified domains keep `Off` enabled while disabling active presets with hint text: `"Domain ownership verification required before scheduling automated scans."`
+  - Alerts Section: Shows `"Alert status"` (`Alerts: enabled` or `Alerts: disabled` neutral badge with class `status-skipped`), `"Minimum severity:"`, and `"Configured recipients:"` (`"N recipients configured"`). Admin form provides an enable toggle, severity select, and email chips. On unverified domains, alerts cannot be enabled (`"Domain ownership verification required before enabling alerts."`), but can be disabled.
+- **`alert_notifications.html` (Alert History):**
+  - Outbox log displaying `Created`, `Sent`, `Recipient`, `Subject`, `Status`, `Attempts`, `Last error`, and `Body`.
+  - Privacy Guard: The `Recipient` and `Last error` columns are rendered only if `user_role in ('admin', 'owner')`. Viewers never receive recipient email strings or raw SMTP error details.
+  - Status Badges: Sent (`status-verified`), Pending (`status-pending`), Failed (`status-failed`).
+  - Message body rendered within collapsible `<details class="alert-body-details"><summary>View message body</summary><pre class="code-block"><code>{{ n.body }}</code></pre></details>`.
+- **`audit_events.html` (Audit Log):**
+  - Filter bar with action select (`All actions` and 15 sorted lifecycle actions) and domain select (`All domains`).
+  - Table displaying `Time`, `Actor`, `Action`, `Target`, and `Metadata`.
+  - Keyset pagination with `"Older events"` (attaching `data-before-id="{{ oldest_id }}"`) and `"Newest"`.
+  - Escaped JSON metadata: Rendered as `{{ item.metadata_json }}` inside `<pre><code>`.
+
+### `src/asm/static/js/app.js` (v3.4c Handlers)
+- **Schedule save:** on submit of `#schedule-settings-form`, reads the
+  `interval_hours` select ("" becomes `null`, otherwise an integer) and calls
+  `authenticatedFetch('/orgs/{org_id}/domains/{domain_id}/schedule', { method: 'PUT', ... })`.
+  Errors are shown with `showError(formatErrorMessage(...))`; on success
+  `loadDomainDetail()` re-renders the panel.
+- **Alerts save:** on submit of `#alerts-settings-form`, collects the chip texts
+  (`#alert-emails-list .email-chip-text`), the checkbox and the severity select, then
+  sends `PUT .../alerts` the same way.
+- **Email chips:** added only with the "Add email" button (`#btn-add-alert-email`):
+  the value is trimmed and validated; case-insensitive duplicates and more than 5
+  entries are rejected; the chip is built with `createElement` and `textContent`.
+  "Remove" deletes the chip element.
+- **Alert history paging:** `.btn-page-alert-notifications` buttons pass
+  `data-offset` to `loadAlertNotifications()`, which loads
+  `/ui/.../alert-notifications?offset=N` into `#main-content-area` with `htmx.ajax`.
+- **Audit log:** `loadAuditLog()` builds the query string from non-empty `action`,
+  `domain_id` and `before_id` values only, and loads it into `#main-content-area`.
+  The filter form, "Older events" (`data-before-id`) and "Newest" all call it.
+
+---
+
+## 2. Five v3.4c Security & Architecture Interview Questions & Answers
+
+### Question 1: Why does Jinja2's built-in `tojson` filter bypass autoescape, why was that a security hazard for audit metadata, and how is untrusted JSON rendered safely?
+**Answer:**
+- **Why `tojson` Bypasses Autoescape:**
+  In Jinja2, the `tojson` filter is implemented by dumping an object to JSON and wrapping the resulting string in `markupsafe.Markup`. In Jinja's architecture, any object of type `Markup` is considered pre-sanitized by the developer. The autoescape engine explicitly checks `isinstance(val, Markup)`; if true, it injects the string verbatim without HTML-entity escaping (`&`, `<`, `>`, `"`, `'`).
+- **The Hazardous Assumption:**
+  The `tojson` filter was originally designed for embedding data inside JavaScript `<script>` blocks (e.g. `<script>let data = {{ data|tojson }};</script>`), where it escapes `<` as the Unicode escape sequence `\u003c` to prevent closing `</script>` tags. However, if rendered inside HTML body markup (such as `<pre><code>{{ data|tojson }}</code></pre>`), the browser treats it as HTML text. While `\u003c` prevents raw tag opening, relying on `Markup`-wrapped JSON in HTML templates is brittle and bypasses the fundamental autoescape guarantee. If any serializer variation or sub-filter does not escape HTML characters, XSS occurs.
+- **The Safe Pattern:**
+  Serialize the data in Python using the standard library `json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=False)`. Pass the resulting plain `str` into the template context. In Jinja, standard string variables rendered via `{{ metadata_json }}` undergo standard HTML autoescaping:
+  - `<` becomes `&lt;`
+  - `>` becomes `&gt;`
+  - `&` becomes `&amp;`
+  - `"` becomes `&#34;`
+- **Static Template Guard:**
+  To guarantee this rule is never broken, the project enforces a template guard test (`test_templates_have_no_csp_blocked_inline_code`) that statically inspects all Jinja2 files and fails the build if `tojson` or `|safe` appears anywhere in template source code.
+
+---
+
+### Question 2: In multi-tenant web applications, why must role-based authorization checks and resource-scoping choke points be tested separately (non-member vs parameter swap)?
+**Answer:**
+- **Two Distinct Layers of Defense:**
+  Multi-tenant security relies on two independent layers:
+  1. *Layer 1 (Role Authorization):* Validates that the caller is an authenticated member of the organization identified in the URL (`/orgs/{org_id}/...`) with an adequate role (`viewer`, `admin`, `owner`).
+  2. *Layer 2 (Resource Scoping / Choke Point):* Validates that the target resource (e.g. `domain_id`, `scan_id`) actually belongs to the caller's organization, not a different tenant.
+- **The Non-Member Test Flaw:**
+  If a test only verifies that a non-member cannot access `/ui/orgs/{org_a}/domains/{domain_b}/alert-notifications`, the test is stopped at Layer 1 (`require_org_role` raises 404 because the caller has no membership in `org_a`). This test never exercises Layer 2. If Layer 2 had a critical bug (e.g. querying `Domain.id == domain_id` without filtering on `Domain.org_id == org_id`), the non-member test would still pass!
+- **The Parameter Swap Test (IDOR):**
+  To test Layer 2, the test caller must be a fully authorized member (such as `owner`) of `org_a`, but pass the ID of a domain belonging to `org_b` (`/ui/orgs/{org_a}/domains/{domain_b}/alert-notifications`). Here, Layer 1 passes cleanly. The request reaches the resource choke point (`get_domain_for_org`). If the choke point correctly asserts `domain.org_id == org_a`, it raises an anti-enumeration 404. Testing both scenarios independently guarantees that both defense layers are functional.
+
+---
+
+### Question 3: What is the difference between UI-only data redaction and API-layer data redaction, what threat models does UI-only redaction protect against, and what does it leave exposed?
+**Answer:**
+- **What UI-Only Redaction Is:**
+  In v3.4c, redaction of recipient email addresses and raw SMTP errors is implemented in the presentation layer: Jinja2 templates (`alert_notifications.html`, `domain_detail.html`) omit email strings when `user_role == 'viewer'`, rendering only the recipient count (`"2 recipients configured"`). The underlying JSON API (`DomainRead`, `GET /alert-notifications`), however, continues to return the email addresses to authenticated viewers.
+- **Threat Models Protected by UI-Only Redaction:**
+  1. *Shoulder Surfing & Screen Sharing:* In enterprise operations, junior analysts or viewers often share screens or present dashboards during meetings. Hiding sensitive email addresses from the browser view prevents accidental visual disclosure.
+  2. *Casual Inspection & Screenshots:* Prevents PII from appearing in screenshots, exports, or casual DOM inspection.
+- **What UI-Only Redaction Leaves Exposed:**
+  Because the backend JSON API still serializes `alert_emails` and `recipient` to any caller with the `viewer` role, a knowledgeable viewer can open browser developer tools, inspect API network responses, or query the API directly using their Bearer token to read the unredacted email addresses.
+- **Why It Was Scoped This Way:**
+  Modifying API contracts risks breaking external API integrations and automated scripts. API-layer redaction was deferred to a future API version (tracked in `IDEAS.md`). However, defense-in-depth requires documenting this boundary clearly so developers and security auditors do not mistakenly assume the API is private.
+
+---
+
+### Question 4: When designing pagination for web applications, what are the architectural criteria for choosing keyset cursor pagination versus offset pagination?
+**Answer:**
+- **Keyset Cursor Pagination (Chosen for Audit Log):**
+  - *Mechanism:* Queries use an indexed sequential column and inequality operator: `WHERE org_id = :org_id AND id < :before_id ORDER BY id DESC LIMIT :limit`.
+  - *Best Fit:* High-volume, append-only event streams (such as audit logs, system telemetry, and transaction ledgers).
+  - *Performance:* $O(\log N)$ B-tree index seek regardless of page depth. Page 1,000 executes as fast as Page 1.
+  - *Stability:* Immune to row shifting. If new audit events are logged while a user inspects a page, the cursor (`before_id`) ensures the next page contains only events created before that record, avoiding duplicate or skipped items.
+  - *Trade-off:* Does not support random page jumping (e.g. "Jump to page 47"); users can only navigate sequentially forward (`before_id`) or reset to newest.
+- **Offset Pagination (Chosen for Alert History):**
+  - *Mechanism:* Queries use `OFFSET :offset LIMIT :limit`.
+  - *Best Fit:* Low-to-moderate volume entity lists scoped to a single parent entity (e.g. alert notifications for a specific domain, where the number of rows per domain is expected to stay small (not yet measured)).
+  - *Usability:* Supports direct bidirectional offsets (`offset=0`, `offset=50`, `offset=100`), enabling simple Next and Previous controls with deterministic offset math (`offset - limit`, `offset + limit`).
+  - *Trade-off:* $O(N)$ scanning cost on deep pages, and vulnerable to row drift if rows are inserted or deleted while paginating. This is acceptable while per-domain history stays small; revisit if it grows.
+
+---
+
+### Question 5: In security-critical state machines, why should "turning things off" remain permissible even when an entity is in an unverified or lapsed state (Decision A)?
+**Answer:**
+- **The Fail-Safe Direction (Principle of Safe State):**
+  In systems engineering, when an entity loses trust (such as a domain whose ownership verification lapses or fails DNS re-checks), the system must prevent active operations (automated network reconnaissance scans, outbound alert emails). However, administrative actions fall into two opposing directions:
+  1. *Activating / Continuing Operations:* Enabling alerts, scheduling recurring scans, triggering on-demand scans.
+  2. *Deactivating / Revoking Operations:* Disabling alerts, removing alert recipients, turning off scan schedules.
+- **The Hazard of Rigid Validation (The "Lock-In" Anti-Pattern):**
+  Prior to Decision A, `PUT .../alerts` rejected any request on an unverified domain with `422 Unprocessable Content`. If a domain's verification lapsed while email alerts were active, an administrator attempting to turn alerts off or remove a compromised recipient's email address received an error: the API refused to let them turn it off until they re-verified the domain!
+- **Decision A Resolution:**
+  The validation rule was refined:
+  - If `alerts_enabled == True`, verification is strictly required (returns 422 if unverified).
+  - If `alerts_enabled == False`, the request is permitted regardless of verification status.
+  This allows administrators to clear recipients, disable outbound notifications, and set scan schedules to `Off` without being blocked by verification checks. Systems must always facilitate transitioning toward a more secure, inert state.
+
+

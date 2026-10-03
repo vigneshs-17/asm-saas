@@ -145,6 +145,42 @@
 - **Fix:** Activated `.venv`, ensured `TEST_DATABASE_URL` was exported, and started `asm-test-db` container (`docker start asm-test-db`). All 430 tests then passed cleanly.
 - **How to prevent it:** Always run tests using `.venv\Scripts\pytest`, verify that `TEST_DATABASE_URL` is set, and confirm the test database container is running with `docker ps` before running integration tests.
 
+### Entry X: Audit Metadata Rendered with Jinja tojson Bypassed Autoescape
+- **What happened:** Plan review: the plan rendered audit metadata with Jinja's `tojson` and claimed autoescape protected it. `tojson` returns `Markup` (already marked safe), so autoescape skips it; it was safe only because `tojson` encodes `<` as `\u003c`.
+- **Root cause:** Jinja2's `tojson` filter marks its return value as HTML-safe (`Markup`), causing the autoescape engine to bypass it entirely.
+- **Fix:** Serialized metadata in Python via `json.dumps(...)` to a plain `str` passed in template context, rendered with `{{ metadata_json }}`; updated `test_templates_have_no_csp_blocked_inline_code` to ban `tojson` and `|safe` in templates.
+- **How to prevent it:** Never use `tojson` or `|safe` for untrusted JSON in templates; serialize to a plain string in Python and let Jinja autoescape it; enforce with static template guard tests.
+
+### Entry Y: Schedule Form Entirely Disabled on Unverified Domains
+- **What happened:** Plan review: the plan disabled the whole schedule form on unverified domains, but the API allows `interval_hours=null` there. Admins could not turn scans off.
+- **Root cause:** The plan conflated disallowing active automated scan cadences with preventing schedule changes altogether.
+- **Fix:** Keep "Off" (`value=""`) enabled while disabling all non-null cadence presets (`6`, `12`, `24`, `168`, `720`) on unverified domains, allowing admins to turn off automated scans.
+- **How to prevent it:** Design UI state transitions to always permit the fail-safe action (turning off automated background operations) even when prerequisites for enabling them are unmet.
+
+### Entry Z: Alerts Update API Inflexibility on Unverified Domains
+- **What happened:** The alerts API returned 422 for every update on unverified domains, so after a lapse alerts could not be disabled and recipients could not be removed.
+- **Root cause:** The API endpoint `PUT /orgs/{org_id}/domains/{domain_id}/alerts` rejected all requests with 422 if `domain.verification_status != "verified"`, regardless of whether the user was attempting to disable alerts or enable them.
+- **Fix:** (Owner Decision A) Modified the endpoint in `src/asm/api/routes.py` to allow `alerts_enabled=false` on unverified domains, allowing alerts to be turned off and recipients cleared; enabling alerts (`alerts_enabled=true`) still returns 422.
+- **How to prevent it:** Design authorization/validation gates to allow disabling or revoking features regardless of entity verification status.
+
+### Entry AA: Raw SMTP Exception in Last Error Column Exposed Recipient Emails to Viewers
+- **What happened:** Code review: alert history showed `last_error` to viewers. `last_error` stores raw SMTP exception text, which can contain recipient emails, undoing the viewer redaction.
+- **Root cause:** The template rendered `last_error` unconditionally for all roles, overlooking that SMTP client exceptions often include the target email address in their error messages.
+- **Fix:** Restricted the "Last error" column (`<th>` and `<td>`) in `alert_notifications.html` to `admin` and `owner` roles only; extended `test_ui_viewer_privacy_no_email_strings_anywhere` to verify that `last_error` strings containing recipient emails are never exposed to viewers.
+- **How to prevent it:** Treat diagnostic and exception strings as sensitive when they may reflect PII; apply the same role-based access restrictions to error detail columns as to the raw PII fields themselves.
+
+### Entry AB: Cross-Tenant Test Did Not Exercise Parameter Swap
+- **What happened:** Code review: the cross-tenant test only covered a non-member (stopped by the role check), never a member swapping in another org's `domain_id` (the `get_domain_for_org` choke point). A test named `...offset_paging` asserted no paging.
+- **Root cause:** The test suite verified multi-tenancy at the outermost authorization layer (`require_org_role`) but missed asserting the second defense layer (`get_domain_for_org`). Furthermore, the offset paging test verified only XSS without exercising real pagination across multiple pages.
+- **Fix:** Added `test_ui_alert_notifications_param_swap_404` to explicitly test swapping in another org's `domain_id` by an authenticated organization owner, and added `test_ui_alert_notifications_paging_55_rows` to assert real multi-page offset pagination (50 rows on page 1 with Next button, 5 rows on page 2 with Previous button).
+- **How to prevent it:** Test each security layer separately (outer membership check vs inner resource-scoping choke point); ensure test names strictly match their assertions.
+
+### Entry AC: Unlabelled Email Input and Unstyled Warning Notices
+- **What happened:** Owner's live check (Chrome DevTools Issues panel) reported "No label associated with a form field" and a missing autocomplete attribute on the add-email input; the unverified warning notices rendered as plain boxes.
+- **Root cause:** The input had only a placeholder (not an accessible name), and the templates used `.alert-warning`, which had no CSS rule.
+- **Fix:** Added a `<label for>` and `autocomplete="email"`, added the `.alert-warning` rule, and added `test_templates_form_fields_have_labels`.
+- **How to prevent it:** Run a live browser check every phase; the label test now guards every template.
+
 ---
 
 ## Architectural Decisions
@@ -205,6 +241,18 @@
 - **Decision:** Rendered finding evidence, why-it-matters strings, and change assets strictly as HTML-escaped text inside `<code>` and standard elements, never converting URLs or endpoints into active clickable links (`<a href>`).
 - **Rejected alternatives:** Automatically hyperlinking evidence strings (e.g. rendering discovered URLs or endpoints as clickable links). Rejected because evidence strings are attacker-influenced (drawn from certificate transparency logs, web banners, and HTTP responses); rendering active links creates stored XSS vectors (e.g. `javascript:...` URIs or data URIs) and phishing risks.
 
+### 15. Shared Audit Query Builder (`audit.build_audit_query`)
+- **Decision:** Extracted a single shared query builder function `build_audit_query` in `src/asm/audit.py` used by both the JSON API (`GET /orgs/{org_id}/audit-events`) and the UI fragment (`GET /ui/orgs/{org_id}/audit-events`).
+- **Rejected alternatives:** Separate query implementations in `routes.py` and `routes_ui.py`. Rejected because maintaining duplicate query filtering, joins, cursor logic, and sort ordering across two endpoints risks behavioral and security drift.
+
+### 16. Viewer Email Redaction in UI Layer Only
+- **Decision:** Redacted alert recipient emails and raw SMTP errors in the UI templates and routes for users with the `viewer` role, while leaving the existing JSON API responses unchanged.
+- **Rejected alternatives:** Modifying existing JSON API schemas (`DomainRead`, alert notifications list) to redact emails. Rejected because modifying existing API contracts was explicitly out of scope for v3.4c (recorded in `IDEAS.md` for a future API revision).
+
+### 17. Audit Log Keyset Paging Replaces Full Fragment
+- **Decision:** "Older events" and "Newest" reload the whole audit log fragment into `#main-content-area` via `htmx.ajax` (`loadAuditLog`) instead of appending rows to the table.
+- **Rejected alternatives:** Appending `<tr>` rows dynamically via JavaScript or client-side DOM parsing. Rejected because full fragment swapping requires zero client-side HTML parsing, keeps state purely server-driven, and preserves strict CSP invariants.
+
 ---
 
 ## Known Limitations
@@ -216,6 +264,8 @@
 - **15-Minute Polling Cap from `created_at`:** The polling cap calculates elapsed time from scan `created_at`. Scans that spend extended time queued before worker claim will stop auto-polling earlier in their active execution, requiring manual Refresh.
 - **UTC Label Without Conversion:** Timestamps are printed with a literal "UTC" suffix but are not explicitly converted to UTC first; they are only correct while the database session time zone is UTC.
 - **Untested 401 Retry Swap Path:** The preserved `hx-swap` on 401 token refresh has been verified in code and unit logic, but has not yet been exercised via an end-to-end browser test.
+- **Viewer Email Exposure in JSON API:** The JSON API (`DomainRead`, `alert-notifications`) still returns `alert_emails`, `recipient`, and `last_error` to viewers (in `IDEAS.md`).
+- **Untested JS Save Flows and Email Chips:** The schedule/alerts save flows and email chips run in browser JS with no browser test yet (v3.4d).
 
 ---
 
@@ -224,6 +274,9 @@
 - tests collected 339 -> 375, db tests 91 -> 112.
 - v3.4b: tests passed 412 -> 430 (2 deselected in both runs; owner-verified).
 - v3.4b: 141 tests marked db (pytest -m db --collect-only).
+- v3.4c: tests passed 430 -> 441 (owner-verified).
 - v3.3 audit logging added 15 tracked actions, migration 0009, and append-only trigger protection.
 - v3.4a added dashboard shell, Supabase auth, domains list, and DNS TXT verification.
 - v3.4b added scans list, scan detail with 5 stages, Fix first prioritization, and attack surface changes.
+- v3.4c added schedule and alerts configuration, alert history outbox log, and organization audit log UI.
+

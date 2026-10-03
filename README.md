@@ -16,7 +16,8 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 - **v3.3 Audit Log & Event Tracking**: Done. Append-only audit events table, trigger against app tampering, 15 structured actions, and organization audit API.
 - **v3.4a Dashboard Shell & Verification UI**: Done. Server-rendered dashboard (FastAPI + Jinja2 + HTMX), Supabase browser authentication, organization management, domains list, and DNS TXT verification UI.
 - **v3.4b Scans, Results & Changes UI**: Done. Scans list (latest 20 runs, status, trigger, duration, changes summary), Run scan button (gated by domain verification and role), scan detail with 5 pipeline stages, Fix first prioritized findings (capped at 50 with overflow count), per-tier count cards, and changes table with auto-polling (3s, 15m cap).
-- **Next: v3.4c**: Schedule and alerts UI, audit log UI, browser tests.
+- **v3.4c Schedule, Alerts & Audit Log UI**: Done. Domain schedule settings with presets (Off, 6h, 12h, 24h, 7 days, 30 days) and next scan time; email alerts settings (toggle, min severity, up to 5 recipients) with viewer email redaction; domain alert history outbox log with offset paging; and organization audit log with action/domain filtering, keyset pagination, and escaped metadata.
+- **Next: v3.4d**: Playwright browser tests.
 
 ---
 
@@ -450,7 +451,7 @@ curl -i "http://127.0.0.1:8000/orgs/1/audit-events?domain_id=1&action=verificati
 
 ---
 
-### 7. Dashboard (v3.4a, v3.4b)
+### 7. Dashboard (v3.4a-v3.4c)
 
 A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templates, and HTMX with zero node/npm build dependencies.
 
@@ -484,6 +485,10 @@ A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templat
   - Per-tier count cards: Summary cards for Domain score, Risk band, Critical, High, Medium, and Low counts (calculated across all parsed findings before capping).
   - Changes table: Structured delta entries from `ScanChange` records displaying severity, category, change type, asset, detail, and evidence (or `"No changes detected in this scan."`).
 - **Real-Time Polling & Cap:** Scans in `queued` or `running` state poll `/ui/orgs/{org_id}/scans/{scan_id}` every 3 seconds via HTMX (`hx-trigger="every 3s"`, `hx-target="this"`, `hx-swap="outerHTML"`). Polling is capped at 15 minutes from `created_at`; after that, polling stops and displays a banner: `"Still <status> after 15 minutes. Automatic updates have stopped."` alongside a manual `"Refresh"` button. Finished scans omit polling attributes entirely to prevent unintentional re-fetching on user clicks.
+- **Schedule:** Presets `Off`, `Every 6 hours`, `Every 12 hours`, `Every 24 hours`, `Every 7 days`, `Every 30 days`, and next scan time. On unverified domains, only "Off" is enabled to allow turning off background scans; cadence presets are disabled with `"Domain ownership verification required before scheduling automated scans."`
+- **Alerts:** Enable toggle, minimum severity selector, and dynamic email chip input supporting up to 5 recipients. On unverified domains, alerts cannot be enabled (`"Domain ownership verification required before enabling alerts."`), but can be disabled. Viewers see only the recipient count (`"N recipients configured"`), never recipient email strings.
+- **Alert History:** Outbox log for domain email notifications with offset pagination (`Previous` / `Next`, 50 per page) and collapsible message body inspection (`"View message body"`). The `Recipient` and `Last error` columns are displayed to `admin` and `owner` roles only, preventing raw SMTP exception text from exposing recipient emails to viewers.
+- **Audit Log:** Organization-wide append-only audit trail restricted to `admin` and `owner` roles. Filterable by lifecycle action (`All actions` dropdown) and target domain (`All domains` dropdown). Keyset cursor pagination using `"Older events"` (`before_id`) and `"Newest"` controls. Event metadata is serialized to a standard string and rendered as escaped JSON in `<pre><code>` blocks.
 
 #### Security Design
 - **All Writes Reuse the Existing JSON API:** The dashboard introduces zero new write endpoints and no duplicated business logic. Form submissions and action triggers dispatch `fetch()` requests directly to `/orgs`, `/orgs/{org_id}/domains`, `/orgs/{org_id}/domains/{domain_id}/verification/*`, and `/orgs/{org_id}/domains/{domain_id}/scans`, then refresh DOM fragments via `htmx.ajax()`.

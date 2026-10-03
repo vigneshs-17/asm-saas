@@ -476,6 +476,12 @@ body {
   color: var(--color-abyssal-ink);
 }
 
+.alert-warning {
+  background-color: var(--color-tungsten-bg);
+  color: var(--color-tungsten-text);
+  border-color: rgba(194, 87, 0, 0.3);
+}
+
 .alert-error {
   background-color: var(--color-signal-crimson-bg);
   color: var(--color-signal-crimson);
@@ -503,3 +509,91 @@ body {
   color: var(--color-muted-text);
   font-size: 0.875rem;
 }
+
+/* v3.4c: Schedule, alerts, and audit log styles */
+.settings-form {
+  margin-top: 0.75rem;
+  padding: 1rem 0;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.form-checkbox-group {
+  margin-bottom: 0.75rem;
+}
+
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.email-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  list-style: none;
+  margin-bottom: 0.5rem;
+}
+
+.email-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.6rem;
+  background-color: var(--color-sea-glass);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+}
+
+.email-chip-text {
+  word-break: break-all;
+}
+
+.btn-xs {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.4rem;
+}
+
+.add-email-group {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.alert-body-details,
+.metadata-details {
+  margin: 0.25rem 0;
+}
+
+.alert-body-details summary,
+.metadata-details summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--color-cobalt-beacon);
+}
+
+.metadata-block {
+  background-color: var(--color-sea-glass);
+  border: 1px solid var(--color-border-subtle);
+  padding: 0.5rem;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  overflow-x: auto;
+  max-height: 250px;
+  margin-top: 0.25rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.pagination-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 1rem;
+}
+
