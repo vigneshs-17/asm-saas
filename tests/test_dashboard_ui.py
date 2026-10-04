@@ -17,7 +17,7 @@ from asm.api.deps import get_current_user, reset_auth_dependencies
 from asm.api.main import app
 from asm.audit import record_event
 from asm.auth.config import get_auth_settings
-from asm.config import Settings
+from asm.config import Settings, get_settings
 from asm.db.models import (
     AlertNotification,
     AuditEvent,
@@ -30,6 +30,7 @@ from asm.db.models import (
     ScanStage,
     User,
 )
+from asm.db.session import get_engine
 from asm.verification import queue_domain_alert
 
 
@@ -286,29 +287,42 @@ def test_ui_unauthenticated_returns_401():
     """Calling /ui/* endpoints without an Authorization header returns 401."""
     # Ensure no dependency overrides
     app.dependency_overrides.pop(get_current_user, None)
-    with patch.dict(os.environ, {"SUPABASE_URL": "https://testproj.supabase.co"}):
+    get_settings.cache_clear()
+    get_engine.cache_clear()
+    try:
+        with patch.dict(
+            os.environ,
+            {
+                "SUPABASE_URL": "https://testproj.supabase.co",
+                "DATABASE_URL": "postgresql+psycopg://dummy:dummy@127.0.0.1:1/dummy_test",
+            },
+        ):
+            reset_auth_dependencies()
+            with TestClient(app) as client:
+                resp1 = client.get("/ui/empty-org")
+                assert resp1.status_code == 401
+
+                resp2 = client.get("/ui/orgs/1/domains")
+                assert resp2.status_code == 401
+
+                resp3 = client.get("/ui/orgs/1/domains/1")
+                assert resp3.status_code == 401
+
+                resp4 = client.get("/ui/orgs/1/domains/1/scans")
+                assert resp4.status_code == 401
+
+                resp5 = client.get("/ui/orgs/1/scans/1")
+                assert resp5.status_code == 401
+
+                resp6 = client.get("/ui/orgs/1/domains/1/alert-notifications")
+                assert resp6.status_code == 401
+
+                resp7 = client.get("/ui/orgs/1/audit-events")
+                assert resp7.status_code == 401
+    finally:
+        get_settings.cache_clear()
+        get_engine.cache_clear()
         reset_auth_dependencies()
-        with TestClient(app) as client:
-            resp1 = client.get("/ui/empty-org")
-            assert resp1.status_code == 401
-
-            resp2 = client.get("/ui/orgs/1/domains")
-            assert resp2.status_code == 401
-
-            resp3 = client.get("/ui/orgs/1/domains/1")
-            assert resp3.status_code == 401
-
-            resp4 = client.get("/ui/orgs/1/domains/1/scans")
-            assert resp4.status_code == 401
-
-            resp5 = client.get("/ui/orgs/1/scans/1")
-            assert resp5.status_code == 401
-
-            resp6 = client.get("/ui/orgs/1/domains/1/alert-notifications")
-            assert resp6.status_code == 401
-
-            resp7 = client.get("/ui/orgs/1/audit-events")
-            assert resp7.status_code == 401
 
 
 # ==============================================================================

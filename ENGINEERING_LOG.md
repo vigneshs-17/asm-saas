@@ -213,6 +213,12 @@
 - **Fix:** Wrapped the 401 trigger in `page.expect_response`, waited first for `expect(page.locator(".status-badge:has-text('Status: Succeeded')")).to_be_visible()` to guarantee DOM swap completion, and then executed immediate non-waiting assertions verifying container counts (`count() == 1`, nested `count() == 0`) and absence of `hx-trigger` and `hx-get` attributes.
 - **How to prevent it:** See a test fail before trusting it; confirm the mutation with git diff; read the summary line for "skipped".
 
+### Entry AI: CI Red for 4 Commits (v3.4a-v3.4d) Unnoticed Due to Missing DATABASE_URL in Lint Job
+- **What happened:** CI red for 4 commits (v3.4a-v3.4d) unnoticed: the test needed DATABASE_URL, present locally via .env but absent in the lint job; CI status was reported from an unreliable page summary instead of the job log.
+- **Root cause:** In commit 682df8e (v3.4a), `test_ui_unauthenticated_returns_401` was added to `tests/test_dashboard_ui.py`. The tested `/ui/*` endpoints resolve `current_user: CurrentUser` (`get_current_user`), which depends on `db: DbSession` (`get_db`). Resolving `get_db` invokes `get_settings().database_url`. Because `database_url` is a required setting without default, `get_settings()` raises `RuntimeError("DATABASE_URL environment variable is required but not set.")` if neither `DATABASE_URL` nor `.env` exists. In CI's `Lint & Test` job, no database service or `DATABASE_URL` is configured, so `test_ui_unauthenticated_returns_401` failed on every push across runs #29-#32. Locally, the test passed because `.env` supplied a `DATABASE_URL`.
+- **Fix:** Patched a dummy `DATABASE_URL` (`postgresql+psycopg://dummy:dummy@127.0.0.1:1/dummy_test`, using port 1 so it can never reach a real local Postgres) within `test_ui_unauthenticated_returns_401` via `unittest.mock.patch.dict(os.environ, ...)`. SQLAlchemy sessions are lazy, and because unauthenticated requests fail fast when extracting the missing Bearer header in `get_current_user`, no database connection is ever attempted. Caches cleared before and after so the dummy URL cannot leak into later tests.
+- **How to prevent it:** Confirm CI from the job log or a screenshot before closing a phase.
+
 ---
 
 ## Architectural Decisions
