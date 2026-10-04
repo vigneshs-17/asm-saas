@@ -83,7 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Shared Audit Query Builder (`build_audit_query`)**: Centralized audit query constructor in `src/asm/audit.py` shared by both the JSON API (`routes.py`) and UI fragment (`routes_ui.py`), supporting keyset pagination (`before_id`), filters, and optional outer join with `users` for actor email display.
 - **Template Security Guard Enhancement**: Updated `test_templates_have_no_csp_blocked_inline_code` to ban `tojson` and `|safe` filters across all Jinja2 templates, guaranteeing all JSON and attacker-influenced data is autoescaped.
 
+#### Playwright Browser Tests (v3.4d)
+- **End-to-End Browser Test Suite**: Added 10 Playwright Chromium tests under `tests/browser/` verifying browser workflows against an in-process live Uvicorn server thread on an ephemeral port.
+- **Zero In-Tree Auth Backdoors**: Implemented synthetic JWT-shaped token generation and token registries strictly within `tests/browser/helpers.py` and `tests/browser/conftest.py`. The production application code (`src/`) has zero test hooks and rejects synthetic tokens with HTTP 401.
+- **Browser State Machine & UI Verification**: Automated verification for sign-in, zero runtime CSP violations, viewer RBAC privacy with complete email omission, schedule/alerts validation on unverified domains (Decision A), 5-email chip limits, scan detail auto-polling and cleanup, 401 token refresh retry preserving a single container, audit log keyset navigation, and DNS verification result DOM persistence.
+- **Strict Network & Runtime Guards**: Automatic fixture teardown assertions enforcing zero CSP violation events, zero unhandled page errors, zero unexpected 5xx or non-favicon 404 responses, and zero outbound network egress. Added an autouse patch forbidding real DNS lookups in browser tests.
+
 ### Changed
+- **Pytest Default Options**: `pyproject.toml` `addopts` now deselects the `browser` marker by default (`-m 'not integration and not browser'`), keeping default test execution fast and offline.
+- **Dedicated Browser Test CI Job**: Added `browser-test` workflow job in `.github/workflows/ci.yml` running Playwright tests against PostgreSQL and recording trace/screenshot artifacts on failure.
 - **Alerts Update on Unverified Domains**: `PUT /orgs/{org_id}/domains/{domain_id}/alerts` now accepts `alerts_enabled=false` on unverified domains, so alerts can be switched off and recipients removed after a lapse; enabling still returns 422.
 - **BREAKING (API)**: Removed `authorized` and `authorization_note` fields from `DomainCreate` request schema and database models. Client can no longer assert authorization.
 - **BREAKING (Database)**: Migration `0008_domain_verification` resets all existing domains to `verification_status = 'pending'`, pausing automated scheduled scans until DNS verification is completed.

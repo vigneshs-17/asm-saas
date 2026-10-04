@@ -17,7 +17,8 @@ A lightweight, modular, and defensible Attack Surface Management (ASM) reconnais
 - **v3.4a Dashboard Shell & Verification UI**: Done. Server-rendered dashboard (FastAPI + Jinja2 + HTMX), Supabase browser authentication, organization management, domains list, and DNS TXT verification UI.
 - **v3.4b Scans, Results & Changes UI**: Done. Scans list (latest 20 runs, status, trigger, duration, changes summary), Run scan button (gated by domain verification and role), scan detail with 5 pipeline stages, Fix first prioritized findings (capped at 50 with overflow count), per-tier count cards, and changes table with auto-polling (3s, 15m cap).
 - **v3.4c Schedule, Alerts & Audit Log UI**: Done. Domain schedule settings with presets (Off, 6h, 12h, 24h, 7 days, 30 days) and next scan time; email alerts settings (toggle, min severity, up to 5 recipients) with viewer email redaction; domain alert history outbox log with offset paging; and organization audit log with action/domain filtering, keyset pagination, and escaped metadata.
-- **Next: v3.4d**: Playwright browser tests.
+- **v3.4d Playwright Browser Tests**: Done. Real browser interaction tests in Chromium with live uvicorn server, route interception, 0 CSP violations, and multi-tenant UI verification.
+- **Next: v3.5**: landing page.
 
 ---
 
@@ -504,6 +505,36 @@ A lightweight, server-rendered web dashboard built using FastAPI, Jinja2 templat
 - **Cache Invalidation:** `Cache-Control: no-store` header is enforced on all `/ui/*` HTML fragment responses to prevent caching sensitive tenant data.
 - **Session Storage:** Tokens are held in module memory and backed by `sessionStorage` (cleared when the browser tab closes, never persisted to `localStorage`).
 - **Vendored Libraries:** HTMX `2.0.11` and Supabase JS `2.117.2` UMD builds are vendored locally with pinned versions, official upstream URLs, and cryptographic SHA-256 checksums documented in `src/asm/static/vendor/VENDOR.md`.
+
+#### Browser tests (v3.4d)
+
+End-to-end browser integration tests executed with Playwright in headless Chromium against an in-process Uvicorn server thread on an ephemeral port.
+
+##### What They Cover
+1. `test_browser_signin_and_domain_inventory`: Browser sign-in via form, `#app-shell` visibility, domain listing, and zero CSP violations.
+2. `test_browser_viewer_rbac_privacy`: Viewer role sees recipient count, write forms omitted, and no email addresses anywhere in DOM or alert history.
+3. `test_browser_schedule_unverified_domain`: Unverified domain allows only "Off" schedule preset, displays verification notice, and persists setting.
+4. `test_browser_email_chips_interaction`: Recipient chip additions, removal, case-insensitive duplicate rejection, and 5-chip cap enforcement.
+5. `test_browser_alerts_save_decision_a`: On unverified domain, enabling alerts returns 422, while disabling alerts succeeds (Decision A).
+6. `test_browser_scan_detail_polling_lifecycle`: Scan polling auto-refreshes every 3 seconds via HTMX and cleans up polling attributes upon completion.
+7. `test_browser_401_retry_preserves_single_container`: Token refresh on 401 retries scan poller preserving single `#scan-detail-container` without nesting.
+8. `test_browser_audit_log_filters_and_paging`: Audit log keyset pagination (50 on page 1, 5 on page 2, return to newest) and action filtering.
+9. `test_browser_production_app_rejects_fake_token_401`: Verifies production auth dependency rejects synthetic test JWT tokens with HTTP 401.
+10. `test_browser_check_now_result_stays_visible`: Verification "Check now" outcome box persists in DOM after network settle.
+
+##### How to Run (Windows PowerShell)
+```powershell
+.\.venv\Scripts\pip install -e ".[dev]"
+.\.venv\Scripts\playwright install chromium
+docker start asm-test-db
+$env:TEST_DATABASE_URL = "postgresql+psycopg://postgres:postgres@localhost:5433/asm_test"
+.\.venv\Scripts\pytest -m browser -v
+```
+
+##### Test Execution & CI Isolation
+- **Deselected by Default Locally:** `pyproject.toml` configures `addopts = "-v --strict-markers -m 'not integration and not browser'"`, preventing browser tests from running during routine unit test runs.
+- **Separate CI Job:** Browser tests run in their own GitHub Actions job (`browser-test` in `.github/workflows/ci.yml`) using a dedicated PostgreSQL service container, installing Playwright system dependencies with `playwright install --with-deps chromium`, and uploading trace/screenshot artifacts on failure.
+- **Security Invariant:** Zero test-only authentication pathways or backdoors exist in application code (`src/`). Synthetic tokens, token registries, and Supabase auth endpoint interception exist exclusively inside `tests/browser/`. If a synthetic test token is sent to the application without test overrides, the real production auth verifier rejects it with HTTP 401 (proven by `test_browser_production_app_rejects_fake_token_401`).
 
 ---
 

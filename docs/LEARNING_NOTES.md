@@ -2175,4 +2175,147 @@ The audit log is accessible via `GET /orgs/{org_id}/audit-events`:
   - If `alerts_enabled == False`, the request is permitted regardless of verification status.
   This allows administrators to clear recipients, disable outbound notifications, and set scan schedules to `Off` without being blocked by verification checks. Systems must always facilitate transitioning toward a more secure, inert state.
 
+---
+
+# Part 12: Phase v3.4d — Playwright Browser Tests
+
+## 1. Plain-English Code Walkthrough
+
+### `tests/browser/conftest.py`
+- **What it is:** The shared pytest configuration and fixture hub for end-to-end browser tests.
+- **Why it exists:** Browser tests require orchestrating multiple layers: a real PostgreSQL test database, an in-process live HTTP server, Chromium browser instances, synthetic authentication routing, and strict runtime health assertions.
+- **Key Fixtures:**
+  - `forbid_real_dns (autouse=True)`: Patches `asm.api.routes.check_dns_txt_verification` to raise `AssertionError("real DNS lookup attempted in a browser test")`. Ensures tests remain hermetic and never leak outbound DNS traffic.
+  - `configure_browser_auth_settings (autouse=True)`: Patches environment variables `SUPABASE_URL="https://auth.test-asm.local"` and `SUPABASE_PUBLISHABLE_KEY="sb_publishable_test"`, resetting auth dependencies before and after each test.
+  - `browser_session_factory`: Sessionmaker bound to `db_engine` with `expire_on_commit=False` for multi-threaded access.
+  - `override_db_and_auth`: Overrides FastAPI's `get_db` to yield fresh sessions from `browser_session_factory`, and overrides `get_current_user` to validate incoming Bearer tokens against `TOKEN_REGISTRY` in memory.
+  - `live_server`: Starts Uvicorn inside a daemon thread bound to `127.0.0.1:0` (ephemeral port), shares the FastAPI `app` in-process, polls until started, yields the base URL, and shuts down cleanly after test completion.
+  - `page`: Launches Chromium via `sync_playwright()`, initializes tracing and CSP violation listeners (`window.__cspViolations`), intercepts network routes via `page.route("**", ...)` (mocking Supabase auth grants and blocking external egress), monitors console errors and server response status codes, and executes teardown assertions (asserting zero CSP violations, zero console errors, zero page errors, zero 5xx or non-favicon 404 responses, and zero aborted external requests).
+
+### `tests/browser/helpers.py`
+- **What it is:** Helper utilities and synthetic token registries decoupled from test fixtures.
+- **Why it exists:** Avoids importing directly from `conftest.py` (which violates pytest conventions) while centralizing authentication state and browser interaction helpers.
+- **Key Functions and Registries:**
+  - `TOKEN_REGISTRY`: In-memory dictionary mapping synthetic `access_token` strings to `user.id` UUIDs.
+  - `REFRESH_REGISTRY`: In-memory dictionary mapping synthetic `refresh_token` strings to `user.id` UUIDs.
+  - `make_fake_jwt(user: User) -> str`: Builds a base64url-encoded, JWT-shaped string (`header.payload.synthetic_signature`) with HS256 algorithm and registers it in `TOKEN_REGISTRY`.
+  - `sign_in(page: Page, email: str, base_url: str) -> None`: Automates navigating to `/app`, filling `#signin-email` and `#signin-password`, clicking submit, and waiting for `#app-shell` visibility.
+
+### `tests/browser/test_dashboard_browser.py`
+- **What it is:** The 10 Playwright Chromium browser tests marked with `@pytest.mark.browser`.
+- **Why it exists:** Exercises behaviors that cannot be validated via server-rendered HTML unit tests: real DOM event dispatch, live HTMX outerHTML swaps, runtime CSP evaluation, JavaScript event loops, and multi-step state changes.
+- **The 10 Tests:**
+  1. `test_browser_signin_and_domain_inventory`: Signs in as owner, checks `#app-shell` and domain cards, asserts zero CSP violations.
+  2. `test_browser_viewer_rbac_privacy`: Verifies viewer role sees recipient count, write forms are omitted, and recipient emails do not appear in the DOM or alert history table.
+  3. `test_browser_schedule_unverified_domain`: Confirms only "Off" is enabled on unverified domains, warning notice is visible, and saving persists.
+  4. `test_browser_email_chips_interaction`: Tests adding chips, removing chips, rejecting case-insensitive duplicates, and enforcing the 5-chip cap with error banner.
+  5. `test_browser_alerts_save_decision_a`: Tests Decision A on unverified domains: enabling alerts fails with 422, while disabling alerts succeeds and renders "Alerts: disabled".
+  6. `test_browser_scan_detail_polling_lifecycle`: Tests scan polling with `hx-trigger="every 3s"`, auto-refreshing until status reaches succeeded, and removing polling attributes.
+  7. `test_browser_401_retry_preserves_single_container`: Intercepts scan route to return 401 once, records headers, updates scan to succeeded, awaits Succeeded badge, asserts exactly 1 `#scan-detail-container` without nesting, and verifies refresh token header replacement.
+  8. `test_browser_audit_log_filters_and_paging`: Seeds 55 audit events, checks 50 on page 1, navigates to page 2 (5 events) via "Older events", resets to page 1 via "Newest", and verifies action filtering.
+  9. `test_browser_production_app_rejects_fake_token_401`: Verifies that if `get_current_user` override is removed, the production verifier rejects synthetic test tokens with HTTP 401.
+  10. `test_browser_check_now_result_stays_visible`: Clicks "Check now" on unverified domain with mocked verification stub, asserts outcome alert remains in DOM after network settle.
+
+---
+
+## 2. Five v3.4d Interview Questions & Answers
+
+### Question 1: Why run an in-process live server thread instead of a separate subprocess or a `TEST_MODE` configuration flag?
+**Answer:**
+- **The Subprocess Isolation Barrier:**
+  When a test harness launches a web server as an external OS subprocess (e.g. `subprocess.Popen(["uvicorn", "asm.api.main:app"])`), the server executes inside an isolated Python process with its own separate memory address space. In that architecture, pytest fixtures running in the test runner process cannot access or modify FastAPI's in-memory data structures, specifically `app.dependency_overrides`.
+- **The Hazard of `TEST_MODE` Flags:**
+  To work around subprocess memory isolation, developers often resort to adding configuration switches like `if settings.TEST_MODE: bypass_auth()`. Introducing test-only conditional branches into production code creates backdoors that risk accidental enablement in production, increases attack surface, and violates security hygiene.
+- **The In-Process Solution:**
+  By running Uvicorn inside a Python `threading.Thread` within the same process on an ephemeral port (`port=0`), the test harness shares the identical FastAPI `app` object in memory. This enables:
+  1. *Per-Test Dependency Overrides:* `app.dependency_overrides[get_db]` and `app.dependency_overrides[get_current_user]` can be registered and cleared per test.
+  2. *Zero Code Changes in `src/`:* Production code contains zero test flags, zero backdoors, and zero mock hooks.
+  3. *Exact Production Routes:* The live browser connects to a real HTTP socket, but requests are processed through clean, test-scoped dependencies.
+
+---
+
+### Question 2: What is mutation testing, why must you prove a test can fail, and what silent pitfalls occurred in v3.4d?
+**Answer:**
+- **Why Seeing Tests Pass Is Insufficient:**
+  A test that passes does not prove that the code is correct; it only proves that the test did not fail. If a test contains a logical flaw (such as asserting an element's state before a swap occurs, or asserting on conditions that are always true), the test is vacuous: it passes whether the application code works or is completely broken.
+- **Proving the Test Can Fail (Mutation Check):**
+  Mutation testing involves deliberately introducing a bug (a "mutant") into the application code and verifying that the test fails:
+  - In v3.4d, the bug being guarded was Entry T: duplicate nested `#scan-detail-container` elements if `retryContext.swap` was omitted during 401 token refresh.
+  - To verify the test, `retryContext.swap = swapStyle` was commented out in `src/asm/static/js/app.js`.
+  - Running `test_browser_401_retry_preserves_single_container` resulted in `FAILED: assert 2 == 1`, confirming the test catches the bug. Restoring the line made it pass.
+- **Silent Pitfalls Encountered:**
+  1. *Unsaved File Edits:* An earlier mutation attempt ran pytest before saving the commented-out change to disk; the test passed because it was testing unmodified code.
+  2. *Unset Test Database URL:* Another run resulted in tests being skipped because `TEST_DATABASE_URL` was not exported in the shell, which could be misread as passing if the terminal summary is not inspected.
+- **Rule of Thumb:**
+  Always verify the mutation diff with `git diff`, run the test, confirm the exact assertion failure, restore the code, verify clean diff, and inspect the test summary line to ensure no tests were skipped.
+
+---
+
+### Question 3: What is the difference between Playwright's auto-waiting `expect()` and immediate assertions, and when does auto-waiting hide bugs?
+**Answer:**
+- **How Auto-Waiting `expect()` Works:**
+  Playwright assertions like `expect(locator).to_have_count(1)` or `expect(locator).to_be_visible()` do not assert immediately. Instead, they poll the DOM repeatedly across a timeout window (default 5 seconds) until the condition is met or the timer expires.
+- **When Auto-Waiting Is Essential:**
+  Auto-waiting is essential when waiting for asynchronous network operations and DOM swaps to complete. For example, waiting for `expect(page.locator(".status-badge:has-text('Status: Succeeded')")).to_be_visible()` ensures that HTMX has received the retry response and finished swapping the new markup into the DOM.
+- **When Auto-Waiting Hides Critical Bugs:**
+  If you use auto-waiting assertions to verify that an undesirable element is *not* present, or that a transient bad state does not occur, auto-waiting can mask failures:
+  - If a temporary broken element is swapped in and later replaced, or if an assertion should hold *instantly* at a specific lifecycle boundary, an auto-waiting locator may wait until an asynchronous cleanup or subsequent action "fixes" the DOM before evaluating.
+- **The Immediate Assertion Pattern:**
+  After synchronizing on a definitive event via `expect(...)` (e.g. the Succeeded badge becoming visible), all structural invariant checks should use non-waiting Python assertions:
+  ```python
+  assert page.locator("#scan-detail-container").count() == 1
+  assert page.locator("#scan-detail-container #scan-detail-container").count() == 0
+  assert page.locator("#scan-detail-container").get_attribute("hx-trigger") is None
+  ```
+  These evaluate immediately against the current DOM state, failing without waiting if the hierarchy is malformed.
+
+---
+
+### Question 4: Why are server-side network calls invisible to browser request interception, and how do you ensure end-to-end tests remain hermetic?
+**Answer:**
+- **The Boundary of `page.route`:**
+  Playwright's `page.route("**", ...)` intercepts network requests dispatched by the browser client (Chromium network stack). This includes browser `fetch()`, `XMLHttpRequest`, stylesheet loads, script tags, and image requests.
+- **Server-Side Network Blindspot:**
+  When a browser action triggers an HTTP endpoint on the local application server (e.g. clicking "Check now" posts to `/orgs/{org_id}/domains/{domain_id}/verification/check`), the server executes Python code in the backend process. If that Python code performs an outbound network call (such as `dnspython` querying public DNS servers or `httpx` querying external APIs), those packets originate from the server process, not Chromium. Playwright has zero visibility into or control over server-side network calls.
+- **The Danger of Leaked Lookups:**
+  In Phase v3.4d, the initial "Check now" test clicked the button, which invoked `check_dns_txt_verification` on the server. Because the domain was not mocked on the server, the server performed real DNS resolution against public DNS root servers, violating test hermeticity, introducing external network flakiness, and leaking internal test data.
+- **The Hermetic Defense:**
+  Enforce test hermeticity by adding an autouse pytest fixture (`forbid_real_dns`) that patches server-side network handlers to fail fast:
+  ```python
+  @pytest.fixture(autouse=True)
+  def forbid_real_dns():
+      def _fail_dns(*args, **kwargs):
+          raise AssertionError("real DNS lookup attempted in a browser test")
+      with patch("asm.api.routes.check_dns_txt_verification", side_effect=_fail_dns):
+          yield
+  ```
+  Any test that requires DNS resolution must explicitly override this patch with a local mock stub, guaranteeing no unmonitored external network calls occur.
+
+---
+
+### Question 5: How do you detect Content Security Policy (CSP) violations in end-to-end browser tests when the browser does not fail HTTP requests on CSP blocks?
+**Answer:**
+- **The Silent Nature of CSP Violations:**
+  When a browser blocks an inline script, disallowed style, or unauthorized network connection due to Content Security Policy, the HTTP request for the HTML page still succeeds with status 200. The browser simply refuses to execute the script or apply the style, logging a warning or error to the browser developer console without failing the test runner.
+- **Two-Layer CSP Detection Architecture:**
+  In v3.4d, CSP violations are actively captured through two complementary mechanisms in `conftest.py`:
+  1. *Security Policy Violation Event Listener:*
+     Before any page loads, Playwright executes an initialization script (`page.add_init_script`) that hooks the standard DOM `securitypolicyviolation` event:
+     ```javascript
+     window.__cspViolations = [];
+     document.addEventListener('securitypolicyviolation', function(e) {
+         window.__cspViolations.push({
+             blockedURI: e.blockedURI,
+             violatedDirective: e.violatedDirective,
+             originalPolicy: e.originalPolicy
+         });
+     });
+     ```
+     During fixture teardown after the test completes, Python retrieves this array via `page.evaluate("window.__cspViolations || []")` and asserts `assert len(csp_violations) == 0`.
+  2. *Console Error Listener:*
+     The page fixture listens to `page.on("console", ...)` and captures any message with level `error`. Teardown asserts `assert len(console_errors) == 0`.
+- **Outcome:**
+  If any template or script attempts to inject inline styles, inline scripts, or connect to unapproved origins, the test suite immediately fails and prints the exact directive and blocked URI.
+
+
 

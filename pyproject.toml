@@ -29,6 +29,7 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.5.0",
+    "playwright>=1.49.0",
 ]
 
 [project.scripts]
@@ -62,8 +63,9 @@ ignore = []
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --strict-markers -m 'not integration'"
+addopts = "-v --strict-markers -m 'not integration and not browser'"
 markers = [
     "integration: real network integration tests (deselected by default in CI)",
     "db: tests requiring a real PostgreSQL database (run when TEST_DATABASE_URL is set)",
+    "browser: Playwright browser tests requiring a running server and chromium (deselected by default)",
 ]

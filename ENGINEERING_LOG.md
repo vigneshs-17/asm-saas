@@ -181,6 +181,38 @@
 - **Fix:** Added a `<label for>` and `autocomplete="email"`, added the `.alert-warning` rule, and added `test_templates_form_fields_have_labels`.
 - **How to prevent it:** Run a live browser check every phase; the label test now guards every template.
 
+### Entry AD: Plan Review — Missing `get_db` Dependency Override in In-Process Server
+- **What happened:** The initial v3.4d plan did not override `get_db`, so the in-process server would have used `DATABASE_URL` (the dev DB) instead of the test database.
+- **Root cause:** The plan assumed that setting environment variables or using the caller's test session was sufficient, overlooking that incoming HTTP requests to the live Uvicorn thread invoke FastAPI's dependency injection system, which defaults to `get_db` using the engine created from `DATABASE_URL`.
+- **Fix:** Added a `get_db` dependency override bound to `browser_session_factory` (which uses the validated `*_test` engine from the `db_engine` fixture), providing a new database session per request and cleaning tables with `clean_db`.
+- **How to prevent it:** In integration test harnesses using a live server, explicitly review every database dependency provider to ensure all execution paths bind to the test engine.
+
+### Entry AE: Plan Review — Auth Override Ignored Tokens Preventing Token Bug Detection
+- **What happened:** The initial plan's auth override returned a hardcoded user regardless of the incoming token, meaning tests could not catch token-injection or header-propagation bugs.
+- **Root cause:** The planned test dependency mock bypassed token inspection entirely to simplify test authentication.
+- **Fix:** Updated the override to parse the `Authorization` header, extract the Bearer token, validate it against `TOKEN_REGISTRY`, and look up the corresponding user in the test database session. Unregistered tokens return HTTP 401.
+- **How to prevent it:** Test authentication overrides must validate synthetic tokens against an explicit registry rather than returning unconditional mock objects.
+
+### Entry AF: Code Review — "Check now" Browser Test Performed Real DNS Lookup
+- **What happened:** The "Check now" browser test performed a real DNS lookup (server-side, invisible to Playwright's request guard).
+- **Root cause:** Playwright request interception (`page.route`) operates purely in the browser client context; server-side DNS queries dispatched by FastAPI endpoints via `dnspython` bypass the browser network layer entirely.
+- **Fix:** Added an autouse fixture (`forbid_real_dns`) in `tests/browser/conftest.py` patching `asm.api.routes.check_dns_txt_verification` to raise `AssertionError("real DNS lookup attempted in a browser test")`. In `test_browser_check_now_result_stays_visible`, overridden with a mock returning `(VerificationOutcome.ABSENT, "No TXT records found at _asm-verify.check.example.com")`, asserting it was called exactly once.
+- **How to prevent it:** In end-to-end browser test suites, guard all server-side external network boundaries with autouse fixtures that fail fast if real network calls are attempted.
+
+### Entry AG: Code Review — Console Filter Swallowed 5xx and 404 Responses
+- **What happened:** The initial console message filter swallowed failed HTTP resource and fragment loads, including 5xx server errors and 404 errors.
+- **Root cause:** The console error handler used an overly broad filter that ignored all messages mentioning failed fetches or non-200 status codes.
+- **Fix:** Narrowed the console filter to ignore only `"favicon.ico"`, `"status of 401"`, `"status of 422"`, `"Response Status Error Code 401"`, and `"Response Status Error Code 422"`. Added an active `page.on("response")` listener that fails the test if any request to the live server returns status $\ge 500$ or a non-favicon 404.
+- **How to prevent it:** Narrow error filters to explicit expected codes; pair console monitoring with affirmative response status listeners on application server routes.
+
+### Entry AH: Vacuous 401-Retry Test and Silent Mutation Check Failures
+- **What happened:** The 401-retry test was vacuous twice: first it asserted nothing about the retry; then its count ran before htmx swapped the response into the DOM. Proven with a mutation check (commented-out retryContext.swap -> FAILED, assert 2 == 1). An earlier mutation attempt silently tested unmodified code because the edit was not saved, and another was SKIPPED because TEST_DATABASE_URL was unset.
+- **Root cause:**
+  1. The test counted containers right after the 200 HTTP response arrived rather than after HTMX completed swapping the DOM.
+  2. Testing mutations without saving files or verifying test selection resulted in false passes and skipped executions.
+- **Fix:** Wrapped the 401 trigger in `page.expect_response`, waited first for `expect(page.locator(".status-badge:has-text('Status: Succeeded')")).to_be_visible()` to guarantee DOM swap completion, and then executed immediate non-waiting assertions verifying container counts (`count() == 1`, nested `count() == 0`) and absence of `hx-trigger` and `hx-get` attributes.
+- **How to prevent it:** See a test fail before trusting it; confirm the mutation with git diff; read the summary line for "skipped".
+
 ---
 
 ## Architectural Decisions
@@ -253,6 +285,18 @@
 - **Decision:** "Older events" and "Newest" reload the whole audit log fragment into `#main-content-area` via `htmx.ajax` (`loadAuditLog`) instead of appending rows to the table.
 - **Rejected alternatives:** Appending `<tr>` rows dynamically via JavaScript or client-side DOM parsing. Rejected because full fragment swapping requires zero client-side HTML parsing, keeps state purely server-driven, and preserves strict CSP invariants.
 
+### 18. In-Process Uvicorn Thread for Browser Tests
+- **Decision:** Run the live web server during browser tests inside a daemon thread (`threading.Thread(target=server.run, daemon=True)`) hosting Uvicorn on an ephemeral port (`port=0`), sharing the FastAPI `app` object in-process.
+- **Rejected alternatives:** Subprocess invocation (`subprocess.Popen(["uvicorn", ...])`) or adding a `TEST_MODE` configuration flag in production source code. Rejected because subprocesses run in separate memory spaces where FastAPI's `app.dependency_overrides` cannot be manipulated per test, which would force introducing test-specific bypass flags or backdoors into `src/`. In-process threads allow direct dependency injection overrides with zero test hooks in production code.
+
+### 19. Synthetic Supabase Auth Mock via Playwright Route Interception
+- **Decision:** Intercept Supabase Auth endpoints (`https://auth.test-asm.local/auth/v1/token`) using Playwright's `page.route` to return synthetic JWT-shaped HS256 tokens and track tokens in memory registries.
+- **Rejected alternatives:** Running an external Supabase emulator container, using real Supabase credentials, or creating a backdoor `/api/test-login` route. Rejected because external services add network instability, slow down testing, and require external credentials; backdoor routes in application source introduce severe security vulnerabilities. Synthetic tokens shaped like JWTs satisfy client-side parsing while being rejected by production JWT verifiers (proven by `test_browser_production_app_rejects_fake_token_401`).
+
+### 20. Separate Browser Test Marker and CI Workflow Job
+- **Decision:** Mark all browser tests with `@pytest.mark.browser`, deselect them by default locally in `pyproject.toml` (`-m 'not integration and not browser'`), and execute them in a dedicated CI job (`browser-test`) in `.github/workflows/ci.yml`.
+- **Rejected alternatives:** Running browser tests as part of the default `pytest` invocation. Rejected because browser tests require Chromium installation, active PostgreSQL database services, and UI execution overhead, which would degrade the rapid feedback cycle of local unit test development.
+
 ---
 
 ## Known Limitations
@@ -263,9 +307,10 @@
 - **Scans List Pagination:** The scans list displays the latest 20 scans only; pagination for older scan history is not yet implemented.
 - **15-Minute Polling Cap from `created_at`:** The polling cap calculates elapsed time from scan `created_at`. Scans that spend extended time queued before worker claim will stop auto-polling earlier in their active execution, requiring manual Refresh.
 - **UTC Label Without Conversion:** Timestamps are printed with a literal "UTC" suffix but are not explicitly converted to UTC first; they are only correct while the database session time zone is UTC.
-- **Untested 401 Retry Swap Path:** The preserved `hx-swap` on 401 token refresh has been verified in code and unit logic, but has not yet been exercised via an end-to-end browser test.
 - **Viewer Email Exposure in JSON API:** The JSON API (`DomainRead`, `alert-notifications`) still returns `alert_emails`, `recipient`, and `last_error` to viewers (in `IDEAS.md`).
-- **Untested JS Save Flows and Email Chips:** The schedule/alerts save flows and email chips run in browser JS with no browser test yet (v3.4d).
+- **Chromium Only:** Browser test suite currently runs exclusively against Chromium; cross-browser execution across Firefox and WebKit is not configured.
+- **Real 3s Polling Interval in Browser Tests:** The polling test exercises the live 3-second auto-refresh interval; fast-forwarding or timer mocking is not used.
+- **Sequential DB Execution Required:** Browser tests commit data and truncate tables, so they must not run in parallel with other DB tests on the same database.
 
 ---
 
@@ -275,8 +320,10 @@
 - v3.4b: tests passed 412 -> 430 (2 deselected in both runs; owner-verified).
 - v3.4b: 141 tests marked db (pytest -m db --collect-only).
 - v3.4c: tests passed 430 -> 441 (owner-verified).
+- - v3.4d: browser tests 10 passed; default suite 441 passed (owner-verified).
 - v3.3 audit logging added 15 tracked actions, migration 0009, and append-only trigger protection.
 - v3.4a added dashboard shell, Supabase auth, domains list, and DNS TXT verification.
 - v3.4b added scans list, scan detail with 5 stages, Fix first prioritization, and attack surface changes.
 - v3.4c added schedule and alerts configuration, alert history outbox log, and organization audit log UI.
+- v3.4d added 10 Playwright browser tests, ephemeral live server fixture, synthetic auth mocks, and dedicated CI job.
 
