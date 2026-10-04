@@ -219,6 +219,27 @@
 - **Fix:** Patched a dummy `DATABASE_URL` (`postgresql+psycopg://dummy:dummy@127.0.0.1:1/dummy_test`, using port 1 so it can never reach a real local Postgres) within `test_ui_unauthenticated_returns_401` via `unittest.mock.patch.dict(os.environ, ...)`. SQLAlchemy sessions are lazy, and because unauthenticated requests fail fast when extracting the missing Bearer header in `get_current_user`, no database connection is ever attempted. Caches cleared before and after so the dummy URL cannot leak into later tests.
 - **How to prevent it:** Confirm CI from the job log or a screenshot before closing a phase.
 
+### Entry AJ: Landing Page Copy Accuracy, Test Strength, and Mutation Check
+- **What happened:** Code review of the v3.5 landing page caught five copy and test rigor issues before release:
+  1. An invented claim that change detection caught "revoked certificates" when `changes.py` actually detects `certificate problems (expired, untrusted, self-signed, hostname mismatch)`.
+  2. Hero node 02 described as "Dual-stack HTTP" when `prober.py` inspects `HTTP/HTTPS on 80/443`.
+  3. Probing source label cited `headers_inspect.py` instead of `scan_common.py`.
+  4. Heuristic scoring text contained duplicate phrasing ("by host impact").
+  5. The DNS TXT verification example in the Trust card was hard-coded instead of dynamically computed via `get_expected_record_value`.
+  6. Reduced-motion and no-JS tests spawned isolated Playwright browsers without attaching the global fixture listeners and teardown assertions (CSP violations, console errors, page errors, server response codes, and unexpected network egress).
+  7. The initial GSAP browser test asserted opacity on `#hero h1` without verifying that ScrollTrigger instances actually existed for below-fold sections.
+- **Root cause:**
+  - Copy was composed from memory rather than strictly verifying underlying scanner implementation files (`changes.py`, `prober.py`, `verification.py`).
+  - Browser tests for alternative contexts (`reduced_motion="reduce"`, `java_script_enabled=False`) used nested `sync_playwright()` blocks to bypass standard fixtures, inadvertently losing the teardown assertions.
+- **Fix:**
+  - Corrected all copy strings in `src/asm/templates/landing.html`.
+  - Injected `txt_example=get_expected_record_value("<your-token>")` and `txt_label="_asm-verify.example.com"` into `get_landing_page` (`src/asm/api/routes_ui.py`) and rendered it via normal template autoescaping.
+  - Refactored `page` in `tests/browser/conftest.py` into a factory fixture `make_page(**context_kwargs)` that enforces all listeners and teardown assertions uniformly.
+  - Asserted `window.ScrollTrigger.getAll().length > 0` directly on page load in `test_browser_landing_page_loads_and_gsap_runs`.
+  - Added `test_browser_landing_all_sections_reveal_on_scroll` asserting all `ANIMATED` elements transition to opacity 1 when scrolled into view.
+  - Verified with a mutation check: mutating CTA trigger start to `"top -500%"` failed `test_browser_landing_all_sections_reveal_on_scroll` with `TimeoutError: Page.wait_for_function: Timeout 5000ms exceeded`; restoring `landing.js` returned the suite to passing.
+- **How to prevent it:** Quote implementation sources directly for marketing copy; run all browser variations through the central fixture factory with active teardown guards; verify new scroll tests with deliberate mutation checks.
+
 ---
 
 ## Architectural Decisions
@@ -303,6 +324,10 @@
 - **Decision:** Mark all browser tests with `@pytest.mark.browser`, deselect them by default locally in `pyproject.toml` (`-m 'not integration and not browser'`), and execute them in a dedicated CI job (`browser-test`) in `.github/workflows/ci.yml`.
 - **Rejected alternatives:** Running browser tests as part of the default `pytest` invocation. Rejected because browser tests require Chromium installation, active PostgreSQL database services, and UI execution overhead, which would degrade the rapid feedback cycle of local unit test development.
 
+### 21. Landing Served by Same FastAPI App at /, CSS 3D + GSAP Now, Three.js Hero Deferred
+- **Decision:** Serve the public marketing landing page directly from the existing FastAPI web application at `/` using Jinja2 templates (`landing.html`), vanilla CSS 3D chassis (`landing.css`), and vendored GSAP 3.15.0 entrance animations (`landing.js`), keeping the dashboard authenticated application shell at `/app`.
+- **Rejected alternatives:** Separate marketing static site/Next.js app, or complex Three.js canvas in the initial release. Rejected because a separate web app adds architectural divergence and operational deployment overhead, while a Three.js canvas adds substantial bundle weight and WebGL complexity before baseline product and conversion messaging are established.
+
 ---
 
 ## Known Limitations
@@ -326,10 +351,12 @@
 - v3.4b: tests passed 412 -> 430 (2 deselected in both runs; owner-verified).
 - v3.4b: 141 tests marked db (pytest -m db --collect-only).
 - v3.4c: tests passed 430 -> 441 (owner-verified).
-- - v3.4d: browser tests 10 passed; default suite 441 passed (owner-verified).
+- v3.4d: browser tests 10 passed; default suite 441 passed (owner-verified).
+- v3.5: browser tests 10 -> 15 passed; default suite 441 -> 443 passed.
 - v3.3 audit logging added 15 tracked actions, migration 0009, and append-only trigger protection.
 - v3.4a added dashboard shell, Supabase auth, domains list, and DNS TXT verification.
 - v3.4b added scans list, scan detail with 5 stages, Fix first prioritization, and attack surface changes.
 - v3.4c added schedule and alerts configuration, alert history outbox log, and organization audit log UI.
 - v3.4d added 10 Playwright browser tests, ephemeral live server fixture, synthetic auth mocks, and dedicated CI job.
+- v3.5 added static public landing page at `/`, vendored GSAP 3.15.0 with ScrollTrigger, CSS 3D chassis, and 5 landing browser tests.
 

@@ -34,6 +34,81 @@ from asm.db.session import get_engine
 from asm.verification import queue_domain_alert
 
 
+def test_landing_page_serves_html_and_security_headers():
+    """GET / serves landing HTML with full CSP matching /app, without auth."""
+    with patch.dict(
+        os.environ,
+        {
+            "SUPABASE_URL": "https://testproj.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "anon_key_test_12345",
+        },
+    ):
+        reset_auth_dependencies()
+        with TestClient(app) as client:
+            resp = client.get("/")
+            assert resp.status_code == 200
+            assert "text/html" in resp.headers["content-type"]
+            assert "Content-Security-Policy" in resp.headers
+            assert resp.headers["X-Content-Type-Options"] == "nosniff"
+            assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+            # Compare CSP with /app
+            resp_app = client.get("/app")
+            assert (
+                resp.headers["Content-Security-Policy"]
+                == resp_app.headers["Content-Security-Policy"]
+            )
+
+
+def test_landing_page_content_invariants():
+    """GET / contains required copy, links /app and GitHub, and has no banned patterns."""
+    with patch.dict(
+        os.environ,
+        {
+            "SUPABASE_URL": "https://testproj.supabase.co",
+            "SUPABASE_PUBLISHABLE_KEY": "anon_key_test_12345",
+        },
+    ):
+        reset_auth_dependencies()
+        with TestClient(app) as client:
+            resp = client.get("/")
+            assert resp.status_code == 200
+            html = resp.text
+
+            # Links /app and GitHub
+            assert 'href="/app"' in html
+            assert "https://github.com/vigneshs-17/asm-saas" in html
+
+            # Mandatory copy checks
+            assert (
+                "Active scans run only on domains you have verified with a DNS TXT record at"
+                in html
+            )
+            assert "_asm-verify.&lt;domain&gt;" in html or "_asm-verify.<domain>" in html
+            assert "A time-limited operator override exists for exceptional cases." in html
+            audit_text = (
+                "Append-only audit log: a database trigger blocks updates, deletes and truncates "
+                "from the application."
+            )
+            assert audit_text in html
+
+            # Assert dynamic verification TXT example rendered
+            from html import escape
+
+            from asm.verification import get_expected_record_value
+
+            expected_txt = escape(get_expected_record_value("<your-token>"))
+            assert expected_txt in html
+
+            # Banned copy checks
+            assert "tamper" not in html.lower()
+            assert "v3.5" not in html
+            assert 'rel="canonical"' not in html
+            assert "revoked" not in html.lower()
+            assert "dual-stack" not in html.lower()
+            assert "clean umd" not in html.lower()
+
+
 def test_app_shell_serves_html_and_no_inline_scripts():
     """GET /app serves HTML with data- attributes, no inline scripts, and no inline styles."""
     with patch.dict(
@@ -138,10 +213,26 @@ def test_static_files_served_correctly():
         assert resp_supa.status_code == 200
         assert len(resp_supa.content) > 10000
 
+        # GSAP
+        resp_gsap = client.get("/static/vendor/gsap.min.js")
+        assert resp_gsap.status_code == 200
+        assert len(resp_gsap.content) > 10000
+
+        # ScrollTrigger
+        resp_st = client.get("/static/vendor/ScrollTrigger.min.js")
+        assert resp_st.status_code == 200
+        assert len(resp_st.content) > 10000
+
         # Stylesheet (verifies palette concept comment exists)
         resp_css = client.get("/static/css/app.css")
         assert resp_css.status_code == 200
         assert "A crisp radar-inspired visual hierarchy" in resp_css.text
+
+        # Landing CSS & JS
+        resp_landing_css = client.get("/static/css/landing.css")
+        assert resp_landing_css.status_code == 200
+        resp_landing_js = client.get("/static/js/landing.js")
+        assert resp_landing_js.status_code == 200
 
         # IBM Plex Fonts
         resp_font = client.get("/static/fonts/IBMPlexSans-Regular.woff2")
@@ -150,12 +241,13 @@ def test_static_files_served_correctly():
 
 
 def test_app_js_contains_no_inner_html():
-    """Static client script app.js must never contain the word innerHTML."""
+    """Static client scripts app.js and landing.js must never contain the word innerHTML."""
     root = Path(__file__).resolve().parent.parent
-    app_js_path = root / "src" / "asm" / "static" / "js" / "app.js"
-    assert app_js_path.is_file(), "src/asm/static/js/app.js missing!"
-    content = app_js_path.read_text(encoding="utf-8")
-    assert "innerHTML" not in content, "Found forbidden property 'innerHTML' in app.js"
+    for script_name in ["app.js", "landing.js"]:
+        script_path = root / "src" / "asm" / "static" / "js" / script_name
+        assert script_path.is_file(), f"{script_path} missing!"
+        content = script_path.read_text(encoding="utf-8")
+        assert "innerHTML" not in content, f"Found forbidden property 'innerHTML' in {script_name}"
 
 
 def test_templates_package_data_exists():
@@ -165,12 +257,17 @@ def test_templates_package_data_exists():
     """
     expected_files = [
         ("templates", "app.html"),
+        ("templates", "landing.html"),
         ("templates", "partials", "scans_list.html"),
         ("templates", "partials", "scan_detail.html"),
         ("static", "js", "app.js"),
+        ("static", "js", "landing.js"),
         ("static", "vendor", "htmx.min.js"),
         ("static", "vendor", "supabase.min.js"),
+        ("static", "vendor", "gsap.min.js"),
+        ("static", "vendor", "ScrollTrigger.min.js"),
         ("static", "css", "app.css"),
+        ("static", "css", "landing.css"),
         ("static", "fonts", "IBMPlexSans-Regular.woff2"),
         ("static", "fonts", "IBMPlexSans-SemiBold.woff2"),
         ("static", "fonts", "IBMPlexMono-Regular.woff2"),
@@ -251,12 +348,14 @@ def test_templates_form_fields_have_labels():
             elif tag in ("input", "select", "textarea"):
                 if tag == "input" and attr_dict.get("type", "").lower() == "hidden":
                     return
-                self.fields.append({
-                    "tag": tag,
-                    "attrs": attr_dict,
-                    "wrapped": self.label_depth > 0,
-                    "line": self.getpos()[0],
-                })
+                self.fields.append(
+                    {
+                        "tag": tag,
+                        "attrs": attr_dict,
+                        "wrapped": self.label_depth > 0,
+                        "line": self.getpos()[0],
+                    }
+                )
 
         def handle_endtag(self, tag):
             if tag == "label" and self.label_depth > 0:
@@ -331,9 +430,7 @@ def test_ui_unauthenticated_returns_401():
 
 
 @pytest.mark.db
-def test_ui_cache_control_no_store(
-    client: TestClient, db_session: Session, test_org: Organization
-):
+def test_ui_cache_control_no_store(client: TestClient, db_session: Session, test_org: Organization):
     """Every /ui/* HTML fragment response must include Cache-Control: no-store."""
     resp = client.get(f"/ui/orgs/{test_org.id}/domains")
     assert resp.status_code == 200
@@ -341,9 +438,7 @@ def test_ui_cache_control_no_store(
 
 
 @pytest.mark.db
-def test_viewer_vs_admin_rendering(
-    client: TestClient, db_session: Session, test_org: Organization
-):
+def test_viewer_vs_admin_rendering(client: TestClient, db_session: Session, test_org: Organization):
     """Viewers do not see write forms or action buttons; admins see full controls."""
     # Create test domain
     domain = Domain(
@@ -381,9 +476,7 @@ def test_viewer_vs_admin_rendering(
 
     # Downgrade or create membership as viewer
     membership = (
-        db_session.query(Membership)
-        .filter_by(org_id=test_org.id, user_id=viewer_user_id)
-        .first()
+        db_session.query(Membership).filter_by(org_id=test_org.id, user_id=viewer_user_id).first()
     )
     if not membership:
         membership = Membership(org_id=test_org.id, user_id=viewer_user_id, role="viewer")
@@ -617,7 +710,7 @@ def test_scans_list_viewer_vs_admin_and_verification_status(
         assert resp_viewer.status_code == 200
         assert 'id="btn-run-scan"' not in resp_viewer.text
         # But table and view scan buttons are visible
-        assert 'btn-view-scan' in resp_viewer.text
+        assert "btn-view-scan" in resp_viewer.text
     finally:
         app.dependency_overrides.pop(get_current_user, None)
 
@@ -1100,9 +1193,7 @@ def test_ui_cross_tenant_and_role_access_v34c(
     db_session.flush()
 
     # 1. Cross-tenant alert notifications: requesting domain_a under org_b -> 404
-    resp_ct_alerts = client.get(
-        f"/ui/orgs/{org_b.id}/domains/{domain_a.id}/alert-notifications"
-    )
+    resp_ct_alerts = client.get(f"/ui/orgs/{org_b.id}/domains/{domain_a.id}/alert-notifications")
     assert resp_ct_alerts.status_code == 404
 
     # 2. Cross-tenant audit log: non-member requesting org_b audit events -> 404
@@ -1118,9 +1209,7 @@ def test_ui_cross_tenant_and_role_access_v34c(
         db_session.flush()
 
     membership = (
-        db_session.query(Membership)
-        .filter_by(org_id=test_org.id, user_id=viewer_user_id)
-        .first()
+        db_session.query(Membership).filter_by(org_id=test_org.id, user_id=viewer_user_id).first()
     )
     if not membership:
         membership = Membership(org_id=test_org.id, user_id=viewer_user_id, role="viewer")
@@ -1198,8 +1287,7 @@ def test_ui_schedule_and_alerts_domain_detail_rendering(
     assert '<option value="168" disabled>Every 7 days</option>' in resp_unv.text
     assert '<option value="720" disabled>Every 30 days</option>' in resp_unv.text
     assert (
-        "Domain ownership verification required before scheduling automated scans."
-        in resp_unv.text
+        "Domain ownership verification required before scheduling automated scans." in resp_unv.text
     )
     assert "Domain ownership verification required before enabling alerts." in resp_unv.text
     assert '<span class="status-badge status-skipped">Alerts: disabled</span>' in resp_unv.text
@@ -1274,9 +1362,7 @@ def test_ui_viewer_privacy_no_email_strings_anywhere(
         db_session.flush()
 
     membership = (
-        db_session.query(Membership)
-        .filter_by(org_id=test_org.id, user_id=viewer_user_id)
-        .first()
+        db_session.query(Membership).filter_by(org_id=test_org.id, user_id=viewer_user_id).first()
     )
     if not membership:
         membership = Membership(org_id=test_org.id, user_id=viewer_user_id, role="viewer")
@@ -1409,9 +1495,7 @@ def test_ui_audit_parity_json_vs_ui(
 
 
 @pytest.mark.db
-def test_ui_audit_paging_55_events(
-    client: TestClient, db_session: Session
-):
+def test_ui_audit_paging_55_events(client: TestClient, db_session: Session):
     """Paging 55 events: page 1 has 50 rows + 'Older events'; page 2 has 5 rows (no older)."""
     paging_org = Organization(name="Audit Paging Org")
     db_session.add(paging_org)
@@ -1528,9 +1612,7 @@ def test_ui_alert_notifications_param_swap_404(
     db_session.add(domain_b)
     db_session.flush()
 
-    resp = client.get(
-        f"/ui/orgs/{test_org.id}/domains/{domain_b.id}/alert-notifications"
-    )
+    resp = client.get(f"/ui/orgs/{test_org.id}/domains/{domain_b.id}/alert-notifications")
     assert resp.status_code == 404
 
 
@@ -1565,9 +1647,7 @@ def test_ui_alert_notifications_paging_55_rows(
     db_session.flush()
 
     # offset=0: 50 body <details> elements, a "Next" button with data-offset="50", no "Previous"
-    resp0 = client.get(
-        f"/ui/orgs/{test_org.id}/domains/{domain.id}/alert-notifications?offset=0"
-    )
+    resp0 = client.get(f"/ui/orgs/{test_org.id}/domains/{domain.id}/alert-notifications?offset=0")
     assert resp0.status_code == 200
     assert resp0.text.count('<details class="alert-body-details">') == 50
     assert 'data-offset="50"' in resp0.text
@@ -1575,12 +1655,9 @@ def test_ui_alert_notifications_paging_55_rows(
     assert "Previous" not in resp0.text
 
     # offset=50: 5 rows, a "Previous" button with data-offset="0", no "Next"
-    resp50 = client.get(
-        f"/ui/orgs/{test_org.id}/domains/{domain.id}/alert-notifications?offset=50"
-    )
+    resp50 = client.get(f"/ui/orgs/{test_org.id}/domains/{domain.id}/alert-notifications?offset=50")
     assert resp50.status_code == 200
     assert resp50.text.count('<details class="alert-body-details">') == 5
     assert 'data-offset="0"' in resp50.text
     assert "Previous" in resp50.text
     assert "Next" not in resp50.text
-

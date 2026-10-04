@@ -38,6 +38,7 @@ from asm.ui_views import (
     format_change_summary,
     format_duration,
 )
+from asm.verification import get_expected_record_value
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,24 @@ def apply_security_headers(
     response.headers["Referrer-Policy"] = "no-referrer"
     if is_fragment:
         response.headers["Cache-Control"] = "no-store"
+
+
+@ui_router.get(
+    "/",
+    response_class=HTMLResponse,
+    summary="Public Landing Page",
+)
+def get_landing_page(
+    response: Response,
+    auth_settings: Annotated[AuthSettings, Depends(get_current_auth_settings)],
+) -> str:
+    """Serve the public landing page with strict CSP and security headers."""
+    apply_security_headers(response, auth_settings, is_fragment=False)
+    template = templates_env.get_template("landing.html")
+    return template.render(
+        txt_example=get_expected_record_value("<your-token>"),
+        txt_label="_asm-verify.example.com",
+    )
 
 
 @ui_router.get(
@@ -267,9 +286,7 @@ def get_org_scan_detail_ui(
     scan_changes = list(db.scalars(changes_stmt).all())
 
     stages_stmt = (
-        select(ScanStage)
-        .where(ScanStage.scan_run_id == scan_run.id)
-        .order_by(ScanStage.id.asc())
+        select(ScanStage).where(ScanStage.scan_run_id == scan_run.id).order_by(ScanStage.id.asc())
     )
     stages = list(db.scalars(stages_stmt).all())
     stage_map = {s.stage: s for s in stages}
@@ -278,21 +295,25 @@ def get_org_scan_detail_ui(
         st_obj = stage_map.get(st_name)
         if st_obj:
             dur_str = f"{st_obj.duration_ms}ms" if st_obj.duration_ms is not None else "--"
-            pipeline_stages.append({
-                "name": st_name,
-                "status": st_obj.status,
-                "status_display": st_obj.status.capitalize(),
-                "duration": dur_str,
-                "error": st_obj.error,
-            })
+            pipeline_stages.append(
+                {
+                    "name": st_name,
+                    "status": st_obj.status,
+                    "status_display": st_obj.status.capitalize(),
+                    "duration": dur_str,
+                    "error": st_obj.error,
+                }
+            )
         else:
-            pipeline_stages.append({
-                "name": st_name,
-                "status": "pending",
-                "status_display": "Pending",
-                "duration": "--",
-                "error": None,
-            })
+            pipeline_stages.append(
+                {
+                    "name": st_name,
+                    "status": "pending",
+                    "status_display": "Pending",
+                    "duration": "--",
+                    "error": None,
+                }
+            )
 
     should_poll, is_stale_active = check_polling_status(
         scan_run.status,
@@ -412,17 +433,17 @@ def get_org_audit_events_ui(
             ensure_ascii=False,
         )
 
-        events_data.append({
-            "event": event,
-            "actor_display": actor_display,
-            "target_display": f"{event.target_type}:{event.target_id}",
-            "metadata_json": meta_json,
-        })
+        events_data.append(
+            {
+                "event": event,
+                "actor_display": actor_display,
+                "target_display": f"{event.target_type}:{event.target_id}",
+                "metadata_json": meta_json,
+            }
+        )
 
     org_domains = list(
-        db.scalars(
-            select(Domain).where(Domain.org_id == org_id).order_by(Domain.name.asc())
-        ).all()
+        db.scalars(select(Domain).where(Domain.org_id == org_id).order_by(Domain.name.asc())).all()
     )
     sorted_actions = sorted(AUDIT_ACTIONS)
     oldest_id = events_data[-1]["event"].id if len(events_data) == limit else None
@@ -440,4 +461,3 @@ def get_org_audit_events_ui(
         oldest_id=oldest_id,
         limit=limit,
     )
-

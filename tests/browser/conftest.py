@@ -20,7 +20,8 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from typing import Annotated, Any
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 @pytest.fixture(autouse=True)
 def forbid_real_dns():
     """Autouse fixture ensuring no real DNS lookups are attempted during browser tests."""
+
     def _fail_dns(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("real DNS lookup attempted in a browser test")
 
@@ -84,6 +86,7 @@ def auth_events() -> list[dict[str, str]]:
 @pytest.fixture
 def override_db_and_auth(browser_session_factory, clean_db):
     """Override get_db and get_current_user for the live server during tests."""
+
     def _override_get_db() -> Generator[Session, None, None]:
         with browser_session_factory() as session:
             yield session
@@ -153,249 +156,271 @@ def live_server(override_db_and_auth) -> Generator[str, None, None]:
 
 
 @pytest.fixture
-def page(
+def make_page(
     live_server: str,
     browser_session_factory,
     auth_events: list[dict[str, str]],
     request: pytest.FixtureRequest,
-) -> Generator[Page, None, None]:
-    """Launch Chromium, start tracing, intercept routes, and assert clean execution on teardown."""
+) -> Generator[Callable[..., Generator[Page, None, None]], None, None]:
+    """Factory fixture returning a context manager that creates a Page with standard guards."""
     headed = os.getenv("BROWSER_HEADED", "0") == "1"
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not headed)
-        context: BrowserContext = browser.new_context()
+    @contextmanager
+    def _factory(**context_kwargs: Any) -> Generator[Page, None, None]:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=not headed)
+            context: BrowserContext = browser.new_context(**context_kwargs)
 
-        output_dir = os.path.join("output", "playwright")
-        os.makedirs(output_dir, exist_ok=True)
-        context.tracing.start(screenshots=True, snapshots=True, sources=True)
+            output_dir = os.path.join("output", "playwright")
+            os.makedirs(output_dir, exist_ok=True)
+            context.tracing.start(screenshots=True, snapshots=True, sources=True)
 
-        page_instance = context.new_page()
+            page_instance = context.new_page()
 
-        # Capture CSP violations in window.__cspViolations
-        page_instance.add_init_script(
-            """
-            window.__cspViolations = [];
-            document.addEventListener('securitypolicyviolation', function(e) {
-                window.__cspViolations.push({
-                    blockedURI: e.blockedURI,
-                    violatedDirective: e.violatedDirective,
-                    originalPolicy: e.originalPolicy
+            # Capture CSP violations in window.__cspViolations
+            page_instance.add_init_script(
+                """
+                window.__cspViolations = [];
+                document.addEventListener('securitypolicyviolation', function(e) {
+                    window.__cspViolations.push({
+                        blockedURI: e.blockedURI,
+                        violatedDirective: e.violatedDirective,
+                        originalPolicy: e.originalPolicy
+                    });
                 });
-            });
-            """
-        )
+                """
+            )
 
-        console_errors: list[str] = []
-        page_errors: list[str] = []
-        unexpected_responses: list[str] = []
+            console_errors: list[str] = []
+            page_errors: list[str] = []
+            unexpected_responses: list[str] = []
 
-        def _on_console(msg):
-            if msg.type == "error":
-                text = msg.text
-                if "favicon.ico" in text:
-                    return
-                # Only ignore status of 401 / 422 messages (plus HTMX response error codes)
-                if (
-                    "status of 401" in text
-                    or "status of 422" in text
-                    or "Response Status Error Code 401" in text
-                    or "Response Status Error Code 422" in text
-                ):
-                    return
-                console_errors.append(text)
-
-        def _on_page_error(exc):
-            page_errors.append(str(exc))
-
-        def _on_response(resp):
-            url = resp.url
-            if url.startswith(live_server):
-                status_code = resp.status
-                path = urlparse(url).path
-                if status_code >= 500:
-                    unexpected_responses.append(f"HTTP {status_code} from {url}")
-                elif status_code == 404 and not path.endswith("favicon.ico"):
-                    unexpected_responses.append(f"HTTP 404 from {url}")
-
-        page_instance.on("console", _on_console)
-        page_instance.on("pageerror", _on_page_error)
-        page_instance.on("response", _on_response)
-
-        aborted_requests: list[str] = []
-        unexpected_auth_calls: list[str] = []
-
-        def _route_handler(route: Route):
-            req = route.request
-            url = req.url
-
-            # 1. Supabase auth mock
-            if url.startswith("https://auth.test-asm.local/"):
-                if "token?grant_type=password" in url:
-                    try:
-                        post_data = req.post_data_json or {}
-                    except Exception:
-                        post_data = {}
-                    email = (post_data.get("email") or "").strip().lower()
-
-                    with browser_session_factory() as session:
-                        user = session.query(User).filter(User.email == email).first()
-
-                    if not user:
-                        route.fulfill(
-                            status=400,
-                            content_type="application/json",
-                            body=json.dumps(
-                                {"error": "invalid_grant", "error_description": "User not found"}
-                            ),
-                        )
+            def _on_console(msg):
+                if msg.type == "error":
+                    text = msg.text
+                    if "favicon.ico" in text:
                         return
+                    # Only ignore status of 401 / 422 messages (plus HTMX response error codes)
+                    if (
+                        "status of 401" in text
+                        or "status of 422" in text
+                        or "Response Status Error Code 401" in text
+                        or "Response Status Error Code 422" in text
+                    ):
+                        return
+                    console_errors.append(text)
 
-                    fake_token = make_fake_jwt(user)
-                    refresh_tok = f"ref_{fake_token}"
-                    REFRESH_REGISTRY[refresh_tok] = user.id
-                    user_sub = str(user.id)
-                    route.fulfill(
-                        status=200,
-                        content_type="application/json",
-                        body=json.dumps(
-                            {
-                                "access_token": fake_token,
-                                "token_type": "bearer",
-                                "expires_in": 3600,
-                                "refresh_token": refresh_tok,
-                                "user": {
-                                    "id": user_sub,
-                                    "email": user.email,
-                                    "aud": "authenticated",
-                                    "role": "authenticated",
-                                },
-                            }
-                        ),
-                    )
-                    return
+            def _on_page_error(exc):
+                page_errors.append(str(exc))
 
-                if "token?grant_type=refresh_token" in url:
-                    try:
-                        post_data = req.post_data_json or {}
-                    except Exception:
-                        post_data = {}
-                    old_refresh = (post_data.get("refresh_token") or "").strip()
-                    user_id = REFRESH_REGISTRY.get(old_refresh)
+            def _on_response(resp):
+                url = resp.url
+                if url.startswith(live_server):
+                    status_code = resp.status
+                    path = urlparse(url).path
+                    if status_code >= 500:
+                        unexpected_responses.append(f"HTTP {status_code} from {url}")
+                    elif status_code == 404 and not path.endswith("favicon.ico"):
+                        unexpected_responses.append(f"HTTP 404 from {url}")
 
-                    if not user_id:
+            page_instance.on("console", _on_console)
+            page_instance.on("pageerror", _on_page_error)
+            page_instance.on("response", _on_response)
+
+            aborted_requests: list[str] = []
+            unexpected_auth_calls: list[str] = []
+
+            def _route_handler(route: Route):
+                req = route.request
+                url = req.url
+
+                # 1. Supabase auth mock
+                if url.startswith("https://auth.test-asm.local/"):
+                    if "token?grant_type=password" in url:
+                        try:
+                            post_data = req.post_data_json or {}
+                        except Exception:
+                            post_data = {}
+                        email = (post_data.get("email") or "").strip().lower()
+
+                        with browser_session_factory() as session:
+                            user = session.query(User).filter(User.email == email).first()
+
+                        if not user:
+                            route.fulfill(
+                                status=400,
+                                content_type="application/json",
+                                body=json.dumps(
+                                    {
+                                        "error": "invalid_grant",
+                                        "error_description": "User not found",
+                                    }
+                                ),
+                            )
+                            return
+
+                        fake_token = make_fake_jwt(user)
+                        refresh_tok = f"ref_{fake_token}"
+                        REFRESH_REGISTRY[refresh_tok] = user.id
+                        user_sub = str(user.id)
                         route.fulfill(
-                            status=400,
+                            status=200,
                             content_type="application/json",
                             body=json.dumps(
                                 {
-                                    "error": "invalid_grant",
-                                    "error_description": "Unknown refresh token",
+                                    "access_token": fake_token,
+                                    "token_type": "bearer",
+                                    "expires_in": 3600,
+                                    "refresh_token": refresh_tok,
+                                    "user": {
+                                        "id": user_sub,
+                                        "email": user.email,
+                                        "aud": "authenticated",
+                                        "role": "authenticated",
+                                    },
                                 }
                             ),
                         )
                         return
 
-                    with browser_session_factory() as session:
-                        user = session.get(User, user_id)
+                    if "token?grant_type=refresh_token" in url:
+                        try:
+                            post_data = req.post_data_json or {}
+                        except Exception:
+                            post_data = {}
+                        old_refresh = (post_data.get("refresh_token") or "").strip()
+                        user_id = REFRESH_REGISTRY.get(old_refresh)
 
-                    if not user:
+                        if not user_id:
+                            route.fulfill(
+                                status=400,
+                                content_type="application/json",
+                                body=json.dumps(
+                                    {
+                                        "error": "invalid_grant",
+                                        "error_description": "Unknown refresh token",
+                                    }
+                                ),
+                            )
+                            return
+
+                        with browser_session_factory() as session:
+                            user = session.get(User, user_id)
+
+                        if not user:
+                            route.fulfill(
+                                status=400,
+                                content_type="application/json",
+                                body=json.dumps(
+                                    {
+                                        "error": "invalid_grant",
+                                        "error_description": "User not found",
+                                    }
+                                ),
+                            )
+                            return
+
+                        new_access = make_fake_jwt(user)
+                        new_refresh = f"ref_{new_access}"
+                        REFRESH_REGISTRY[new_refresh] = user.id
+                        auth_events.append({"old_refresh": old_refresh, "new_access": new_access})
+
                         route.fulfill(
-                            status=400,
+                            status=200,
                             content_type="application/json",
                             body=json.dumps(
-                                {"error": "invalid_grant", "error_description": "User not found"}
+                                {
+                                    "access_token": new_access,
+                                    "token_type": "bearer",
+                                    "expires_in": 3600,
+                                    "refresh_token": new_refresh,
+                                    "user": {
+                                        "id": str(user.id),
+                                        "email": user.email,
+                                        "aud": "authenticated",
+                                        "role": "authenticated",
+                                    },
+                                }
                             ),
                         )
                         return
 
-                    new_access = make_fake_jwt(user)
-                    new_refresh = f"ref_{new_access}"
-                    REFRESH_REGISTRY[new_refresh] = user.id
-                    auth_events.append({"old_refresh": old_refresh, "new_access": new_access})
-
+                    unexpected_auth_calls.append(f"{req.method} {url}")
                     route.fulfill(
-                        status=200,
+                        status=500,
                         content_type="application/json",
-                        body=json.dumps(
-                            {
-                                "access_token": new_access,
-                                "token_type": "bearer",
-                                "expires_in": 3600,
-                                "refresh_token": new_refresh,
-                                "user": {
-                                    "id": str(user.id),
-                                    "email": user.email,
-                                    "aud": "authenticated",
-                                    "role": "authenticated",
-                                },
-                            }
-                        ),
+                        body=json.dumps({"error": "unexpected_auth_call", "url": url}),
                     )
                     return
 
-                unexpected_auth_calls.append(f"{req.method} {url}")
-                route.fulfill(
-                    status=500,
-                    content_type="application/json",
-                    body=json.dumps({"error": "unexpected_auth_call", "url": url}),
+                # 2. Local app server requests
+                if url.startswith(live_server):
+                    route.continue_()
+                    return
+
+                # 3. Disallowed external network egress
+                aborted_requests.append(url)
+                route.abort()
+
+            page_instance.route("**", _route_handler)
+
+            try:
+                yield page_instance
+            finally:
+                # Failure artifacts (screenshots and trace)
+                test_failed = hasattr(request.node, "rep_call") and request.node.rep_call.failed
+                test_name = request.node.name
+                if test_failed:
+                    screenshot_path = os.path.join(output_dir, f"{test_name}.png")
+                    trace_path = os.path.join(output_dir, f"{test_name}_trace.zip")
+                    try:
+                        page_instance.screenshot(path=screenshot_path)
+                    except Exception as e:
+                        logger.warning("Failed to capture failure screenshot: %s", e)
+                    try:
+                        context.tracing.stop(path=trace_path)
+                    except Exception as e:
+                        logger.warning("Failed to save trace: %s", e)
+                else:
+                    try:
+                        context.tracing.stop()
+                    except Exception:
+                        pass
+
+                # Collect CSP violations from page context
+                csp_violations = []
+                try:
+                    csp_violations = page_instance.evaluate("window.__cspViolations || []")
+                except Exception:
+                    pass
+
+                context.close()
+                browser.close()
+
+                # Teardown assertions
+                assert len(csp_violations) == 0, f"CSP violations detected: {csp_violations}"
+                assert len(console_errors) == 0, f"Console errors detected: {console_errors}"
+                assert len(page_errors) == 0, f"Page errors detected: {page_errors}"
+                assert len(unexpected_responses) == 0, (
+                    f"Unexpected server responses detected: {unexpected_responses}"
                 )
-                return
+                assert len(unexpected_auth_calls) == 0, (
+                    f"Unexpected auth calls: {unexpected_auth_calls}"
+                )
+                assert len(aborted_requests) == 0, (
+                    f"External requests attempted and aborted: {aborted_requests}"
+                )
 
-            # 2. Local app server requests
-            if url.startswith(live_server):
-                route.continue_()
-                return
+    yield _factory
 
-            # 3. Disallowed external network egress
-            aborted_requests.append(url)
-            route.abort()
 
-        page_instance.route("**", _route_handler)
-
-        yield page_instance
-
-        # Failure artifacts (screenshots and trace)
-        test_failed = hasattr(request.node, "rep_call") and request.node.rep_call.failed
-        test_name = request.node.name
-        if test_failed:
-            screenshot_path = os.path.join(output_dir, f"{test_name}.png")
-            trace_path = os.path.join(output_dir, f"{test_name}_trace.zip")
-            try:
-                page_instance.screenshot(path=screenshot_path)
-            except Exception as e:
-                logger.warning("Failed to capture failure screenshot: %s", e)
-            try:
-                context.tracing.stop(path=trace_path)
-            except Exception as e:
-                logger.warning("Failed to save trace: %s", e)
-        else:
-            try:
-                context.tracing.stop()
-            except Exception:
-                pass
-
-        # Collect CSP violations from page context
-        csp_violations = []
-        try:
-            csp_violations = page_instance.evaluate("window.__cspViolations || []")
-        except Exception:
-            pass
-
-        context.close()
-        browser.close()
-
-        # Teardown assertions
-        assert len(csp_violations) == 0, f"CSP violations detected: {csp_violations}"
-        assert len(console_errors) == 0, f"Console errors detected: {console_errors}"
-        assert len(page_errors) == 0, f"Page errors detected: {page_errors}"
-        assert (
-            len(unexpected_responses) == 0
-        ), f"Unexpected server responses detected: {unexpected_responses}"
-        assert len(unexpected_auth_calls) == 0, f"Unexpected auth calls: {unexpected_auth_calls}"
-        assert len(aborted_requests) == 0, (
-            f"External requests attempted and aborted: {aborted_requests}"
-        )
+@pytest.fixture
+def page(
+    make_page: Callable[..., Generator[Page, None, None]],
+) -> Generator[Page, None, None]:
+    """Default Page fixture using make_page() without arguments."""
+    with make_page() as p:
+        yield p
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)

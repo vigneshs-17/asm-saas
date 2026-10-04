@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASM SaaS — External Attack Surface Management</title>
+  <meta name="description" content="Defensible external attack surface management. Continuous passive discovery, active probing, port scanning, and risk triage for verified infrastructure.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ASM SaaS — Attack Surface Management">
+  <meta property="og:description" content="Defensible attack surface reconnaissance for verified domains.">
+  <meta property="og:site_name" content="ASM SaaS">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="ASM SaaS">
+  <meta name="twitter:description" content="Defensible external attack surface reconnaissance.">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <link rel="stylesheet" href="/static/css/landing.css">
+  <script src="/static/vendor/gsap.min.js" defer></script>
+  <script src="/static/vendor/ScrollTrigger.min.js" defer></script>
+  <script src="/static/js/landing.js" defer></script>
+</head>
+<body class="landing-body">
+  <header class="landing-header">
+    <div class="landing-header-inner">
+      <a href="/" class="brand-title">
+        <span class="brand-badge">ASM</span>
+        <span>ASM SaaS</span>
+      </a>
+      <nav class="landing-nav" aria-label="Main navigation">
+        <a href="#how-it-works" class="landing-nav-link">How it works</a>
+        <a href="#features" class="landing-nav-link">Features</a>
+        <a href="#trust" class="landing-nav-link">Trust &amp; safety</a>
+        <a href="/app" class="btn btn-secondary btn-sm landing-signin-btn">Sign in</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="landing-main">
+    <!-- Hero Section -->
+    <section id="hero" class="landing-section hero-section">
+      <div class="landing-container hero-container">
+        <div class="hero-copy">
+          <h1 class="hero-title">Defensible external attack surface reconnaissance.</h1>
+          <p class="hero-subhead">Continuous subdomain discovery, active probing, port scanning, and risk triage for verified infrastructure.</p>
+          <div class="hero-actions">
+            <a href="/app" class="btn btn-primary hero-cta-btn">Sign in to dashboard</a>
+          </div>
+        </div>
+        <div class="hero-chassis" aria-hidden="true">
+          <div class="chassis-plate">
+            <div class="chassis-header">
+              <span class="chassis-dot"></span>
+              <span class="chassis-label">RECON PIPELINE</span>
+            </div>
+            <div class="chassis-nodes">
+              <div class="pipeline-stage-node">
+                <span class="node-idx">01</span>
+                <span class="node-title">Discovery</span>
+                <span class="node-desc">Passive CT logs</span>
+              </div>
+              <div class="pipeline-stage-node">
+                <span class="node-idx">02</span>
+                <span class="node-title">Probing</span>
+                <span class="node-desc">HTTP/HTTPS on 80/443</span>
+              </div>
+              <div class="pipeline-stage-node">
+                <span class="node-idx">03</span>
+                <span class="node-title">Portscan</span>
+                <span class="node-desc">16 default ports</span>
+              </div>
+              <div class="pipeline-stage-node">
+                <span class="node-idx">04</span>
+                <span class="node-title">Inspection</span>
+                <span class="node-desc">TLS &amp; security headers</span>
+              </div>
+              <div class="pipeline-stage-node">
+                <span class="node-idx">05</span>
+                <span class="node-title">Scoring</span>
+                <span class="node-desc">Triage &amp; risk band</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Problem Section -->
+    <section id="problem" class="landing-section problem-section">
+      <div class="landing-container">
+        <div class="section-intro">
+          <p class="section-eyebrow">The visibility gap</p>
+          <h2 class="section-title">Unverified scans produce noise. Blind spots produce breaches.</h2>
+          <p class="section-lead">Organizations accumulate forgotten subdomains, exposed test databases, and deprecated TLS configurations. Scanning without verified ownership creates authorization liabilities, while ad-hoc testing misses newly exposed ports and configuration drift.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- How It Works Section -->
+    <section id="how-it-works" class="landing-section pipeline-section">
+      <div class="landing-container">
+        <div class="section-intro">
+          <p class="section-eyebrow">Architecture</p>
+          <h2 class="section-title">Structured five-stage reconnaissance pipeline</h2>
+        </div>
+        <div class="stages-grid">
+          <article class="stage-step-card">
+            <div class="stage-step-header">
+              <span class="stage-step-num">Stage 1</span>
+              <h3 class="stage-step-title">Passive Subdomain Discovery</h3>
+            </div>
+            <p class="stage-step-text">Queries Certificate Transparency logs and resolves live A (IPv4) and AAAA (IPv6) records without touching target hosts directly.</p>
+            <span class="stage-step-source">discovery.py, resolver.py</span>
+          </article>
+
+          <article class="stage-step-card">
+            <div class="stage-step-header">
+              <span class="stage-step-num">Stage 2</span>
+              <h3 class="stage-step-title">Active Host Probing</h3>
+            </div>
+            <p class="stage-step-text">Validates HTTP/HTTPS availability on ports 80/443 with SSRF defenses blocking private/loopback IP ranges and a 64 KB response streaming cap.</p>
+            <span class="stage-step-source">prober.py, scan_common.py</span>
+          </article>
+
+          <article class="stage-step-card">
+            <div class="stage-step-header">
+              <span class="stage-step-num">Stage 3</span>
+              <h3 class="stage-step-title">Lightweight TCP Port Scanning</h3>
+            </div>
+            <p class="stage-step-text">Connects asynchronously across sixteen default service ports to classify open states and collect non-intrusive service greetings.</p>
+            <span class="stage-step-source">portscan.py</span>
+          </article>
+
+          <article class="stage-step-card">
+            <div class="stage-step-header">
+              <span class="stage-step-num">Stage 4</span>
+              <h3 class="stage-step-title">TLS &amp; Header Inspection</h3>
+            </div>
+            <p class="stage-step-text">Evaluates TLS certificate validity, deprecation, and defensive security headers like HSTS, CSP, and X-Content-Type-Options.</p>
+            <span class="stage-step-source">tls_inspect.py, headers_inspect.py</span>
+          </article>
+
+          <article class="stage-step-card">
+            <div class="stage-step-header">
+              <span class="stage-step-num">Stage 5</span>
+              <h3 class="stage-step-title">Heuristic Risk Scoring</h3>
+            </div>
+            <p class="stage-step-text">Groups findings into severity tiers from Critical to Info, ordering remediation priorities ordered by severity tier, score impact, then host.</p>
+            <span class="stage-step-source">scoring.py</span>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="landing-section features-section">
+      <div class="landing-container">
+        <div class="section-intro">
+          <p class="section-eyebrow">Capabilities</p>
+          <h2 class="section-title">Built for operational security rigor</h2>
+        </div>
+        <div class="features-grid">
+          <div class="feature-item">
+            <h3 class="feature-title">Automated Change Detection</h3>
+            <p class="feature-desc">Differential engine compares consecutive scans to detect new subdomains, newly open ports, and certificate problems (expired, untrusted, self-signed, hostname mismatch).</p>
+          </div>
+          <div class="feature-item">
+            <h3 class="feature-title">Scheduled Cadences</h3>
+            <p class="feature-desc">Configurable automated scan intervals from 6 hours to 720 hours (30 days) with randomized execution jitter to disperse network load.</p>
+          </div>
+          <div class="feature-item">
+            <h3 class="feature-title">Transactional Email Alerts</h3>
+            <p class="feature-desc">Transactional outbox delivery issues notification digests to up to 5 configured recipients upon new risk discoveries.</p>
+          </div>
+          <div class="feature-item">
+            <h3 class="feature-title">Append-Only Audit Log</h3>
+            <p class="feature-desc">Append-only audit log: a database trigger blocks updates, deletes and truncates from the application.</p>
+          </div>
+          <div class="feature-item">
+            <h3 class="feature-title">Multi-Tenant Isolation</h3>
+            <p class="feature-desc">Role-based access control with owner, admin, and viewer ranks, enforced by tenant-scoped database queries and anti-enumeration defenses.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Trust & Safety Section -->
+    <section id="trust" class="landing-section trust-section">
+      <div class="landing-container">
+        <div class="trust-card">
+          <p class="section-eyebrow">Authorization Gate</p>
+          <h2 class="section-title">Ownership verification before active scanning</h2>
+          <p class="trust-lead">Active scans run only on domains you have verified with a DNS TXT record at _asm-verify.&lt;domain&gt;. A time-limited operator override exists for exceptional cases.</p>
+          <div class="trust-code-chassis">
+            <span class="chassis-label">DNS TXT VERIFICATION RECORD</span>
+            <code class="trust-code">{{ txt_label }} IN TXT &quot;{{ txt_example }}&quot;</code>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CTA Section -->
+    <section id="cta" class="landing-section cta-section">
+      <div class="landing-container cta-container">
+        <h2 class="cta-title">Monitor your organization&#39;s perimeter</h2>
+        <p class="cta-desc">Access your domain inventory, configure scan schedules, and triage findings.</p>
+        <div class="cta-action">
+          <a href="/app" class="btn btn-primary cta-btn">Get started</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="landing-footer">
+    <div class="landing-container footer-container">
+      <p class="footer-copy">ASM SaaS — Attack Surface Management Reconnaissance</p>
+      <div class="footer-links">
+        <a href="/app" class="footer-link">Dashboard</a>
+        <a href="https://github.com/vigneshs-17/asm-saas" class="footer-link" target="_blank" rel="noopener noreferrer">Source Code</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

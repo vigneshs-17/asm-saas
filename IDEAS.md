@@ -6,3 +6,6 @@ Ideas outside the roadmap go here and are not built.
 - Retry button for failed alert notifications
 - Free-text search on audit metadata
 - Redact alert_emails, recipient and last_error from the JSON API for viewers (DomainRead, alert-notifications)
+- Three.js hero
+- Absolute canonical URL + og:image after deploy
+- Reduced-motion CSS currently flattens the static 3D tilt — revisit

@@ -49,7 +49,12 @@ async def add_security_headers_middleware(request: Request, call_next):
     """Enforce strict CSP and security headers on /app, /ui/*, and /static/* responses."""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/app") or path.startswith("/ui") or path.startswith("/static"):
+    if (
+        path == "/"
+        or path.startswith("/app")
+        or path.startswith("/ui")
+        or path.startswith("/static")
+    ):
         settings = get_current_auth_settings()
         if "Content-Security-Policy" not in response.headers:
             response.headers["Content-Security-Policy"] = build_csp_header(settings.supabase_url)
